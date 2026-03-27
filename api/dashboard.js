@@ -90,15 +90,18 @@ function getDashboardHTML() {
       color: var(--text-muted);
     }
 
-    .header-badge {
-      background: #1a2a1a;
-      border: 1px solid #22c55e44;
-      color: var(--green);
-      font-size: 12px;
-      padding: 4px 12px;
-      border-radius: 20px;
-      font-weight: 500;
-    }
+    .header-right { display: flex; align-items: center; gap: 14px; }
+    .header-badge { background: #1a2a1a; border: 1px solid #22c55e44; color: var(--green); font-size: 12px; padding: 4px 12px; border-radius: 20px; font-weight: 500; }
+    .sub-bar { display: flex; align-items: center; gap: 8px; background: var(--surface2); border: 1px solid var(--border); padding: 5px 14px; border-radius: 20px; }
+    .sub-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .sub-dot.green { background: var(--green); box-shadow: 0 0 5px var(--green); }
+    .sub-dot.yellow { background: var(--yellow); box-shadow: 0 0 5px var(--yellow); }
+    .sub-dot.red { background: var(--red); box-shadow: 0 0 5px var(--red); }
+    .sub-dot.grey { background: var(--text-muted); }
+    .sub-label { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+    .sub-activate-btn { background: var(--orange); color: white; border: none; padding: 5px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .sub-activate-btn:hover { background: var(--orange-light); }
+    .sub-activate-btn:disabled { background: var(--surface2); color: var(--text-muted); cursor: not-allowed; border: 1px solid var(--border); }
 
     /* ── LAYOUT ── */
     .main {
@@ -555,7 +558,14 @@ function getDashboardHTML() {
       <div class="logo-sub">Test Dashboard</div>
     </div>
   </div>
-  <div class="header-badge">● Live System</div>
+  <div class="header-right">
+    <div class="sub-bar" id="sub-bar">
+      <div class="sub-dot grey" id="sub-dot"></div>
+      <span class="sub-label" id="sub-label">Checking webhook...</span>
+    </div>
+    <button class="sub-activate-btn" id="sub-activate-btn" style="display:none" onclick="activateSubscription()">Activate Webhook</button>
+    <div class="header-badge">● Live System</div>
+  </div>
 </header>
 
 <div class="main">
@@ -941,8 +951,55 @@ function getDashboardHTML() {
       + ' ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
   }
 
+  // ── SUBSCRIPTION STATUS ──
+  async function loadSubscriptionStatus() {
+    try {
+      const res = await fetch('/api/subscribe?action=status');
+      if (!res.ok) return;
+      const data = await res.json();
+      const dot = document.getElementById('sub-dot');
+      const label = document.getElementById('sub-label');
+      const btn = document.getElementById('sub-activate-btn');
+      dot.className = 'sub-dot ' + (data.colour || 'grey');
+      label.textContent = data.message || 'Unknown';
+      if (data.status === 'none' || data.status === 'expired') {
+        btn.style.display = 'inline-block';
+      } else {
+        btn.style.display = 'none';
+      }
+    } catch(e) {
+      document.getElementById('sub-label').textContent = 'Webhook status unavailable';
+    }
+  }
+
+  async function activateSubscription() {
+    const btn = document.getElementById('sub-activate-btn');
+    const label = document.getElementById('sub-label');
+    btn.disabled = true;
+    btn.textContent = 'Activating...';
+    label.textContent = 'Creating webhook subscription...';
+    try {
+      const res = await fetch('/api/subscribe?action=create');
+      const data = await res.json();
+      if (data.success) {
+        label.textContent = 'Activated! ' + (data.message || '');
+        btn.style.display = 'none';
+        document.getElementById('sub-dot').className = 'sub-dot green';
+      } else {
+        label.textContent = 'Activation failed: ' + (data.error || 'Unknown error');
+        btn.disabled = false;
+        btn.textContent = 'Retry';
+      }
+    } catch(e) {
+      label.textContent = 'Activation failed: ' + e.message;
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+    }
+  }
+
   // ── INIT ──
   loadFiles();
+  loadSubscriptionStatus();
 </script>
 
 </body>
