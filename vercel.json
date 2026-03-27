@@ -5,6 +5,12 @@
       "maxDuration": 60
     }
   },
+  "crons": [
+    {
+      "path": "/api/cron",
+      "schedule": "0 9 * * *"
+    }
+  ],
   "routes": [
     { "src": "/dashboard", "dest": "/api/dashboard" },
     { "src": "/api/(.*)", "dest": "/api/$1" }
