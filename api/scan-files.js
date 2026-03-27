@@ -20,12 +20,14 @@ module.exports = async function handler(req, res) {
 
   try {
     const userId = process.env.ONEDRIVE_USER_ID;
-    const watchFolder = process.env.ONEDRIVE_WATCH_FOLDER;
 
-    // List children of the Scans folder
+    // Build correct Graph API path for listing folder children
+    // Format: /users/{id}/drive/root:/{folder path}:/children
+    const folderPath = encodeURIComponent('Grove Group Scotland/Grove Bedding/Scans').replace(/%2F/g, '/');
+
     const result = await graphRequest(
       'GET',
-      `/users/${userId}/${watchFolder}:/children?$filter=file ne null&$select=id,name,size,createdDateTime,webUrl,file`
+      `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file`
     );
 
     const items = result?.value || [];
