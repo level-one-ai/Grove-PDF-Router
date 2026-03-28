@@ -27,6 +27,16 @@ const {
   getStatusSummary,
 } = require('../lib/subscription');
 
+function getSubscriptionHint(err) {
+  const code = err.graphCode || '';
+  const msg = (err.graphMessage || '').toLowerCase();
+  if (msg.includes('notificationurl')) return 'The WEBHOOK_NOTIFICATION_URL is invalid or Microsoft cannot reach it. Make sure it is set to your exact Vercel URL e.g. https://grove-pdf-router.vercel.app';
+  if (msg.includes('expiration')) return 'Expiry date is invalid. This is a system error — please report it.';
+  if (code === 'ExtensionError') return 'Microsoft cannot reach your webhook URL to validate it. Check WEBHOOK_NOTIFICATION_URL is correct and the /api/webhook endpoint is deployed.';
+  if (err.response?.status === 403) return 'Permission denied. Check Azure API permissions have admin consent granted for Files.ReadWrite.All.';
+  return 'Check all Microsoft environment variables are set correctly in Vercel and redeployed.';
+}
+
 module.exports = async function handler(req, res) {
 
   // ── Microsoft Graph Validation Token Handshake ──
@@ -96,8 +106,15 @@ module.exports = async function handler(req, res) {
         message: 'Subscription created and saved. Auto-renewal is active via Vercel Cron — no manual renewal needed.',
       });
     } catch (err) {
-      console.error('[subscribe] Create error:', err.response?.data || err.message);
-      return res.status(500).json({ success: false, error: err.message });
+      console.error('[subscribe] Create error:', err.graphError || err.response?.data || err.message);
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+        graphError: err.graphError || err.response?.data || null,
+        graphMessage: err.graphMessage || null,
+        graphCode: err.graphCode || null,
+        hint: getSubscriptionHint(err),
+      });
     }
   }
 
