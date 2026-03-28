@@ -2,37 +2,58 @@
  * /api/scan-files
  *
  * Lists all PDF files currently in the OneDrive Scans folder.
- * Used by the test dashboard to populate the file browser.
- *
- * GET /api/scan-files
- * Returns: { files: [{ id, name, size, createdAt, webUrl }] }
  */
 
 const { requireAuth } = require('../lib/auth');
-const { graphRequest } = require('../lib/graph');
 
 module.exports = async function handler(req, res) {
-  if (!requireAuth(req, res)) return;
+  res.setHeader('Content-Type', 'application/json');
+
+  try {
+    if (!requireAuth(req, res)) return;
+  } catch (authErr) {
+    return res.status(500).json({
+      success: false,
+      error: 'Auth middleware failed',
+      detail: authErr.message,
+    });
+  }
 
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
+  // Check required env vars
+  const userId = process.env.ONEDRIVE_USER_ID;
+  const tenantId = process.env.MICROSOFT_TENANT_ID;
+  const clientId = process.env.MICROSOFT_CLIENT_ID;
+  const clientSecret = process.env.MICROSOFT_CLIENT_SECRET;
+
+  const missing = [];
+  if (!userId) missing.push('ONEDRIVE_USER_ID');
+  if (!tenantId) missing.push('MICROSOFT_TENANT_ID');
+  if (!clientId) missing.push('MICROSOFT_CLIENT_ID');
+  if (!clientSecret) missing.push('MICROSOFT_CLIENT_SECRET');
+
+  if (missing.length > 0) {
+    return res.status(500).json({
+      success: false,
+      error: `Missing environment variables: ${missing.join(', ')}`,
+    });
+  }
+
   try {
-    const userId = process.env.ONEDRIVE_USER_ID;
+    const { graphRequest } = require('../lib/graph');
 
-    // Build correct Graph API path for listing folder children
-    // Format: /users/{id}/drive/root:/{folder path}:/children
-    const folderPath = encodeURIComponent('Grove Group Scotland/Grove Bedding/Scans').replace(/%2F/g, '/');
+    const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
+    const apiPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file`;
 
-    const result = await graphRequest(
-      'GET',
-      `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file`
-    );
+    // Return the full API path so we can verify it looks correct
+    console.log('[scan-files] Calling Graph API:', apiPath);
 
+    const result = await graphRequest('GET', apiPath);
     const items = result?.value || [];
 
-    // Filter to PDFs only
     const pdfFiles = items
       .filter((item) => {
         const name = (item.name || '').toLowerCase();
@@ -54,9 +75,25 @@ module.exports = async function handler(req, res) {
       count: pdfFiles.length,
       files: pdfFiles,
     });
+
   } catch (err) {
-    console.error('[scan-files] Error:', err.response?.data || err.message);
-    return res.status(500).json({ success: false, error: err.message });
+    const graphError = err.response?.data?.error;
+    const statusCode = err.response?.status;
+    const graphMessage = err.response?.data;
+
+    console.error('[scan-files] Graph API error:', JSON.stringify(graphMessage));
+
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+      httpStatus: statusCode || null,
+      graphErrorCode: graphError?.code || null,
+      graphErrorMessage: graphError?.message || null,
+      fullGraphResponse: graphMessage || null,
+      userId: process.env.ONEDRIVE_USER_ID || 'NOT SET',
+      folderPathUsed: `Grove Group Scotland/Grove Bedding/Scans`,
+      fullApiPath: `/users/${process.env.ONEDRIVE_USER_ID}/drive/root:/Grove Group Scotland/Grove Bedding/Scans:/children`,
+    });
   }
 };
 
