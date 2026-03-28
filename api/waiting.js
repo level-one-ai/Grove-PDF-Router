@@ -2,12 +2,11 @@
  * /api/waiting
  * Returns files currently waiting for human approval.
  */
-const { requireApiAuth } = require('../lib/auth');
 const db = require('../lib/firebase');
 
 module.exports = async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
-  if (!requireApiAuth(req, res)) return;
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
   try {
     const files = await db.getWaitingFiles();
