@@ -8,7 +8,6 @@
  * POST /api/mode         → sets mode { mode: 'auto' | 'human' }
  */
 
-const { requireApiAuth } = require('../lib/auth');
 const admin = require('firebase-admin');
 
 function getDb() {
@@ -25,8 +24,8 @@ function getDb() {
 }
 
 module.exports = async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
-  if (!requireApiAuth(req, res)) return;
 
   const db = getDb();
   const docRef = db.collection('settings').doc('processingMode');
