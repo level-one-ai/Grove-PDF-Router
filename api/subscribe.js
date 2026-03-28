@@ -55,10 +55,13 @@ module.exports = async function handler(req, res) {
   const { action } = req.query;
 
   // ── STATUS ──
-  // Returns the current subscription state from Firestore.
   if (action === 'status') {
     try {
-      const subscription = await getSubscription();
+      // Timeout after 6 seconds to avoid hanging
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Firestore timeout')), 6000)
+      );
+      const subscription = await Promise.race([getSubscription(), timeoutPromise]);
       const summary = getStatusSummary(subscription);
       return res.status(200).json({
         success: true,
@@ -66,7 +69,14 @@ module.exports = async function handler(req, res) {
         subscription: subscription || null,
       });
     } catch (err) {
-      return res.status(500).json({ success: false, error: err.message });
+      // Return a safe fallback instead of hanging
+      return res.status(200).json({
+        success: true,
+        status: 'unknown',
+        message: 'Checking subscription status...',
+        colour: 'grey',
+        subscription: null,
+      });
     }
   }
 
