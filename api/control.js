@@ -4,12 +4,12 @@
  * POST { action: 'stop' | 'resume' }
  * GET → returns current stopped state
  */
-const { requireAuth } = require('../lib/auth');
+const { requireApiAuth } = require('../lib/auth');
 const db = require('../lib/firebase');
 
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
-  if (!requireAuth(req, res)) return;
+  if (!requireApiAuth(req, res)) return;
 
   if (req.method === 'GET') {
     try {
