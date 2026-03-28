@@ -30,8 +30,9 @@ module.exports = async function handler(req, res) {
   }
 
   // Validate callback secret
-  const incomingSecret = req.headers['x-callback-secret'];
   const expectedSecret = process.env.CALLBACK_SECRET || 'grove-pdf-router-secret';
+  // Accept secret from header (old format) or body (new JSON format)
+  const incomingSecret = req.headers['x-callback-secret'] || req.body?.secret;
   if (incomingSecret !== expectedSecret) {
     console.warn('[callback] Invalid secret, rejecting request');
     return res.status(401).json({ error: 'Unauthorised' });
