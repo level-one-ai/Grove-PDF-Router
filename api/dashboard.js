@@ -342,7 +342,7 @@ async function loadWaiting() {
     nl.innerHTML = '<div style="font-size:12px;color:var(--mu);text-align:center;padding:8px">None waiting</div>';
   } else {
     nl.innerHTML = files.map(function(f){
-      return '<div style="display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:6px;background:var(--s2);border:1px solid #d9770033;margin-bottom:5px;cursor:pointer" onclick="selWait(\'' + f.fileId + '\')">'
+      return '<div style="display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:6px;background:var(--s2);border:1px solid #d9770033;margin-bottom:5px;cursor:pointer" data-nfid="' + esc(f.fileId) + '" onclick="selWait(this.dataset.nfid)">'
         + '<div style="font-size:16px">&#128196;</div>'
         + '<div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(f.fileName) + '</div>'
         + '<div style="font-size:10px;color:var(--mu)">' + (f.totalPages||'?') + ' pages &middot; Waiting</div></div>'
@@ -392,11 +392,11 @@ async function loadFiles() {
 
   $('flist').innerHTML = d.files.map(function(f, idx){
     // Store file data safely using index — we keep a files array
-    return '<div class="fi" id="f-' + f.id + '" data-fid="' + esc(f.id) + '" data-idx="' + idx + '" onclick="clickFile(' + idx + ')">'
+    return '<div class="fi" id="f-' + f.id + '" data-fid="' + esc(f.id) + '" data-idx="' + idx + '" onclick="clickFile(this)">'
       + '<div class="fic">&#128196;</div>'
       + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div><div class="fmeta">' + esc(f.sizeFormatted) + ' &middot; ' + fdate(f.createdAt) + '</div></div>'
       + '<div class="fac"><span class="wbadge">&#9203;</span>'
-      + '<button class="rstbtn" onclick="doReset(event,\'' + esc(f.id) + '\')" title="Reset">&#8635;</button>'
+      + '<button class="rstbtn" data-rid="' + esc(f.id) + '" onclick="doReset(event,this.dataset.rid)" title="Reset">&#8635;</button>'
       + '<div class="chk">&#10003;</div></div>'
       + '</div>';
   }).join('');
@@ -406,8 +406,9 @@ async function loadFiles() {
   refreshBadges();
 }
 
-function clickFile(idx) {
+function clickFile(el) {
   if (IR) return;
+  var idx = parseInt(el.dataset.idx);
   var f = window.FILES && window.FILES[idx];
   if (!f) return;
 
