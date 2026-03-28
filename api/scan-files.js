@@ -51,7 +51,11 @@ module.exports = async function handler(req, res) {
     // Return the full API path so we can verify it looks correct
     console.log('[scan-files] Calling Graph API:', apiPath);
 
-    const result = await graphRequest('GET', apiPath);
+    // Timeout after 8 seconds
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('OneDrive request timed out after 8 seconds')), 8000)
+    );
+    const result = await Promise.race([graphRequest('GET', apiPath), timeoutPromise]);
     const items = result?.value || [];
 
     const pdfFiles = items
