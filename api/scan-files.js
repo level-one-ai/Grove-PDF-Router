@@ -4,13 +4,13 @@
  * Lists all PDF files currently in the OneDrive Scans folder.
  */
 
-const { requireAuth } = require('../lib/auth');
+const { requireApiAuth } = require('../lib/auth');
 
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
 
   try {
-    if (!requireAuth(req, res)) return;
+    if (!requireApiAuth(req, res)) return;
   } catch (authErr) {
     return res.status(500).json({
       success: false,
