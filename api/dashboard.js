@@ -197,12 +197,12 @@ function fd(iso){if(!iso)return'';var d=new Date(iso);return d.toLocaleDateStrin
 
 // MODE
 async function loadMode(){
-  try{var r=await fetch('/api/mode'),d=await r.json();CM=d.mode||'auto';updMode();}catch(ex){}
+  try{var r=await ft('/api/mode',null,5000),d=await r.json();CM=d.mode||'auto';updMode();}catch(ex){CM='auto';updMode();}
 }
 async function toggleMode(){
   var m=CM==='auto'?'human':'auto';
   CM=m;updMode();
-  await fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
+  await ft('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
   updSS();
 }
 function updMode(){
@@ -230,7 +230,7 @@ function selSt(n){
 // STOP/RESUME
 async function loadStopState(){
   try{
-    var r=await fetch('/api/control'),d=await r.json();
+    var r=await ft('/api/control',null,5000),d=await r.json();
     stopped=d.stopped||false;
     updateStopBtn();
   }catch(ex){}
@@ -251,7 +251,7 @@ function updateStopBtn(){
 async function handleStop(){
   var action=stopped?'resume':'stop';
   try{
-    var r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
+    var r=await ft('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
     var d=await r.json();
     stopped=d.stopped;
     updateStopBtn();
@@ -261,7 +261,7 @@ async function handleStop(){
 // SUBSCRIPTION
 async function loadSub(){
   try{
-    var r=await fetch('/api/subscribe?action=status'),d=await r.json();
+    var r=await ft('/api/subscribe?action=status',null,8000),d=await r.json();
     document.getElementById('sd').className='sd '+(d.colour||'grey');
     document.getElementById('sl').textContent=d.message||'Unknown';
     document.getElementById('sa').style.display=(d.status==='none'||d.status==='expired')?'inline-block':'none';
@@ -271,7 +271,7 @@ async function activateSub(){
   var btn=document.getElementById('sa'),lbl=document.getElementById('sl');
   btn.disabled=true;lbl.textContent='Activating...';
   try{
-    var r=await fetch('/api/subscribe?action=create'),d=await r.json();
+    var r=await ft('/api/subscribe?action=create',null,15000),d=await r.json();
     lbl.textContent=d.success?'Activated!':'Failed: '+(d.error||'');
     document.getElementById('sd').className='sd '+(d.success?'green':'red');
     if(d.success)btn.style.display='none';else btn.disabled=false;
@@ -281,7 +281,7 @@ async function activateSub(){
 // WAITING
 async function loadWaiting(){
   try{
-    var r=await fetch('/api/waiting'),d=await r.json(),files=d.files||[];
+    var r=await ft('/api/waiting',null,6000),d=await r.json(),files=d.files||[];
     WF={};files.forEach(function(f){WF[f.fileId]=f;});
     var bb=document.getElementById('bb');
     if(files.length){bb.style.display='block';bb.textContent=String(files.length);}
@@ -309,7 +309,7 @@ async function loadFiles(){
   var fl=document.getElementById('fl'),fc=document.getElementById('fc');
   fl.innerHTML='<div class="stm"><div class="ic pl">&#128194;</div><div class="ti">Loading...</div></div>';
   try{
-    var r=await fetch('/api/scan-files');
+    var r=await ft('/api/scan-files',null,10000);
     if(r.status===401){fl.innerHTML='<div class="stm"><div class="ic">&#128274;</div><div class="ti">Unauthorised</div></div>';return;}
     var d=await r.json();
     if(!d.success||!d.files||!d.files.length){
@@ -361,7 +361,7 @@ async function rstF(ev,fid){
   ev.stopPropagation();
   if(!confirm('Reset this file record so it can be reprocessed?'))return;
   try{
-    var r=await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileId:fid})});
+    var r=await ft('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileId:fid})});
     var d=await r.json();
     if(d.success){alert('Reset successful \u2014 you can now run this file.');loadWaiting();}
     else alert('Reset failed: '+(d.error||'Unknown'));
@@ -465,6 +465,14 @@ function finErr(step,msg){
   btn.innerHTML='\u21ba Try Again';
 }
 
+
+function ft(url,opts,ms){
+  ms=ms||8000;
+  var ctrl=new AbortController();
+  var timer=setTimeout(function(){ctrl.abort();},ms);
+  return fetch(url,Object.assign({},opts||{},{signal:ctrl.signal}))
+    .finally(function(){clearTimeout(timer);});
+}
 // INIT
 loadMode();
 loadFiles();
