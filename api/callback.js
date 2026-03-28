@@ -12,7 +12,7 @@
  */
 
 const db = require('../lib/firebase');
-const { dispatchNextPage, getPageBuffer } = require('../lib/queue');
+const { dispatchNextPage, getPageBuffer, cleanupTempPages } = require('../lib/queue');
 const { buildFilename, getSupplierLabel, getCustomerFolderName, getRefFolder } = require('../lib/namingEngine');
 const { uploadFile: uploadToOneDrive } = require('../lib/graph');
 const { fileDocuments } = require('../lib/googleDrive');
@@ -182,6 +182,14 @@ async function fileAllPages(fileId, totalPages, lastPageJson) {
     oneDriveProcessedFolderUrl: `https://onedrive.live.com/?path=${encodeURIComponent('/Grove Group Scotland/Grove Bedding/Scans/Processed')}`,
     oneDriveFiles: oneDriveResults,
   });
+
+  // Clean up temp pages from OneDrive
+  try {
+    await cleanupTempPages(fileId);
+    console.log(`[callback] Temp pages cleaned up for ${fileId}`);
+  } catch (err) {
+    console.warn(`[callback] Temp cleanup warning for ${fileId}:`, err.message);
+  }
 
   console.log(`[callback] ✅ Completed processing for fileId: ${fileId} — ${renamedFiles.length} files filed.`);
 }
