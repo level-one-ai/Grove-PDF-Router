@@ -382,7 +382,7 @@ async function startRun(){
   stpl.innerHTML=STEPS.map(function(s){return mkStep(s.id,s.l,'','pending');}).join('');
   try{
     var body={fileId:SF.id,fileName:SF.name,runMode:CM,runStep:SS,isWaiting:!!WF[SF.id]};
-    var resp=await fetch('/api/test-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var resp=await fetch('/api/test-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'include'});
     if(resp.status===401){finErr('unknown','Session expired');return;}
     var reader=resp.body.getReader(),dec=new TextDecoder(),buf='';
     while(true){
@@ -470,8 +470,9 @@ function ft(url,opts,ms){
   ms=ms||8000;
   var ctrl=new AbortController();
   var timer=setTimeout(function(){ctrl.abort();},ms);
-  return fetch(url,Object.assign({},opts||{},{signal:ctrl.signal}))
-    .finally(function(){clearTimeout(timer);});
+  // Send credentials so Basic Auth passes through to API endpoints
+  var merged=Object.assign({credentials:'include'},opts||{},{signal:ctrl.signal});
+  return fetch(url,merged).finally(function(){clearTimeout(timer);});
 }
 // INIT
 loadMode();
