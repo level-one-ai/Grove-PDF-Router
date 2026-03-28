@@ -253,14 +253,14 @@ async function api(url, opts) {
 
 // ── MODE ──
 async function loadMode() {
-  var d = await api('/api/mode');
+  var d = await api('/api/admin?action=mode');
   CM = (d && d.mode) ? d.mode : 'auto';
   applyMode();
 }
 async function toggleMode() {
   CM = CM === 'auto' ? 'human' : 'auto';
   applyMode();
-  await api('/api/mode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mode:CM})});
+  await api('/api/admin?action=mode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mode:CM})});
 }
 function applyMode() {
   var h = CM === 'human';
@@ -283,7 +283,7 @@ function setSt(n) {
 
 // ── STOP/RESUME ──
 async function loadStopState() {
-  var d = await api('/api/control');
+  var d = await api('/api/admin?action=control');
   if (!d) return;
   STOPPED = d.stopped || false;
   updateStopBtn();
@@ -302,7 +302,7 @@ function updateStopBtn() {
 }
 async function doStop() {
   var action = STOPPED ? 'resume' : 'stop';
-  var d = await api('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:action})});
+  var d = await api('/api/admin?action=control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:action})});
   if (d) { STOPPED = d.stopped; updateStopBtn(); }
 }
 
@@ -330,7 +330,7 @@ async function activateSub() {
 
 // ── WAITING FILES ──
 async function loadWaiting() {
-  var d = await api('/api/waiting');
+  var d = await api('/api/admin?action=waiting');
   var files = (d && d.files) ? d.files : [];
   WF = {};
   files.forEach(function(f){ WF[f.fileId] = f; });
@@ -439,7 +439,7 @@ function clickFile(idx) {
 async function doReset(ev, fid) {
   ev.stopPropagation();
   if (!confirm('Reset this file so it can be reprocessed?')) return;
-  var d = await api('/api/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileId:fid})});
+  var d = await api('/api/admin?action=reset', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileId:fid})});
   if (d && d.success) { alert('Reset \u2014 you can now run this file.'); loadWaiting(); }
   else { alert('Reset failed: ' + (d && d.error ? d.error : 'Unknown error')); }
 }
