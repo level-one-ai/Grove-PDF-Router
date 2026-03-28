@@ -3,12 +3,19 @@
  *
  * Receives the Claude JSON extraction result from Make.com for each page.
  *
+ * KEY BEHAVIOUR: Each page is filed IMMEDIATELY and INDEPENDENTLY
+ * when its callback arrives. Pages from the same PDF may belong to
+ * completely different customers and are routed to their own folders.
+ *
  * Flow per callback:
- * 1. Validate secret header
- * 2. Store page result in Firestore
- * 3. Apply naming convention logic
- * 4. If more pages remain → dispatch next page to Make.com
- * 5. If all pages received → file to OneDrive + Google Drive, mark complete
+ * 1. Validate secret
+ * 2. Retrieve page buffer from OneDrive /Temp
+ * 3. Build filename from Claude JSON
+ * 4. Upload page to OneDrive /Processed immediately
+ * 5. File page to correct Google Drive folder immediately
+ * 6. Update Firestore with page result
+ * 7. Dispatch next page to Make.com (if more remain)
+ * 8. If last page — mark fileId as completed and clean up temp files
  */
 
 const db = require('../lib/firebase');
@@ -22,174 +29,153 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // -------------------------------------------------------
   // Validate callback secret
-  // -------------------------------------------------------
   const incomingSecret = req.headers['x-callback-secret'];
-  if (incomingSecret !== process.env.CALLBACK_SECRET) {
+  const expectedSecret = process.env.CALLBACK_SECRET || 'grove-pdf-router-secret';
+  if (incomingSecret !== expectedSecret) {
     console.warn('[callback] Invalid secret, rejecting request');
     return res.status(401).json({ error: 'Unauthorised' });
   }
 
   const { fileId, pageNumber, totalPages, json: claudeJson } = req.body;
 
-  if (!fileId || !pageNumber || !claudeJson) {
-    return res.status(400).json({ error: 'Missing required fields: fileId, pageNumber, json' });
+  if (!fileId || pageNumber === undefined || !claudeJson) {
+    return res.status(400).json({
+      error: 'Missing required fields: fileId, pageNumber, json',
+    });
   }
 
-  // Acknowledge immediately
-  res.status(200).json({ status: 'received', pageNumber });
+  const pageNum = parseInt(pageNumber, 10);
+  const totalPagesCount = parseInt(totalPages, 10);
+
+  // Acknowledge immediately — Make.com needs a quick response
+  res.status(200).json({ status: 'received', pageNumber: pageNum });
 
   try {
-    await processCallback(fileId, pageNumber, totalPages, claudeJson);
+    await processPage(fileId, pageNum, totalPagesCount, claudeJson);
   } catch (err) {
-    console.error(`[callback] Error processing callback for ${fileId} page ${pageNumber}:`, err);
-    await db.markError(fileId, err);
+    console.error(`[callback] Error on page ${pageNum} for ${fileId}:`, err.message);
+    await db.updatePageResult(fileId, pageNum, {
+      status: 'error',
+      error: err.message,
+    });
   }
 };
 
-async function processCallback(fileId, pageNumber, totalPages, claudeJson) {
-  console.log(`[callback] Received page ${pageNumber}/${totalPages} for fileId: ${fileId}`);
+/**
+ * Process a single page immediately and independently.
+ * Each page is filed to its own customer folder based on Claude's JSON.
+ */
+async function processPage(fileId, pageNumber, totalPages, claudeJson) {
+  console.log(`[callback] Processing page ${pageNumber}/${totalPages} for ${fileId}`);
 
-  // -------------------------------------------------------
-  // Retrieve the PDF buffer for this page from Firestore
-  // -------------------------------------------------------
+  // ── Get page buffer from OneDrive /Temp ──
   const pageBuffer = await getPageBuffer(fileId, pageNumber);
   if (!pageBuffer) {
     throw new Error(`No buffer found for fileId: ${fileId}, page: ${pageNumber}`);
   }
 
-  // -------------------------------------------------------
-  // Build the final filename using naming engine
-  // -------------------------------------------------------
+  // ── Build filename from this page's Claude JSON ──
   const record = await db.getRecord(fileId);
-  const totalPagesCount = record?.totalPages || totalPages;
-  const padWidth = String(totalPagesCount).length > 1 ? String(totalPagesCount).length : 2;
+  const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
   const zeroPadded = String(pageNumber).padStart(padWidth, '0');
 
   const finalFileName = buildFilename(claudeJson, zeroPadded);
   const supplierLabel = getSupplierLabel(claudeJson);
+  const customerFolderName = getCustomerFolderName(claudeJson);
+  const refFolderName = getRefFolder(claudeJson);
 
-  console.log(`[callback] Page ${pageNumber} → ${finalFileName} (${supplierLabel})`);
+  console.log(`[callback] Page ${pageNumber} → "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
 
-  // -------------------------------------------------------
-  // Store page result in Firestore
-  // -------------------------------------------------------
+  // ── Upload to OneDrive /Processed immediately ──
+  let oneDriveResult = null;
+  try {
+    const processedFolderPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
+    const uploaded = await uploadToOneDrive(processedFolderPath, finalFileName, pageBuffer);
+    oneDriveResult = {
+      fileName: finalFileName,
+      oneDriveId: uploaded.id,
+      oneDriveUrl: uploaded.webUrl,
+    };
+    console.log(`[callback] OneDrive upload OK: "${finalFileName}"`);
+  } catch (err) {
+    console.error(`[callback] OneDrive upload failed for "${finalFileName}":`, err.message);
+  }
+
+  // ── File to Google Drive immediately ──
+  // Each page independently routed to its own customer/ref folder
+  let googleDriveResult = null;
+  try {
+    googleDriveResult = await fileDocuments(customerFolderName, refFolderName, [
+      {
+        pageNumber,
+        finalFileName,
+        buffer: pageBuffer,
+      },
+    ]);
+    console.log(`[callback] Google Drive OK: "${customerFolderName}/${refFolderName}"`);
+  } catch (err) {
+    console.error(`[callback] Google Drive failed for page ${pageNumber}:`, err.message);
+  }
+
+  // ── Store page result in Firestore ──
   await db.updatePageResult(fileId, pageNumber, {
     finalFileName,
     supplier: supplierLabel,
-    claudeJson,
-    status: 'pending-filing',
+    customerName: customerFolderName,
+    ref: refFolderName,
+    status: 'completed',
+    oneDrive: oneDriveResult,
+    googleDrive: googleDriveResult
+      ? {
+          folderId: googleDriveResult.refFolderId,
+          folderUrl: googleDriveResult.refFolderUrl,
+          uploadedFile: googleDriveResult.uploadedFiles?.[0] || null,
+        }
+      : null,
   });
 
-  // -------------------------------------------------------
-  // Dispatch next page if more remain
-  // -------------------------------------------------------
+  // ── Dispatch next page if more remain ──
   const nextPage = pageNumber + 1;
-  if (nextPage <= totalPagesCount) {
-    console.log(`[callback] Dispatching page ${nextPage}/${totalPagesCount} for ${fileId}`);
+  if (nextPage <= totalPages) {
+    console.log(`[callback] Dispatching page ${nextPage}/${totalPages} for ${fileId}`);
     await dispatchNextPage(fileId, nextPage);
-    return; // Wait for next callback
+    return;
   }
 
-  // -------------------------------------------------------
-  // All pages received — begin filing
-  // -------------------------------------------------------
-  console.log(`[callback] All ${totalPagesCount} pages received for ${fileId}. Beginning filing...`);
-  await db.updateRecord(fileId, { status: 'filing' });
+  // ── All pages processed — mark completed and clean up ──
+  console.log(`[callback] All ${totalPages} pages processed for ${fileId} — finalising`);
 
-  await fileAllPages(fileId, totalPagesCount, claudeJson);
-}
+  // Collect summary across all pages for the Firestore record
+  const updatedRecord = await db.getRecord(fileId);
+  const pagesData = updatedRecord?.pages || {};
 
-async function fileAllPages(fileId, totalPages, lastPageJson) {
-  // -------------------------------------------------------
-  // Collect all pages from Firestore
-  // -------------------------------------------------------
-  const record = await db.getRecord(fileId);
-  const pagesData = record?.pages || {};
+  const renamedFiles = Object.values(pagesData)
+    .map(p => p.finalFileName)
+    .filter(Boolean);
 
-  const pagesToFile = [];
-  for (let i = 1; i <= totalPages; i++) {
-    const pageData = pagesData[i];
-    if (!pageData) {
-      console.error(`[callback] Missing page data for page ${i} of fileId ${fileId}`);
-      continue;
-    }
-
-    const buffer = await getPageBuffer(fileId, i);
-    if (!buffer) {
-      console.error(`[callback] Missing buffer for page ${i} of fileId ${fileId}`);
-      continue;
-    }
-
-    pagesToFile.push({
-      pageNumber: i,
-      finalFileName: pageData.finalFileName,
-      buffer,
-      claudeJson: pageData.claudeJson,
-    });
-  }
-
-  // -------------------------------------------------------
-  // Upload all pages to OneDrive /Scans/Processed
-  // -------------------------------------------------------
-  const processedFolder = process.env.ONEDRIVE_PROCESSED_FOLDER;
-  const oneDriveResults = [];
-
-  for (const page of pagesToFile) {
-    try {
-      const uploaded = await uploadToOneDrive(processedFolder, page.finalFileName, page.buffer);
-      oneDriveResults.push({
-        pageNumber: page.pageNumber,
-        fileName: page.finalFileName,
-        oneDriveId: uploaded.id,
-        oneDriveUrl: uploaded.webUrl,
-      });
-      console.log(`[callback] Uploaded to OneDrive: ${page.finalFileName}`);
-    } catch (err) {
-      console.error(`[callback] OneDrive upload failed for ${page.finalFileName}:`, err.message);
-    }
-  }
-
-  // -------------------------------------------------------
-  // Upload all pages to Google Drive
-  // Use the last page's JSON to determine folder structure
-  // (all pages in same document share same customer/ref)
-  // -------------------------------------------------------
-  const customerFolderName = getCustomerFolderName(lastPageJson);
-  const refFolderName = getRefFolder(lastPageJson);
-
-  let googleDriveResult = null;
-  try {
-    googleDriveResult = await fileDocuments(customerFolderName, refFolderName, pagesToFile);
-    console.log(`[callback] Filed to Google Drive: ${customerFolderName}/${refFolderName}`);
-  } catch (err) {
-    console.error(`[callback] Google Drive filing failed:`, err.message);
-  }
-
-  // -------------------------------------------------------
-  // Mark as completed in Firestore
-  // -------------------------------------------------------
-  const renamedFiles = pagesToFile.map((p) => p.finalFileName);
+  // Use the last page's Google Drive URL as the primary link
+  // (each page may have its own folder — dashboard shows per-page links)
+  const lastPageData = pagesData[pageNumber];
 
   await db.markCompleted(fileId, {
     renamedFiles,
+    // Summary uses last page values — per-page details in pages.{n}
     customerName: customerFolderName,
     ref: refFolderName,
-    supplier: getSupplierLabel(lastPageJson),
-    googleDriveFolderId: googleDriveResult?.refFolderId || null,
-    googleDriveFolderUrl: googleDriveResult?.refFolderUrl || null,
-    oneDriveProcessedFolderUrl: `https://onedrive.live.com/?path=${encodeURIComponent('/Grove Group Scotland/Grove Bedding/Scans/Processed')}`,
-    oneDriveFiles: oneDriveResults,
+    supplier: supplierLabel,
+    googleDriveFolderId: lastPageData?.googleDrive?.folderId || null,
+    googleDriveFolderUrl: lastPageData?.googleDrive?.folderUrl || null,
+    oneDriveProcessedFolderUrl: 'https://grovebedding-my.sharepoint.com/personal/files_grovebedding_com/Documents/Grove%20Group%20Scotland/Grove%20Bedding/Scans/Processed',
   });
 
-  // Clean up temp pages from OneDrive
+  // Clean up temp pages from OneDrive /Temp
   try {
     await cleanupTempPages(fileId);
-    console.log(`[callback] Temp pages cleaned up for ${fileId}`);
+    console.log(`[callback] Temp files cleaned up for ${fileId}`);
   } catch (err) {
-    console.warn(`[callback] Temp cleanup warning for ${fileId}:`, err.message);
+    console.warn(`[callback] Temp cleanup warning:`, err.message);
   }
 
-  console.log(`[callback] ✅ Completed processing for fileId: ${fileId} — ${renamedFiles.length} files filed.`);
+  console.log(`[callback] ✅ fileId ${fileId} complete — ${renamedFiles.length} page(s) filed independently`);
 }
