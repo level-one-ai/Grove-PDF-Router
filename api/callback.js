@@ -44,7 +44,63 @@ module.exports = async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorised' });
   }
 
-  const { fileId, pageNumber, totalPages, json: claudeJson } = req.body;
+  const body = req.body || {};
+  const fileId = body.fileId;
+  const pageNumber = body.pageNumber;
+  const totalPages = body.totalPages;
+
+  // Accept json as either:
+  // 1. Nested object: { json: { document: {...} } }  (ideal)
+  // 2. Flat fields:   { title, etd, ref, inv_no, company_name, customer_name, ... }
+  let claudeJson = body.json;
+
+  // If json field is a string, parse it
+  if (typeof claudeJson === 'string') {
+    try { claudeJson = JSON.parse(claudeJson); } catch(e) {
+      console.error('[callback] Failed to parse json string:', e.message);
+    }
+  }
+
+  // If no json object, build one from flat fields (Make.com key-value fallback)
+  if (!claudeJson && body.title !== undefined) {
+    claudeJson = {
+      document: {
+        header: {
+          title: body.title || '',
+          etd: body.etd || '',
+          ref: body.ref || '',
+          inv_no: body.inv_no || '',
+          customer_po_no: body.customer_po_no || '',
+        },
+        customer: {
+          company_name: (body.company_name && body.company_name !== 'null') ? body.company_name : null,
+          name: body.customer_name || '',
+          address: {
+            street: body.street || '',
+            city: body.city || '',
+            region: body.region || '',
+            postcode: body.postcode || '',
+            country: body.country || '',
+          },
+          phone: body.phone || '',
+          mobile: body.mobile || '',
+        },
+        ship_to: {
+          name: body.ship_to_name || '',
+          address: {
+            street: body.ship_to_street || '',
+            city: body.ship_to_city || '',
+            region: body.ship_to_region || '',
+            postcode: body.ship_to_postcode || '',
+            country: body.ship_to_country || '',
+          },
+        },
+        handwritten_notes: body.handwritten_notes || '',
+        product_selection: [],
+      }
+    };
+    console.log('[callback] Built claudeJson from flat fields');
+  }
 
   if (!fileId || pageNumber === undefined || !claudeJson) {
     console.error('[callback] Missing fields. fileId:', fileId, 'pageNumber:', pageNumber, 'json:', !!claudeJson);
