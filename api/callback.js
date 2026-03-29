@@ -24,12 +24,44 @@ const { buildFilename, getSupplierLabel, getCustomerFolderName, getRefFolder } =
 const { uploadFile: uploadToOneDrive } = require('../lib/graph');
 const { fileDocuments } = require('../lib/googleDrive');
 
+// Tell Vercel to provide raw body so we can parse it ourselves
+module.exports.config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '10mb',
+    },
+  },
+};
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
+  // Parse body manually — Vercel only auto-parses application/json
+  // For form-urlencoded from Make.com we need to parse manually
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.includes('application/x-www-form-urlencoded') && typeof req.body === 'string') {
+    try {
+      const parsed = {};
+      req.body.split('&').forEach(pair => {
+        const [k, v] = pair.split('=').map(decodeURIComponent);
+        parsed[k] = v;
+      });
+      req.body = parsed;
+      console.log('[callback] Parsed form-urlencoded body');
+    } catch(e) {
+      console.error('[callback] Failed to parse form body:', e.message);
+    }
+  }
+
+  // Also handle case where body is empty object but raw body was form-encoded
+  if ((!req.body || Object.keys(req.body).length === 0) && contentType.includes('urlencoded')) {
+    console.log('[callback] Body empty after parse — content-type:', contentType);
+  }
+
   // Log exactly what arrives so we can diagnose issues
+  console.log('[callback] Content-Type:', contentType);
   console.log('[callback] Received body keys:', Object.keys(req.body || {}));
   console.log('[callback] fileId:', req.body?.fileId);
   console.log('[callback] pageNumber:', req.body?.pageNumber);
@@ -127,14 +159,23 @@ module.exports = async function handler(req, res) {
   // Acknowledge immediately — Make.com needs a quick response
   res.status(200).json({ status: 'received', pageNumber: pageNum });
 
+  console.log('[callback] Starting processPage for fileId:', fileId, 'page:', pageNum, '/', totalPagesCount);
+  console.log('[callback] claudeJson title:', claudeJson?.document?.header?.title, 'ref:', claudeJson?.document?.header?.ref, 'name:', claudeJson?.document?.customer?.name);
+
   try {
     await processPage(fileId, pageNum, totalPagesCount, claudeJson);
   } catch (err) {
-    console.error(`[callback] Error on page ${pageNum} for ${fileId}:`, err.message);
-    await db.updatePageResult(fileId, pageNum, {
-      status: 'error',
-      error: err.message,
-    });
+    console.error(`[callback] FATAL ERROR on page ${pageNum} for ${fileId}:`, err.message);
+    console.error('[callback] Stack:', err.stack);
+    console.error('[callback] Graph error:', err.graphError || 'none');
+    try {
+      await db.updatePageResult(fileId, pageNum, {
+        status: 'error',
+        error: err.message,
+      });
+    } catch (dbErr) {
+      console.error('[callback] Also failed to update Firestore:', dbErr.message);
+    }
   }
 };
 
