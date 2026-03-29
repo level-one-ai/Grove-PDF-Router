@@ -203,13 +203,17 @@ async function uploadPagesToTemp(pages, fileId) {
   const pageStore = {};
 
   for (const page of pages) {
+    if (!page.buffer) {
+      console.error(`[webhook] Skipping page ${page.pageNumber} — split failed: ${page.error}`);
+      continue;
+    }
     const tempFileName = `${fileId}_page_${page.zeroPadded}.pdf`;
     const url = `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${TEMP_FOLDER}/${tempFileName}:/content`;
     const response = await axios.put(url, page.buffer, {
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/pdf' },
       maxBodyLength: Infinity,
     });
-    pageStore[page.pageNumber] = { zeroPadded: page.zeroPadded, tempItemId: response.data.id, tempFileName };
+    pageStore[String(page.pageNumber)] = { zeroPadded: page.zeroPadded, tempItemId: response.data.id, tempFileName };
   }
   return pageStore;
 }
