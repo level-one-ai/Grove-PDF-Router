@@ -71,10 +71,16 @@ async function processPage(fileId, pageNumber, totalPages, claudeJson) {
   console.log(`[callback] Processing page ${pageNumber}/${totalPages} for ${fileId}`);
 
   // ── Get page buffer from OneDrive /Temp ──
+  console.log(`[callback] Fetching page buffer for fileId: ${fileId}, page: ${pageNumber}`);
   const pageBuffer = await getPageBuffer(fileId, pageNumber);
   if (!pageBuffer) {
+    console.error(`[callback] No buffer found — pageStore may be missing tempItemId for page ${pageNumber}`);
+    // Log the current record to diagnose
+    const rec = await db.getRecord(fileId);
+    console.error(`[callback] pageStore keys:`, Object.keys(rec?.pageStore || {}));
     throw new Error(`No buffer found for fileId: ${fileId}, page: ${pageNumber}`);
   }
+  console.log(`[callback] Got page buffer: ${pageBuffer.length} bytes`);
 
   // ── Build filename from this page's Claude JSON ──
   const record = await db.getRecord(fileId);
@@ -82,6 +88,10 @@ async function processPage(fileId, pageNumber, totalPages, claudeJson) {
   const zeroPadded = String(pageNumber).padStart(padWidth, '0');
 
   const finalFileName = buildFilename(claudeJson, zeroPadded);
+  console.log(`[callback] Built filename: "${finalFileName}" from supplier: ${getSupplierLabel(claudeJson)}`);
+  // Log key JSON fields used for naming
+  const doc = claudeJson?.document;
+  console.log(`[callback] title="${doc?.header?.title}" etd="${doc?.header?.etd}" ref="${doc?.header?.ref}" company="${doc?.customer?.company_name}" name="${doc?.customer?.name}"`);
   const supplierLabel = getSupplierLabel(claudeJson);
   const customerFolderName = getCustomerFolderName(claudeJson);
   const refFolderName = getRefFolder(claudeJson);
