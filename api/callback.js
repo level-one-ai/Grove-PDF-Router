@@ -29,21 +29,35 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
+  // Log exactly what arrives so we can diagnose issues
+  console.log('[callback] Received body keys:', Object.keys(req.body || {}));
+  console.log('[callback] fileId:', req.body?.fileId);
+  console.log('[callback] pageNumber:', req.body?.pageNumber);
+  console.log('[callback] secret present:', !!req.body?.secret);
+  console.log('[callback] json present:', !!req.body?.json);
+
   // Validate callback secret
   const expectedSecret = process.env.CALLBACK_SECRET || 'grove-pdf-router-secret';
-  // Accept secret from header (old format) or body (new JSON format)
   const incomingSecret = req.headers['x-callback-secret'] || req.body?.secret;
   if (incomingSecret !== expectedSecret) {
-    console.warn('[callback] Invalid secret, rejecting request');
+    console.warn('[callback] Invalid secret. Expected:', expectedSecret, 'Got:', incomingSecret);
     return res.status(401).json({ error: 'Unauthorised' });
   }
 
   const { fileId, pageNumber, totalPages, json: claudeJson } = req.body;
 
   if (!fileId || pageNumber === undefined || !claudeJson) {
+    console.error('[callback] Missing fields. fileId:', fileId, 'pageNumber:', pageNumber, 'json:', !!claudeJson);
     return res.status(400).json({
       error: 'Missing required fields: fileId, pageNumber, json',
+      received: { fileId: !!fileId, pageNumber: pageNumber !== undefined, json: !!claudeJson },
     });
+  }
+
+  // Fix "null" string that Make.com sends when value is null
+  if (claudeJson?.document?.customer?.company_name === 'null' ||
+      claudeJson?.document?.customer?.company_name === '') {
+    claudeJson.document.customer.company_name = null;
   }
 
   const pageNum = parseInt(pageNumber, 10);
