@@ -73,11 +73,11 @@ module.exports = async function handler(req, res) {
     '| ref:', claudeJson?.document?.header?.ref,
     '| name:', claudeJson?.document?.customer?.name);
 
-  // Check document type — only process customer orders
-  // Claude identifies the type explicitly so we don't misclassify
-  const isOrderForm = docType === 'customer_order' ||
+  // Check document type — only process Delivery Orders
+  // Claude identifies "Delivery Order" text in the top right of the document
+  const isOrderForm = docType === 'delivery_order' ||
     // Fallback if document_type not yet in Make.com payload:
-    // only allow if document is not null (branch transfers return document: null)
+    // only allow if document is not null
     (docType === '' && claudeJson?.document !== null && claudeJson?.document !== undefined);
 
   if (!isOrderForm) {
@@ -124,16 +124,10 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason });
   }
 
-  // claudeJson.document is the actual document data
-  // If Claude returned { document_type, document: {...} }, extract the document
+  // If Claude returned { document_type: "delivery_order", document: {...} }
+  // unwrap to get just the document object in expected { document: {...} } structure
   if (claudeJson.document_type && claudeJson.document) {
-    claudeJson = claudeJson.document;
-    // Re-wrap in expected structure if needed
-    if (!claudeJson.header && !claudeJson.customer) {
-      // Already the inner document object — leave as-is
-    }
-    // Rebuild expected structure
-    claudeJson = { document: claudeJson };
+    claudeJson = { document: claudeJson.document };
   }
 
   // Do ALL work before responding
