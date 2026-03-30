@@ -58,7 +58,14 @@ module.exports = async function handler(req, res) {
     if (claudeJson) console.log('[file-page] Built claudeJson from flat fields');
   }
   if (!claudeJson) {
-    return res.status(400).json({ error: 'Missing json field', keys: Object.keys(body) });
+    // If document_type is present but document fields are empty (e.g. non-order doc),
+    // build a minimal claudeJson so the type check can still run
+    if (body.document_type) {
+      claudeJson = { document_type: body.document_type, document: null };
+      console.log('[file-page] Built minimal claudeJson for non-order document');
+    } else {
+      return res.status(400).json({ error: 'Missing json field', keys: Object.keys(body) });
+    }
   }
 
   // Fix null string
@@ -341,7 +348,9 @@ async function getToken() {
 }
 
 function buildFromFlatFields(body) {
-  if (!body.title && !body.customer_name) return null;
+  // Always build if we have any document fields OR a document_type
+  // Non-order documents have document_type but empty document fields
+  if (!body.title && !body.customer_name && !body.document_type) return null;
   return {
     document: {
       header: {
