@@ -1,29 +1,18 @@
 /**
  * /api/scan-files
- *
- * Lists all PDF files currently in the OneDrive Scans folder.
+ * Lists PDFs in OneDrive Scans or Processed folder.
+ * GET /api/scan-files            → Scans folder
+ * GET /api/scan-files?folder=Processed → Processed folder
  */
-
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
-
-  try {
-    } catch (authErr) {
-    return res.status(500).json({
-      success: false,
-      error: 'Auth middleware failed',
-      detail: authErr.message,
-    });
-  }
 
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Check required env vars
   const userId = process.env.ONEDRIVE_USER_ID;
   const tenantId = process.env.MICROSOFT_TENANT_ID;
   const clientId = process.env.MICROSOFT_CLIENT_ID;
@@ -45,13 +34,16 @@ module.exports = async function handler(req, res) {
   try {
     const { graphRequest } = require('../lib/graph');
 
-    const folderParam = req.query.folder || 'Scans';
-  const folderPath = folderParam === 'Processed'
-    ? 'Grove Group Scotland/Grove Bedding/Scans/Processed'
-    : 'Grove Group Scotland/Grove Bedding/Scans';
-    const apiPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file`;
+    // Support ?folder=Processed to list the Processed folder
+    const folderParam = req.query.folder || '';
+    let folderPath;
+    if (folderParam === 'Processed') {
+      folderPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
+    } else {
+      folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
+    }
 
-    // Return the full API path so we can verify it looks correct
+    const apiPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file`;
     console.log('[scan-files] Calling Graph API:', apiPath);
 
     // Timeout after 8 seconds
@@ -85,21 +77,12 @@ module.exports = async function handler(req, res) {
 
   } catch (err) {
     const graphError = err.response?.data?.error;
-    const statusCode = err.response?.status;
-    const graphMessage = err.response?.data;
-
-    console.error('[scan-files] Graph API error:', JSON.stringify(graphMessage));
-
+    console.error('[scan-files] Error:', err.message);
     return res.status(500).json({
       success: false,
       error: err.message,
-      httpStatus: statusCode || null,
       graphErrorCode: graphError?.code || null,
       graphErrorMessage: graphError?.message || null,
-      fullGraphResponse: graphMessage || null,
-      userId: process.env.ONEDRIVE_USER_ID || 'NOT SET',
-      folderPathUsed: `Grove Group Scotland/Grove Bedding/Scans`,
-      fullApiPath: `/users/${process.env.ONEDRIVE_USER_ID}/drive/root:/Grove Group Scotland/Grove Bedding/Scans:/children`,
     });
   }
 };
