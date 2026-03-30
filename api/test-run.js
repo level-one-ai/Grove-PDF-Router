@@ -17,6 +17,14 @@ const axios = require('axios');
 
 const TEMP_FOLDER = 'Grove Group Scotland/Grove Bedding/Scans/Temp';
 
+module.exports.config = {
+  api: {
+    bodyParser: { sizeLimit: '10mb' },
+    responseLimit: false,
+  },
+  maxDuration: 300, // Vercel Pro allows up to 300 seconds
+};
+
 module.exports = async function handler(req, res) {
   // Auth check using Basic Auth header
   const auth = req.headers['authorization'];
@@ -173,8 +181,8 @@ module.exports = async function handler(req, res) {
 };
 
 async function pollForCompletion(fileId, totalPages, onProgress) {
-  const MAX_WAIT = 8 * 60 * 1000; // 8 minutes
-  const INTERVAL = 4000;
+  const MAX_WAIT = 4 * 60 * 1000; // 4 minutes
+  const INTERVAL = 5000;
   const start = Date.now();
   let lastPages = 0;
 
