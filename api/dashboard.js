@@ -351,7 +351,7 @@ async function loadWaiting() {
     nl.innerHTML = '<div style="font-size:11px;color:var(--mu);text-align:center;padding:8px">None waiting</div>';
   } else {
     nl.innerHTML = files.map(function(f){
-      return '<div style="display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:6px;background:var(--s2);border:1px solid #d9770033;margin-bottom:4px;cursor:pointer" onclick="selWait(\'' + f.fileId + '\')">'
+      return '<div style="display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:6px;background:var(--s2);border:1px solid #d9770033;margin-bottom:4px;cursor:pointer" data-wfid="' + esc(f.fileId) + '" onclick="selWait(this.dataset.wfid)">'
         + '<div style="font-size:15px">&#128196;</div>'
         + '<div style="flex:1;min-width:0"><div style="font-size:11px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(f.fileName) + '</div>'
         + '<div style="font-size:10px;color:var(--mu)">' + (f.totalPages||'?') + ' pages</div></div>'
