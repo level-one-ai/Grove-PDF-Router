@@ -111,9 +111,9 @@ module.exports = async function handler(req, res) {
 
     // Save skipped status to Firestore
     try {
-      await db.updatePageResult(fileId, pageNumber, {
-        status: 'skipped',
-        skipReason,
+      await db.updateRecord(fileId, {
+        [`pages.${pageNumber}`]: { status: 'skipped', skipReason },
+        pagesReturned: require('firebase-admin').firestore.FieldValue.increment(1),
       });
     } catch(e) { /* non-fatal */ }
 
@@ -143,8 +143,8 @@ module.exports = async function handler(req, res) {
     console.error(`[file-page] Error on page ${pageNumber}:`, err.message);
     console.error('[file-page] Stack:', err.stack);
     try {
-      await db.updatePageResult(fileId, pageNumber, {
-        status: 'error', error: err.message,
+      await db.updateRecord(fileId, {
+        [`pages.${pageNumber}`]: { status: 'error', error: err.message },
       });
     } catch (dbErr) {
       console.error('[file-page] Firestore update failed:', dbErr.message);
@@ -159,7 +159,9 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   console.log(`[file-page] START page ${pageNumber}/${totalPages} for ${fileId}`);
 
   // Save JSON to Firestore
-  await db.updatePageResult(fileId, pageNumber, { claudeJson, status: 'filing' });
+  await db.updateRecord(fileId, {
+    [`pages.${pageNumber}`]: { claudeJson, status: 'filing' },
+  });
   console.log(`[file-page] ${T()} Saved to Firestore`);
 
   // Get pageStore from Firestore
