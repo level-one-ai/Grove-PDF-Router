@@ -99,6 +99,11 @@ module.exports = async function handler(req, res) {
         const nonOrderFolder = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
         await uploadToOneDrive(nonOrderFolder, branchFileName, pageBuffer);
         console.log(`[file-page] Moved "${branchFileName}" to Non-Order Documents folder`);
+
+        // If this is the last page, delete the original from Scans
+        if (pageNumber >= totalPages) {
+          await deleteOriginalFromScans(fileId);
+        }
       }
     } catch (moveErr) {
       console.error('[file-page] Failed to move to Non-Order Documents:', moveErr.message);
@@ -259,9 +264,11 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     oneDriveProcessedFolderUrl: 'https://grovebedding-my.sharepoint.com/personal/files_grovebedding_com/Documents/Grove%20Group%20Scotland/Grove%20Bedding/Scans/Processed',
   });
 
-  // Clean up Temp in background
-  cleanupTempPages(fileId, finalRecord?.pageStore || {})
-    .catch(err => console.warn('[file-page] Cleanup warning:', err.message));
+  // Delete original from Scans and clean up Temp — both in background
+  Promise.all([
+    deleteOriginalFromScans(fileId),
+    cleanupTempPages(fileId, finalRecord?.pageStore || {}),
+  ]).catch(err => console.warn('[file-page] Cleanup warning:', err.message));
 
   console.log(`[file-page] ${T()} ✅ Complete — all ${totalPages} pages filed`);
 }
@@ -363,6 +370,31 @@ function buildFromFlatFields(body) {
       product_selection: [],
     }
   };
+}
+
+async function deleteOriginalFromScans(fileId) {
+  // The fileId IS the OneDrive item ID of the original file in Scans
+  try {
+    const token = await getToken();
+    const userId = process.env.ONEDRIVE_USER_ID;
+    // Check it still exists first
+    await axios.get(
+      `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${fileId}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    // Delete it
+    await axios.delete(
+      `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${fileId}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    console.log(`[file-page] Deleted original file ${fileId} from Scans`);
+  } catch (err) {
+    if (err.response?.status === 404) {
+      console.log(`[file-page] Original file ${fileId} already gone from Scans`);
+    } else {
+      console.warn(`[file-page] Could not delete original from Scans:`, err.message);
+    }
+  }
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
