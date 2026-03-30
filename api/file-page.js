@@ -1,17 +1,19 @@
 /**
  * /api/file-page
  *
- * Single endpoint called directly by Make.com HTTP module.
- * Replaces /api/callback entirely.
+ * Called directly by Make.com HTTP module.
+ * Does ALL work BEFORE responding — Vercel terminates functions
+ * after the response is sent so async work after res.send() is unreliable.
  *
- * Does everything in one call that stays under 60 seconds:
+ * Make.com waits up to 40s for a response — Vercel Pro allows 300s.
+ *
  * 1. Receives Claude JSON from Make.com
  * 2. Saves to Firestore
  * 3. Downloads page from OneDrive /Temp
- * 4. Uploads to OneDrive /Processed
- * 5. Files to Google Drive
+ * 4. Uploads to OneDrive /Processed + Google Drive (parallel)
+ * 5. Updates Firestore
  * 6. Dispatches next page to Make.com
- * 7. Marks complete when all pages done
+ * 7. Responds 200 when all done
  */
 
 const db = require('../lib/firebase');
@@ -24,6 +26,7 @@ const TEMP_FOLDER = 'Grove Group Scotland/Grove Bedding/Scans/Temp';
 
 module.exports.config = {
   api: { bodyParser: { sizeLimit: '10mb' } },
+  maxDuration: 300,
 };
 
 module.exports = async function handler(req, res) {
@@ -35,7 +38,6 @@ module.exports = async function handler(req, res) {
   console.log('[file-page] Received keys:', Object.keys(body));
   console.log('[file-page] fileId:', body.fileId, '| page:', body.pageNumber, '| total:', body.totalPages);
 
-  // Extract fields
   const fileId = body.fileId;
   const pageNumber = parseInt(body.pageNumber, 10);
   const totalPages = parseInt(body.totalPages, 10);
@@ -44,7 +46,7 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'Missing fileId or pageNumber' });
   }
 
-  // Build claudeJson from nested or flat fields
+  // Build claudeJson
   let claudeJson = body.json;
   if (typeof claudeJson === 'string') {
     try { claudeJson = JSON.parse(claudeJson); } catch(e) {
@@ -59,7 +61,7 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'Missing json field', keys: Object.keys(body) });
   }
 
-  // Fix null strings
+  // Fix null string
   if (claudeJson?.document?.customer?.company_name === 'null' ||
       claudeJson?.document?.customer?.company_name === '') {
     claudeJson.document.customer.company_name = null;
@@ -69,46 +71,47 @@ module.exports = async function handler(req, res) {
     '| ref:', claudeJson?.document?.header?.ref,
     '| name:', claudeJson?.document?.customer?.name);
 
-  // Respond immediately to Make.com
-  res.status(200).json({ status: 'received', pageNumber });
-
-  // Do all work after responding
+  // Do ALL work before responding
   try {
     await processAndFile(fileId, pageNumber, totalPages, claudeJson);
+    return res.status(200).json({ status: 'filed', pageNumber });
   } catch (err) {
-    console.error(`[file-page] Fatal error on page ${pageNumber}:`, err.message);
+    console.error(`[file-page] Error on page ${pageNumber}:`, err.message);
     console.error('[file-page] Stack:', err.stack);
     try {
       await db.updatePageResult(fileId, pageNumber, {
         status: 'error', error: err.message,
       });
     } catch (dbErr) {
-      console.error('[file-page] Also failed Firestore update:', dbErr.message);
+      console.error('[file-page] Firestore update failed:', dbErr.message);
     }
+    return res.status(500).json({ error: err.message, pageNumber });
   }
 };
 
 async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
-  // Save JSON to Firestore first
-  await db.updatePageResult(fileId, pageNumber, {
-    claudeJson,
-    status: 'filing',
-  });
-  console.log(`[file-page] Saved JSON for page ${pageNumber} to Firestore`);
+  const t0 = Date.now();
+  const T = () => `+${((Date.now()-t0)/1000).toFixed(1)}s`;
+  console.log(`[file-page] START page ${pageNumber}/${totalPages} for ${fileId}`);
 
-  // Get temp page info from Firestore
+  // Save JSON to Firestore
+  await db.updatePageResult(fileId, pageNumber, { claudeJson, status: 'filing' });
+  console.log(`[file-page] ${T()} Saved to Firestore`);
+
+  // Get pageStore from Firestore
   const record = await db.getRecord(fileId);
   const pageStore = record?.pageStore || {};
   const tempData = pageStore[pageNumber] || pageStore[String(pageNumber)];
+  console.log(`[file-page] ${T()} pageStore keys: [${Object.keys(pageStore).join(',')}]`);
 
   if (!tempData?.tempItemId) {
-    throw new Error(`No tempItemId for page ${pageNumber} — pageStore keys: ${Object.keys(pageStore).join(',')}`);
+    throw new Error(`No tempItemId for page ${pageNumber}. pageStore keys: [${Object.keys(pageStore).join(',')}]`);
   }
 
   // Download from OneDrive Temp
-  console.log(`[file-page] Downloading page ${pageNumber} from Temp (${tempData.tempItemId})`);
+  console.log(`[file-page] ${T()} Downloading from Temp: ${tempData.tempItemId}`);
   const pageBuffer = await downloadTempPage(tempData.tempItemId);
-  console.log(`[file-page] Downloaded ${pageBuffer.length} bytes`);
+  console.log(`[file-page] ${T()} Downloaded ${pageBuffer.length} bytes`);
 
   // Build filename
   const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
@@ -117,32 +120,36 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   const supplierLabel = getSupplierLabel(claudeJson);
   const customerFolderName = getCustomerFolderName(claudeJson);
   const refFolderName = getRefFolder(claudeJson);
+  console.log(`[file-page] ${T()} Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
 
-  console.log(`[file-page] Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
+  // Upload to OneDrive and Google Drive in parallel
+  console.log(`[file-page] ${T()} Starting parallel uploads...`);
+  const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
 
-  // Upload to OneDrive /Processed
-  let oneDriveResult = null;
-  try {
-    const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
-    const uploaded = await uploadToOneDrive(processedPath, finalFileName, pageBuffer);
-    oneDriveResult = { fileName: finalFileName, oneDriveId: uploaded.id, oneDriveUrl: uploaded.webUrl };
-    console.log(`[file-page] OneDrive upload OK: "${finalFileName}"`);
-  } catch (err) {
-    console.error(`[file-page] OneDrive upload failed:`, err.graphMessage || err.message);
-  }
+  const [oneDriveResult, googleDriveResult] = await Promise.all([
+    uploadToOneDrive(processedPath, finalFileName, pageBuffer)
+      .then(uploaded => {
+        console.log(`[file-page] ${T()} OneDrive OK: "${finalFileName}"`);
+        return { fileName: finalFileName, oneDriveId: uploaded.id, oneDriveUrl: uploaded.webUrl };
+      })
+      .catch(err => {
+        console.error(`[file-page] ${T()} OneDrive FAILED:`, err.message);
+        return null;
+      }),
+    fileDocuments(customerFolderName, refFolderName, [{ pageNumber, finalFileName, buffer: pageBuffer }])
+      .then(result => {
+        console.log(`[file-page] ${T()} Google Drive OK: "${customerFolderName}/${refFolderName}"`);
+        return result;
+      })
+      .catch(err => {
+        console.error(`[file-page] ${T()} Google Drive FAILED:`, err.message);
+        return null;
+      }),
+  ]);
 
-  // File to Google Drive
-  let googleDriveResult = null;
-  try {
-    googleDriveResult = await fileDocuments(customerFolderName, refFolderName, [{
-      pageNumber, finalFileName, buffer: pageBuffer,
-    }]);
-    console.log(`[file-page] Google Drive OK: "${customerFolderName}/${refFolderName}"`);
-  } catch (err) {
-    console.error(`[file-page] Google Drive failed:`, err.message);
-  }
+  console.log(`[file-page] ${T()} Uploads done. OneDrive: ${!!oneDriveResult} | Google: ${!!googleDriveResult}`);
 
-  // Update Firestore page result
+  // Update Firestore
   await db.updatePageResult(fileId, pageNumber, {
     claudeJson,
     finalFileName,
@@ -157,20 +164,22 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
       uploadedFile: googleDriveResult.uploadedFiles?.[0] || null,
     } : null,
   });
+  console.log(`[file-page] ${T()} Firestore updated`);
 
-  // Dispatch next page or mark all complete
+  // Dispatch next page or mark complete
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
-    // Wait for next page temp upload (webhook uploads in background)
-    const nextTempData = await waitForTempPage(fileId, nextPage, 25000);
+    console.log(`[file-page] ${T()} Waiting for page ${nextPage} in Temp...`);
+    const nextTempData = await waitForTempPage(fileId, nextPage, 20000);
     if (nextTempData) {
       const rec = await db.getRecord(fileId);
-      await dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId);
-      await db.updateRecord(fileId, { currentDispatchPage: nextPage });
-      console.log(`[file-page] Dispatched page ${nextPage}/${totalPages}`);
+      await Promise.all([
+        dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId),
+        db.updateRecord(fileId, { currentDispatchPage: nextPage }),
+      ]);
+      console.log(`[file-page] ${T()} Dispatched page ${nextPage}/${totalPages}`);
     } else {
-      console.error(`[file-page] Timed out waiting for page ${nextPage} in Temp`);
-      await db.markError(fileId, new Error(`Timeout waiting for page ${nextPage} to upload to Temp`));
+      throw new Error(`Timed out waiting for page ${nextPage} to appear in Temp`);
     }
     return;
   }
@@ -190,9 +199,11 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     oneDriveProcessedFolderUrl: 'https://grovebedding-my.sharepoint.com/personal/files_grovebedding_com/Documents/Grove%20Group%20Scotland/Grove%20Bedding/Scans/Processed',
   });
 
-  // Clean up Temp files
-  await cleanupTempPages(fileId, finalRecord?.pageStore || {});
-  console.log(`[file-page] ✅ All ${totalPages} pages complete for ${fileId}`);
+  // Clean up Temp in background
+  cleanupTempPages(fileId, finalRecord?.pageStore || {})
+    .catch(err => console.warn('[file-page] Cleanup warning:', err.message));
+
+  console.log(`[file-page] ${T()} ✅ Complete — all ${totalPages} pages filed`);
 }
 
 async function waitForTempPage(fileId, pageNumber, timeoutMs) {
@@ -228,7 +239,7 @@ async function cleanupTempPages(fileId, pageStore) {
         { headers: { Authorization: `Bearer ${token}` } }
       );
     } catch (err) {
-      console.warn(`[file-page] Could not delete temp:`, err.message);
+      console.warn(`[file-page] Temp cleanup warning:`, err.message);
     }
   }
 }
