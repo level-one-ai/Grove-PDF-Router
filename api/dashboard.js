@@ -278,7 +278,7 @@ var STEPS = [
   {id:2,l:'Download from OneDrive'},
   {id:3,l:'Split PDF pages'},
   {id:4,l:'Dispatch to Make.com'},
-  {id:5,l:'AI extraction'},
+  {id:5,l:'AI extraction (Make.com + Claude)'},
   {id:6,l:'File to OneDrive & Google Drive'}
 ];
 
