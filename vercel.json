@@ -1,9 +1,12 @@
 {
   "version": 2,
   "functions": {
-    "api/*.js": {
-      "maxDuration": 60
-    }
+    "api/webhook.js":   { "maxDuration": 60 },
+    "api/callback.js":  { "maxDuration": 15 },
+    "api/file-page.js": { "maxDuration": 60 },
+    "api/cron.js":      { "maxDuration": 60 },
+    "api/test-run.js":  { "maxDuration": 60 },
+    "api/*.js":         { "maxDuration": 30 }
   },
   "crons": [
     {
