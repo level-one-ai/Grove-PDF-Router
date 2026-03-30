@@ -1,15 +1,17 @@
 /**
  * /api/file-page
  *
- * Handles the slow filing work for each page:
- * - Downloads PDF from OneDrive /Temp
- * - Uploads to OneDrive /Processed with correct filename
- * - Files to Google Drive in correct customer/ref folder
- * - Dispatches next page to Make.com
- * - Marks complete when all pages done
+ * Single endpoint called directly by Make.com HTTP module.
+ * Replaces /api/callback entirely.
  *
- * Called by /api/callback after saving JSON to Firestore.
- * Runs as a separate function to stay under Vercel's 60s timeout.
+ * Does everything in one call that stays under 60 seconds:
+ * 1. Receives Claude JSON from Make.com
+ * 2. Saves to Firestore
+ * 3. Downloads page from OneDrive /Temp
+ * 4. Uploads to OneDrive /Processed
+ * 5. Files to Google Drive
+ * 6. Dispatches next page to Make.com
+ * 7. Marks complete when all pages done
  */
 
 const db = require('../lib/firebase');
@@ -20,61 +22,92 @@ const axios = require('axios');
 
 const TEMP_FOLDER = 'Grove Group Scotland/Grove Bedding/Scans/Temp';
 
+module.exports.config = {
+  api: { bodyParser: { sizeLimit: '10mb' } },
+};
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const { fileId, pageNumber, totalPages } = req.body || {};
+  const body = req.body || {};
+  console.log('[file-page] Received keys:', Object.keys(body));
+  console.log('[file-page] fileId:', body.fileId, '| page:', body.pageNumber, '| total:', body.totalPages);
 
-  if (!fileId || pageNumber === undefined) {
+  // Extract fields
+  const fileId = body.fileId;
+  const pageNumber = parseInt(body.pageNumber, 10);
+  const totalPages = parseInt(body.totalPages, 10);
+
+  if (!fileId || isNaN(pageNumber)) {
     return res.status(400).json({ error: 'Missing fileId or pageNumber' });
   }
 
-  // Respond immediately — the actual work happens below
-  res.status(200).json({ status: 'filing', pageNumber });
+  // Build claudeJson from nested or flat fields
+  let claudeJson = body.json;
+  if (typeof claudeJson === 'string') {
+    try { claudeJson = JSON.parse(claudeJson); } catch(e) {
+      console.error('[file-page] Failed to parse json string:', e.message);
+    }
+  }
+  if (!claudeJson) {
+    claudeJson = buildFromFlatFields(body);
+    if (claudeJson) console.log('[file-page] Built claudeJson from flat fields');
+  }
+  if (!claudeJson) {
+    return res.status(400).json({ error: 'Missing json field', keys: Object.keys(body) });
+  }
 
+  // Fix null strings
+  if (claudeJson?.document?.customer?.company_name === 'null' ||
+      claudeJson?.document?.customer?.company_name === '') {
+    claudeJson.document.customer.company_name = null;
+  }
+
+  console.log('[file-page] title:', claudeJson?.document?.header?.title,
+    '| ref:', claudeJson?.document?.header?.ref,
+    '| name:', claudeJson?.document?.customer?.name);
+
+  // Respond immediately to Make.com
+  res.status(200).json({ status: 'received', pageNumber });
+
+  // Do all work after responding
   try {
-    await filePage(fileId, parseInt(pageNumber), parseInt(totalPages));
+    await processAndFile(fileId, pageNumber, totalPages, claudeJson);
   } catch (err) {
-    console.error(`[file-page] Fatal error on page ${pageNumber} for ${fileId}:`, err.message);
+    console.error(`[file-page] Fatal error on page ${pageNumber}:`, err.message);
     console.error('[file-page] Stack:', err.stack);
     try {
-      await db.updatePageResult(fileId, parseInt(pageNumber), {
-        status: 'error',
-        error: err.message,
+      await db.updatePageResult(fileId, pageNumber, {
+        status: 'error', error: err.message,
       });
     } catch (dbErr) {
-      console.error('[file-page] Also failed to update Firestore:', dbErr.message);
+      console.error('[file-page] Also failed Firestore update:', dbErr.message);
     }
   }
 };
 
-async function filePage(fileId, pageNumber, totalPages) {
-  console.log(`[file-page] Filing page ${pageNumber}/${totalPages} for ${fileId}`);
+async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
+  // Save JSON to Firestore first
+  await db.updatePageResult(fileId, pageNumber, {
+    claudeJson,
+    status: 'filing',
+  });
+  console.log(`[file-page] Saved JSON for page ${pageNumber} to Firestore`);
 
-  // Get the record from Firestore
+  // Get temp page info from Firestore
   const record = await db.getRecord(fileId);
-  if (!record) throw new Error(`No record found for fileId: ${fileId}`);
-
-  // Get Claude JSON for this page from Firestore
-  const pageData = record.pages?.[pageNumber] || record.pages?.[String(pageNumber)];
-  if (!pageData || !pageData.claudeJson) {
-    throw new Error(`No Claude JSON found for page ${pageNumber} of ${fileId}`);
-  }
-  const claudeJson = pageData.claudeJson;
-
-  // Get temp item ID
-  const pageStore = record.pageStore || {};
+  const pageStore = record?.pageStore || {};
   const tempData = pageStore[pageNumber] || pageStore[String(pageNumber)];
+
   if (!tempData?.tempItemId) {
-    throw new Error(`No tempItemId found for page ${pageNumber} of ${fileId}`);
+    throw new Error(`No tempItemId for page ${pageNumber} — pageStore keys: ${Object.keys(pageStore).join(',')}`);
   }
 
-  // Download page from OneDrive Temp
-  console.log(`[file-page] Downloading page ${pageNumber} from Temp`);
+  // Download from OneDrive Temp
+  console.log(`[file-page] Downloading page ${pageNumber} from Temp (${tempData.tempItemId})`);
   const pageBuffer = await downloadTempPage(tempData.tempItemId);
-  if (!pageBuffer) throw new Error(`Failed to download page ${pageNumber} from Temp`);
   console.log(`[file-page] Downloaded ${pageBuffer.length} bytes`);
 
   // Build filename
@@ -90,8 +123,8 @@ async function filePage(fileId, pageNumber, totalPages) {
   // Upload to OneDrive /Processed
   let oneDriveResult = null;
   try {
-    const processedFolderPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
-    const uploaded = await uploadToOneDrive(processedFolderPath, finalFileName, pageBuffer);
+    const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
+    const uploaded = await uploadToOneDrive(processedPath, finalFileName, pageBuffer);
     oneDriveResult = { fileName: finalFileName, oneDriveId: uploaded.id, oneDriveUrl: uploaded.webUrl };
     console.log(`[file-page] OneDrive upload OK: "${finalFileName}"`);
   } catch (err) {
@@ -111,6 +144,7 @@ async function filePage(fileId, pageNumber, totalPages) {
 
   // Update Firestore page result
   await db.updatePageResult(fileId, pageNumber, {
+    claudeJson,
     finalFileName,
     supplier: supplierLabel,
     customerName: customerFolderName,
@@ -124,53 +158,50 @@ async function filePage(fileId, pageNumber, totalPages) {
     } : null,
   });
 
-  // Dispatch next page to Make.com if more remain
+  // Dispatch next page or mark all complete
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
-    // Wait for next page to be available in Temp (may still be uploading)
-    const nextTempData = await waitForTempPage(fileId, nextPage, 30000);
+    // Wait for next page temp upload (webhook uploads in background)
+    const nextTempData = await waitForTempPage(fileId, nextPage, 25000);
     if (nextTempData) {
-      await dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, record.originalFileName, totalPages, nextTempData.tempItemId);
+      const rec = await db.getRecord(fileId);
+      await dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId);
       await db.updateRecord(fileId, { currentDispatchPage: nextPage });
       console.log(`[file-page] Dispatched page ${nextPage}/${totalPages}`);
     } else {
       console.error(`[file-page] Timed out waiting for page ${nextPage} in Temp`);
+      await db.markError(fileId, new Error(`Timeout waiting for page ${nextPage} to upload to Temp`));
     }
     return;
   }
 
-  // All pages done — mark completed
-  const updatedRecord = await db.getRecord(fileId);
-  const pagesData = updatedRecord?.pages || {};
+  // All pages done
+  const finalRecord = await db.getRecord(fileId);
+  const pagesData = finalRecord?.pages || {};
   const renamedFiles = Object.values(pagesData).map(p => p.finalFileName).filter(Boolean);
-  const lastPageData = pagesData[pageNumber] || pagesData[String(pageNumber)];
 
   await db.markCompleted(fileId, {
     renamedFiles,
     customerName: customerFolderName,
     ref: refFolderName,
     supplier: supplierLabel,
-    googleDriveFolderId: lastPageData?.googleDrive?.folderId || null,
-    googleDriveFolderUrl: lastPageData?.googleDrive?.folderUrl || null,
+    googleDriveFolderId: googleDriveResult?.refFolderId || null,
+    googleDriveFolderUrl: googleDriveResult?.refFolderUrl || null,
     oneDriveProcessedFolderUrl: 'https://grovebedding-my.sharepoint.com/personal/files_grovebedding_com/Documents/Grove%20Group%20Scotland/Grove%20Bedding/Scans/Processed',
   });
 
   // Clean up Temp files
-  await cleanupTempPages(fileId, updatedRecord?.pageStore || {});
-  console.log(`[file-page] Completed all ${totalPages} pages for ${fileId}`);
+  await cleanupTempPages(fileId, finalRecord?.pageStore || {});
+  console.log(`[file-page] ✅ All ${totalPages} pages complete for ${fileId}`);
 }
 
-/**
- * Wait for a temp page to appear in Firestore pageStore.
- * The webhook uploads pages in background so we may need to wait briefly.
- */
 async function waitForTempPage(fileId, pageNumber, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const record = await db.getRecord(fileId);
-    const pageStore = record?.pageStore || {};
-    const tempData = pageStore[pageNumber] || pageStore[String(pageNumber)];
-    if (tempData?.tempItemId) return tempData;
+    const ps = record?.pageStore || {};
+    const td = ps[pageNumber] || ps[String(pageNumber)];
+    if (td?.tempItemId) return td;
     await sleep(2000);
   }
   return null;
@@ -189,49 +220,78 @@ async function downloadTempPage(tempItemId) {
 async function cleanupTempPages(fileId, pageStore) {
   const token = await getToken();
   const userId = process.env.ONEDRIVE_USER_ID;
-  for (const [, pageData] of Object.entries(pageStore)) {
-    if (!pageData?.tempItemId) continue;
+  for (const [, pd] of Object.entries(pageStore)) {
+    if (!pd?.tempItemId) continue;
     try {
       await axios.delete(
-        `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${pageData.tempItemId}`,
+        `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${pd.tempItemId}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
     } catch (err) {
-      console.warn(`[file-page] Could not delete temp file:`, err.message);
+      console.warn(`[file-page] Could not delete temp:`, err.message);
     }
   }
 }
 
 async function dispatchToMake(pageNumber, zeroPadded, fileId, originalFileName, totalPages, tempItemId) {
-  const webhookUrl = process.env.MAKE_WEBHOOK_URL;
-  const fileName = `${originalFileName}_${zeroPadded}.pdf`;
   const payload = {
-    fileName, fileId, tempItemId,
-    pageNumber, totalPages,
-    originalName: originalFileName,
-    zeroPadded,
+    fileName: `${originalFileName}_${zeroPadded}.pdf`,
+    fileId, tempItemId, pageNumber, totalPages,
+    originalName: originalFileName, zeroPadded,
     secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
   };
-  await axios.post(webhookUrl, payload, {
+  await axios.post(process.env.MAKE_WEBHOOK_URL, payload, {
     headers: { 'Content-Type': 'application/json' },
     timeout: 30000,
   });
 }
 
 async function getToken() {
-  const url = `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`;
-  const params = new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: process.env.MICROSOFT_CLIENT_ID,
-    client_secret: process.env.MICROSOFT_CLIENT_SECRET,
-    scope: 'https://graph.microsoft.com/.default',
-  });
-  const r = await axios.post(url, params.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  });
+  const r = await axios.post(
+    `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,
+    new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: process.env.MICROSOFT_CLIENT_ID,
+      client_secret: process.env.MICROSOFT_CLIENT_SECRET,
+      scope: 'https://graph.microsoft.com/.default',
+    }).toString(),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+  );
   return r.data.access_token;
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function buildFromFlatFields(body) {
+  if (!body.title && !body.customer_name) return null;
+  return {
+    document: {
+      header: {
+        title: body.title || '',
+        etd: body.etd || '',
+        ref: body.ref || '',
+        inv_no: body.inv_no || '',
+        customer_po_no: body.customer_po_no || '',
+      },
+      customer: {
+        company_name: (body.company_name && body.company_name !== 'null') ? body.company_name : null,
+        name: body.customer_name || '',
+        address: {
+          street: body.street || '',
+          city: body.city || '',
+          region: body.region || '',
+          postcode: body.postcode || '',
+          country: body.country || '',
+        },
+        phone: body.phone || '',
+        mobile: body.mobile || '',
+      },
+      ship_to: {
+        name: body.ship_to_name || '',
+        address: { street: '', city: '', region: '', postcode: '', country: '' },
+      },
+      handwritten_notes: body.handwritten_notes || '',
+      product_selection: [],
+    }
+  };
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
