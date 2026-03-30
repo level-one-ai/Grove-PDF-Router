@@ -73,17 +73,22 @@ async function scanAndProcess() {
   const mode = await db.getMode();
   console.log(`[webhook] Mode: ${mode} — ${pdfFiles.length} PDF(s)`);
 
+  // Get token once for all file checks
+  const token = await getToken();
+
   for (const file of pdfFiles) {
     const existing = await db.getRecord(file.id);
 
-    // Move completed files still in Scans to Processed
+    // Already completed — check if still in Scans and delete it
     if (existing && existing.status === 'completed') {
-      await moveToProcessed(file.id, file.name, userId, processedPath);
+      console.log(`[webhook] "${file.name}" already completed — removing from Scans`);
+      await deleteFromScans(file.id, file.name, userId, token);
       continue;
     }
 
-    // Skip files already being processed
-    if (existing && existing.status !== 'reset') {
+    // Already processing, waiting, or errored — skip
+    if (existing && !['reset', null, undefined].includes(existing.status)) {
+      console.log(`[webhook] Skipping "${file.name}" — status: ${existing.status}`);
       continue;
     }
 
@@ -230,21 +235,25 @@ async function dispatchToMake(pageNumber, zeroPadded, fileId, originalFileName, 
   });
 }
 
-async function moveToProcessed(itemId, fileName, userId, processedPath) {
+async function deleteFromScans(itemId, fileName, userId, token) {
   try {
-    const token = await getToken();
-    const destFolderRes = await axios.get(
-      `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${processedPath}`,
+    // Check if file still exists in Scans first
+    await axios.get(
+      `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${itemId}`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-    await axios.patch(
+    // File exists — delete it
+    await axios.delete(
       `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${itemId}`,
-      { parentReference: { id: destFolderRes.data.id }, name: fileName },
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+      { headers: { Authorization: `Bearer ${token}` } }
     );
-    console.log(`[webhook] Moved "${fileName}" to Processed`);
+    console.log(`[webhook] Deleted "${fileName}" from Scans`);
   } catch (err) {
-    console.warn(`[webhook] Could not move "${fileName}":`, err.message);
+    if (err.response?.status === 404) {
+      console.log(`[webhook] "${fileName}" already gone from Scans — skipping delete`);
+    } else {
+      console.warn(`[webhook] Could not delete "${fileName}" from Scans:`, err.message);
+    }
   }
 }
 
