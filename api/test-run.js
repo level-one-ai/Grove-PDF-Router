@@ -144,6 +144,11 @@ module.exports = async function handler(req, res) {
       return fail(4, `Dispatch failed: ${err.message}`);
     }
 
+    // Keep SSE connection alive with periodic pings
+    const keepalive = setInterval(function() {
+      try { res.write(': ping\n\n'); } catch(e) { clearInterval(keepalive); }
+    }, 15000);
+
     // Step 5 — Wait for Make.com AI extraction
     progress(5, `Waiting for Make.com + Claude to process page 1/${totalPages}...`);
 
@@ -162,10 +167,12 @@ module.exports = async function handler(req, res) {
     });
 
     if (result.status === 'error') {
+      clearInterval(keepalive);
       return fail(5, `Processing error: ${result.error}`);
     }
 
     // Make sure both steps show done
+    clearInterval(keepalive);
     progress(5, `AI extraction complete — ${totalPages} page(s) ✓`, 'done');
     progress(6, `Filed to OneDrive & Google Drive ✓`, 'done');
 
