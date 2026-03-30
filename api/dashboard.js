@@ -134,6 +134,38 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 20px;hei
 .reslbl{color:var(--mu);min-width:72px;flex-shrink:0}.resval{color:var(--tx);word-break:break-all}
 .reslink{color:var(--or);text-decoration:none}.reslink:hover{text-decoration:underline}
 .fpill{background:var(--s2);border:1px solid var(--bo);border-radius:4px;padding:2px 6px;font-size:10px;color:var(--mu);font-family:monospace;margin-top:2px}
+/* PROCESSED PANEL */
+.procpanel{position:fixed;top:0;right:0;width:420px;height:100vh;background:var(--su);border-left:1px solid var(--bo);z-index:500;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .3s cubic-bezier(.4,0,.2,1)}
+.procpanel.open{transform:translateX(0)}
+.prochead{padding:14px 16px;border-bottom:1px solid var(--bo);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.procht{font-size:13px;font-weight:600}
+.proccls{background:none;border:none;color:var(--mu);font-size:18px;cursor:pointer;padding:2px 6px;border-radius:4px}
+.proccls:hover{color:var(--tx)}
+.proclist{flex:1;overflow-y:auto;padding:8px}
+.proclist::-webkit-scrollbar{width:4px}.proclist::-webkit-scrollbar-thumb{background:var(--bo);border-radius:2px}
+.procitem{padding:10px 12px;border-radius:8px;border:1px solid var(--bo);background:var(--s2);margin-bottom:6px;transition:border-color .15s}
+.procitem.done{border-color:#22c55e33;background:#0f1f0f}
+.procitem.err{border-color:#ef444433;background:#1f0f0f}
+.procitem.proc{border-color:#d9770033;background:#1a0f00}
+.procitem.skip{border-color:#33333355;background:var(--su)}
+.pirow{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.pistatus{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.done .pistatus{background:var(--gn)}.err .pistatus{background:var(--rd)}.proc .pistatus{background:var(--or)}.skip .pistatus{background:var(--mu)}
+.piname{font-size:12px;font-weight:500;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pimeta{font-size:11px;color:var(--mu);margin-left:16px}
+.pifiles{margin-left:16px;margin-top:3px}
+.pifile{font-size:10px;color:#4ade80;font-family:monospace;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pilink{font-size:10px;color:var(--or);text-decoration:none;margin-left:16px}
+.pilink:hover{text-decoration:underline}
+.pifolder{display:flex;align-items:center;gap:5px;margin-left:16px;margin-top:4px;font-size:11px}
+.pifolder-ic{font-size:12px;flex-shrink:0}
+.pifolder-path{color:var(--mu);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pifolder a{color:var(--or);text-decoration:none;font-size:11px;flex-shrink:0}
+.pifolder a:hover{text-decoration:underline}
+.procbtn{background:var(--s2);border:1px solid var(--bo);color:var(--mu);padding:4px 10px;border-radius:5px;font-size:11px;cursor:pointer;transition:all .15s}
+.procbtn:hover{border-color:var(--or);color:var(--or)}
+.overlay{position:fixed;inset:0;background:#0008;z-index:499;display:none}
+.overlay.show{display:block}
 /* STOP AREA */
 .stoparea{padding:10px 16px;border-top:1px solid var(--bo);display:none;flex-shrink:0}
 .stoparea.show{display:block}
@@ -170,7 +202,8 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 20px;hei
     </div>
     <button class="act-btn" id="actbtn" onclick="activateSub()">Activate</button>
     <div class="bell-wrap">
-      <button class="bell-btn" onclick="toggleNotif()">&#128276;<span class="bell-num" id="bnum"></span></button>
+      <button class="procbtn" onclick="openProc()">&#9776; Processed</button>
+    <button class="bell-btn" onclick="toggleNotif()">&#128276;<span class="bell-num" id="bnum"></span></button>
       <div class="np" id="np">
         <div style="font-size:12px;font-weight:600;margin-bottom:8px">&#9203; Waiting Files</div>
         <div id="nlist"><div style="font-size:12px;color:var(--mu);text-align:center;padding:8px">None waiting</div></div>
@@ -219,6 +252,21 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 20px;hei
     <div class="stoparea" id="stoparea">
       <button class="stopbtn stopping" id="stopbtn" onclick="doStop()">&#9632; Stop Processing</button>
     </div>
+  </div>
+</div>
+
+<!-- PROCESSED PANEL -->
+<div class="overlay" id="overlay" onclick="closeProc()"></div>
+<div class="procpanel" id="procpanel">
+  <div class="prochead">
+    <div class="procht">&#9989; Processed Files</div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <button class="procbtn" onclick="loadProcessed()" style="font-size:10px">&#8635; Refresh</button>
+      <button class="proccls" onclick="closeProc()">&#10005;</button>
+    </div>
+  </div>
+  <div class="proclist" id="proclist">
+    <div style="padding:24px;text-align:center;color:var(--mu);font-size:12px">Click Refresh to load</div>
   </div>
 </div>
 
@@ -541,6 +589,50 @@ function finErr(step, msg) {
   var btn = $('runbtn');
   btn.className = 'runbtn go'; btn.disabled = false;
   btn.innerHTML = '\u21ba Try Again';
+}
+
+// ── PROCESSED PANEL ──
+function openProc() {
+  document.getElementById('procpanel').classList.add('open');
+  document.getElementById('overlay').classList.add('show');
+  loadProcessed();
+}
+function closeProc() {
+  document.getElementById('procpanel').classList.remove('open');
+  document.getElementById('overlay').classList.remove('show');
+}
+
+async function loadProcessed() {
+  var pl = document.getElementById('proclist');
+  pl.innerHTML = '<div style="padding:24px;text-align:center;color:var(--mu);font-size:12px" class="pulse">Loading...</div>';
+  var d = await api('/api/status?limit=50');
+  if (!d || !d.records) {
+    pl.innerHTML = '<div style="padding:24px;text-align:center;color:var(--rd);font-size:12px">Failed to load</div>';
+    return;
+  }
+  if (!d.records.length) {
+    pl.innerHTML = '<div style="padding:24px;text-align:center;color:var(--mu);font-size:12px">No records yet</div>';
+    return;
+  }
+  pl.innerHTML = d.records.map(function(r) {
+    var cls = r.status === 'completed' ? 'done' : r.status === 'error' ? 'err' : r.status === 'skipped' ? 'skip' : 'proc';
+    var statusLabel = r.status === 'completed' ? 'Complete' : r.status === 'error' ? 'Error' : r.status === 'skipped' ? 'Skipped' : r.status === 'processing' ? 'Processing' : r.status || 'Unknown';
+    var files = (r.renamedFiles || []).slice(0, 3).map(function(f) {
+      return '<span class="pifile">&#128196; ' + esc(f) + '</span>';
+    }).join('');
+    var date = r.completedAt ? fdate(r.completedAt) : (r.createdAt ? fdate(r.createdAt) : '');
+    var gdLink = r.googleDriveFolderUrl ? '<a class="pilink" href="' + r.googleDriveFolderUrl + '" target="_blank">Google Drive &#8599;</a>' : '';
+    var odLink = r.oneDriveProcessedFolderUrl ? '<a class="pilink" href="' + r.oneDriveProcessedFolderUrl + '" target="_blank">OneDrive &#8599;</a>' : '';
+    return '<div class="procitem ' + cls + '">'
+      + '<div class="pirow"><div class="pistatus"></div><div class="piname">' + esc(r.originalFileName || r.fileId) + '</div>'
+      + '<div style="font-size:10px;color:var(--mu);flex-shrink:0">' + esc(statusLabel) + '</div></div>'
+      + (r.customerName ? '<div class="pimeta">' + esc(r.customerName) + (r.ref ? ' &middot; ' + esc(r.ref) : '') + '</div>' : '')
+      + (r.error ? '<div class="pimeta" style="color:var(--rd)">' + esc(r.error.slice(0, 80)) + '</div>' : '')
+      + (files ? '<div class="pifiles">' + files + '</div>' : '')
+      + (date ? '<div class="pimeta">' + date + '</div>' : '')
+      + ((gdLink || odLink) ? '<div style="margin-left:16px;margin-top:4px">' + gdLink + ' ' + odLink + '</div>' : '')
+      + '</div>';
+  }).join('');
 }
 
 // ── INIT ──
