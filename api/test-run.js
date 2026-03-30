@@ -144,14 +144,20 @@ module.exports = async function handler(req, res) {
       return fail(4, `Dispatch failed: ${err.message}`);
     }
 
-    // Step 5 — Poll for completion
-    progress(5, `Waiting for Make.com to process ${totalPages} page(s)...`);
-    let lastPagesReturned = 0;
+    // Step 5 — Wait for Make.com AI extraction
+    progress(5, `Waiting for Make.com + Claude to process page 1/${totalPages}...`);
 
-    const result = await pollForCompletion(fileId, totalPages, (pagesReturned) => {
-      if (pagesReturned > lastPagesReturned) {
-        lastPagesReturned = pagesReturned;
-        progress(5, `Processed ${pagesReturned}/${totalPages} pages...`);
+    const result = await pollForCompletion(fileId, totalPages, (event) => {
+      if (event.type === 'extraction') {
+        // AI extraction received for a page — step 5 updates
+        progress(5, `AI extraction complete for page ${event.page}/${totalPages} ✓`, event.page >= totalPages ? 'done' : 'running');
+      } else if (event.type === 'filing') {
+        // File has been filed — step 6
+        progress(5, `AI extraction complete for all ${totalPages} page(s) ✓`, 'done');
+        progress(6, `Filing page ${event.page}/${totalPages} to OneDrive & Google Drive...`);
+      } else if (event.type === 'filed') {
+        // Page fully filed
+        progress(6, `Filed page ${event.page}/${totalPages} ✓`, event.page >= totalPages ? 'done' : 'running');
       }
     });
 
@@ -159,7 +165,9 @@ module.exports = async function handler(req, res) {
       return fail(5, `Processing error: ${result.error}`);
     }
 
-    progress(6, 'Filing to OneDrive & Google Drive ✓', 'done');
+    // Make sure both steps show done
+    progress(5, `AI extraction complete — ${totalPages} page(s) ✓`, 'done');
+    progress(6, `Filed to OneDrive & Google Drive ✓`, 'done');
 
     complete({
       message: 'Test run complete',
@@ -180,24 +188,46 @@ module.exports = async function handler(req, res) {
   }
 };
 
-async function pollForCompletion(fileId, totalPages, onProgress) {
+async function pollForCompletion(fileId, totalPages, onEvent) {
   const MAX_WAIT = 4 * 60 * 1000; // 4 minutes
-  const INTERVAL = 5000;
+  const INTERVAL = 3000;
   const start = Date.now();
-  let lastPages = 0;
+  // Track what we've already reported to avoid duplicate events
+  const reported = { extraction: new Set(), filing: new Set(), filed: new Set() };
 
   while (Date.now() - start < MAX_WAIT) {
     await sleep(INTERVAL);
     const record = await db.getRecord(fileId);
     if (!record) continue;
     if (record.status === 'error') return { status: 'error', error: record.error };
-    if (record.pagesReturned > lastPages) {
-      lastPages = record.pagesReturned;
-      onProgress(lastPages);
+
+    // Check each page's status and fire events in order
+    const pages = record.pages || {};
+    for (let p = 1; p <= totalPages; p++) {
+      const pageData = pages[p] || pages[String(p)];
+      if (!pageData) continue;
+      const st = pageData.status;
+
+      // Page JSON saved (AI extraction done) — covers filing, skipped, completed, pending-filing
+      if (!reported.extraction.has(p) && st && st !== 'pending') {
+        reported.extraction.add(p);
+        onEvent({ type: 'extraction', page: p });
+      }
+      // Page filing started
+      if (!reported.filing.has(p) && (st === 'filing' || st === 'completed' || st === 'skipped')) {
+        reported.filing.add(p);
+        onEvent({ type: 'filing', page: p });
+      }
+      // Page fully filed or skipped
+      if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
+        reported.filed.add(p);
+        onEvent({ type: 'filed', page: p });
+      }
     }
+
     if (record.status === 'completed') return record;
   }
-  return { status: 'error', error: 'Timed out after 8 minutes' };
+  return { status: 'error', error: 'Timed out after 4 minutes' };
 }
 
 async function uploadRemainingPages(remainingPages, fileId, token, userId, pageStore) {
