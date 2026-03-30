@@ -7,6 +7,7 @@
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
 
   try {
@@ -44,7 +45,10 @@ module.exports = async function handler(req, res) {
   try {
     const { graphRequest } = require('../lib/graph');
 
-    const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
+    const folderParam = req.query.folder || 'Scans';
+  const folderPath = folderParam === 'Processed'
+    ? 'Grove Group Scotland/Grove Bedding/Scans/Processed'
+    : 'Grove Group Scotland/Grove Bedding/Scans';
     const apiPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file`;
 
     // Return the full API path so we can verify it looks correct
