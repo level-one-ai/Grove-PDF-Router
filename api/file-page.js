@@ -67,9 +67,74 @@ module.exports = async function handler(req, res) {
     claudeJson.document.customer.company_name = null;
   }
 
-  console.log('[file-page] title:', claudeJson?.document?.header?.title,
+  const docTitle = claudeJson?.document?.header?.title || '';
+  const docType = body.document_type || claudeJson?.document_type || '';
+  console.log('[file-page] document_type:', docType, '| title:', docTitle,
     '| ref:', claudeJson?.document?.header?.ref,
     '| name:', claudeJson?.document?.customer?.name);
+
+  // Check document type — only process customer orders
+  // Claude identifies the type explicitly so we don't misclassify
+  const isOrderForm = docType === 'customer_order' ||
+    // Fallback if document_type not yet in Make.com payload:
+    // only allow if document is not null (branch transfers return document: null)
+    (docType === '' && claudeJson?.document !== null && claudeJson?.document !== undefined);
+
+  if (!isOrderForm) {
+    const skipReason = docType
+      ? `Document type is "${docType}" — not a customer order`
+      : 'Document field is null — not a customer order';
+    console.log(`[file-page] Non-order page ${pageNumber} — moving to Branch Transfers folder`);
+
+    // Download the page from Temp
+    try {
+      const record = await db.getRecord(fileId);
+      const ps = record?.pageStore || {};
+      const td = ps[pageNumber] || ps[String(pageNumber)];
+      if (td?.tempItemId) {
+        const pageBuffer = await downloadTempPage(td.tempItemId);
+        const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
+        const zeroPadded = String(pageNumber).padStart(padWidth, '0');
+        const branchFileName = `${record.originalFileName}_${zeroPadded}.pdf`;
+        const nonOrderFolder = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
+        await uploadToOneDrive(nonOrderFolder, branchFileName, pageBuffer);
+        console.log(`[file-page] Moved "${branchFileName}" to Non-Order Documents folder`);
+      }
+    } catch (moveErr) {
+      console.error('[file-page] Failed to move to Non-Order Documents:', moveErr.message);
+    }
+
+    // Save skipped status to Firestore
+    try {
+      await db.updatePageResult(fileId, pageNumber, {
+        status: 'skipped',
+        skipReason,
+      });
+    } catch(e) { /* non-fatal */ }
+
+    // Dispatch next page so pipeline continues
+    if (pageNumber < totalPages) {
+      const nextTempData = await waitForTempPage(fileId, pageNumber + 1, 20000);
+      if (nextTempData) {
+        const rec = await db.getRecord(fileId);
+        await dispatchToMake(pageNumber + 1, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId);
+      }
+    }
+
+    return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason });
+  }
+
+  // claudeJson.document is the actual document data
+  // If Claude returned { document_type, document: {...} }, extract the document
+  if (claudeJson.document_type && claudeJson.document) {
+    claudeJson = claudeJson.document;
+    // Re-wrap in expected structure if needed
+    if (!claudeJson.header && !claudeJson.customer) {
+      // Already the inner document object — leave as-is
+    }
+    // Rebuild expected structure
+    claudeJson = { document: claudeJson };
+  }
 
   // Do ALL work before responding
   try {
@@ -196,6 +261,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     supplier: supplierLabel,
     googleDriveFolderId: googleDriveResult?.refFolderId || null,
     googleDriveFolderUrl: googleDriveResult?.refFolderUrl || null,
+    googleDriveCustomerFolderUrl: googleDriveResult?.customerFolderUrl || null,
     oneDriveProcessedFolderUrl: 'https://grovebedding-my.sharepoint.com/personal/files_grovebedding_com/Documents/Grove%20Group%20Scotland/Grove%20Bedding/Scans/Processed',
   });
 
