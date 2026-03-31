@@ -4,14 +4,15 @@
     "api/test-run.js":     { "maxDuration": 300 },
     "api/file-page.js":    { "maxDuration": 300 },
     "api/webhook.js":      { "maxDuration": 300 },
+    "api/scan-now.js":     { "maxDuration": 300 },
     "api/callback.js":     { "maxDuration": 30  },
-    "api/cron.js":         { "maxDuration": 300 },
+    "api/cron.js":         { "maxDuration": 60  },
     "api/*.js":            { "maxDuration": 60  }
   },
   "crons": [
     {
       "path": "/api/cron",
-      "schedule": "0 9 * * *"
+      "schedule": "0 * * * *"
     }
   ],
   "routes": [
