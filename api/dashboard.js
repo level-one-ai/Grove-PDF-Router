@@ -153,6 +153,17 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 .stopbtn.resuming{background:#0f1f0f;color:var(--gn);border:1px solid #22c55e44}
 .stopbtn.resuming:hover{background:#0f2a0f;border-color:var(--gn)}
 
+/* PROCESSED ITEM DROPDOWN */
+.proc-drop{display:none;margin-top:7px;padding-top:7px;border-top:1px solid var(--bo)}
+.proc-drop.open{display:block}
+.pd-row{display:flex;align-items:center;gap:6px;margin-bottom:5px;font-size:11px}
+.pd-lbl{color:var(--mu);min-width:60px;flex-shrink:0;font-size:10px}
+.pd-val{color:var(--tx);word-break:break-all;flex:1;min-width:0;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pd-link{color:var(--or);text-decoration:none;font-size:11px;white-space:nowrap}
+.pd-link:hover{text-decoration:underline}
+.folder-tag{font-size:9px;padding:2px 6px;border-radius:5px;font-weight:600;white-space:nowrap}
+.folder-tag.gd{background:#1a2f1a;color:#4ade80;border:1px solid #22c55e33}
+.folder-tag.od{background:#1a1a2f;color:#818cf8;border:1px solid #6366f133}
 /* SPINNER */
 @keyframes spin{to{transform:rotate(360deg)}}
 .spin{width:10px;height:10px;border:2px solid rgba(255,255,255,.25);border-top-color:currentColor;border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
@@ -423,21 +434,74 @@ function clickScan(el) {
 async function loadProcessed() {
   $('proc-list').innerHTML = '<div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading...</div></div>';
   $('proc-count').textContent = '—';
-  // Load processed files from OneDrive /Scans/Processed
-  var d = await api('/api/scan-files?folder=Processed');
+
+  // Load OneDrive files and Firestore status records in parallel
+  var results = await Promise.all([
+    api('/api/scan-files?folder=Processed'),
+    api('/api/status?limit=100'),
+  ]);
+  var d = results[0], statusData = results[1];
+
   if (!d || !d.success || !d.files || !d.files.length) {
     $('proc-count').textContent = d && d.files ? '0 files' : 'Error';
     $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128100;</div><div class="ti">' + (d ? 'No files yet' : 'Failed to load') + '</div></div>';
     return;
   }
+
+  // Build lookup: renamedFile name → status record
+  var recsByFile = {};
+  if (statusData && statusData.records) {
+    statusData.records.forEach(function(r) {
+      (r.renamedFiles || []).forEach(function(fname) {
+        recsByFile[fname] = r;
+      });
+    });
+  }
+
   $('proc-count').textContent = d.files.length + ' file' + (d.files.length===1?'':'s');
-  $('proc-list').innerHTML = d.files.map(function(f){
-    return '<div class="fi done-f">'
+  $('proc-list').innerHTML = d.files.map(function(f, idx) {
+    var rec = recsByFile[f.name] || null;
+    var customer = rec && rec.customerName ? rec.customerName : '';
+    var ref = rec && rec.ref ? rec.ref : '';
+    var gdUrl = rec && rec.googleDriveFolderUrl ? rec.googleDriveFolderUrl : '';
+    var odUrl = f.webUrl || '';
+    var folderLabel = customer ? (customer + (ref ? ' / ' + ref : '')) : '';
+
+    // Folder tag
+    var tags = '';
+    if (gdUrl) tags += '<span class="folder-tag gd">&#128230; Google Drive</span> ';
+    if (odUrl) tags += '<span class="folder-tag od">&#9729;&#65039; OneDrive</span>';
+
+    // Dropdown content
+    var dropId = 'pdrop-' + idx;
+    var dropHtml = '<div class="proc-drop" id="' + dropId + '">';
+    if (folderLabel) dropHtml += '<div class="pd-row"><div class="pd-lbl">Folder</div><div class="pd-val" title="' + esc(folderLabel) + '">' + esc(folderLabel) + '</div></div>';
+    if (rec && rec.supplier) dropHtml += '<div class="pd-row"><div class="pd-lbl">Supplier</div><div class="pd-val">' + esc(rec.supplier) + '</div></div>';
+    if (gdUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><a class="pd-link" href="' + esc(gdUrl) + '" target="_blank" onclick="event.stopPropagation()">Open folder &#8599;</a></div>';
+    if (odUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
+    if (!gdUrl && !odUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl" style="color:var(--mu)">No folder links available</div></div>';
+    dropHtml += '</div>';
+
+    return '<div class="fi done-f" data-dropid="' + dropId + '"  onclick="toggleProcDrop(this.dataset.dropid,this)" style="flex-direction:column;align-items:stretch;cursor:pointer">'
+      + '<div style="display:flex;align-items:center;gap:8px">'
       + '<div class="fic">&#128196;</div>'
-      + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div><div class="fmeta">' + fsize(f.size) + ' &middot; ' + fdate(f.createdAt) + '</div></div>'
-      + '<div class="fac"><span class="proc-tag">&#10003; Filed</span></div>'
+      + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div>'
+      + '<div class="fmeta">' + fsize(f.size) + ' &middot; ' + fdate(f.createdAt) + '</div></div>'
+      + '<div class="fac" style="flex-direction:column;align-items:flex-end;gap:2px">' + tags + '</div>'
+      + '</div>'
+      + dropHtml
       + '</div>';
   }).join('');
+}
+
+function toggleProcDrop(dropId, el) {
+  var drop = document.getElementById(dropId);
+  if (!drop) return;
+  var isOpen = drop.classList.contains('open');
+  // Close all other dropdowns
+  document.querySelectorAll('.proc-drop.open').forEach(function(d){ d.classList.remove('open'); });
+  // Toggle this one
+  if (!isOpen) drop.classList.add('open');
 }
 
 // ── RESET ──
@@ -533,12 +597,17 @@ function resetProg() {
 function finRun(success) {
   IR = false;
   var btn = $('runbtn');
-  btn.className = 'runbtn go'; btn.disabled = false;
-  btn.innerHTML = '\u21ba Run Again';
   loadWaiting();
   if (success) {
+    // Disable button — file is processed, no need to run again
+    btn.className = 'runbtn'; btn.disabled = true;
+    btn.innerHTML = '\u2705 Complete';
     // Refresh both columns — processed file disappears from Scans, appears in Processed
     setTimeout(function(){ loadScans(); loadProcessed(); }, 1500);
+  } else {
+    // Re-enable on failure so user can try again
+    btn.className = 'runbtn go'; btn.disabled = false;
+    btn.innerHTML = '\u21ba Run Again';
   }
 }
 
