@@ -1,25 +1,24 @@
 /**
  * /api/cron
  *
- * Vercel Cron Job — runs automatically every 2 days.
- * Checks the Microsoft Graph API subscription and renews it
- * if it is within 24 hours of expiry.
+ * Runs every hour via Vercel cron.
+ * Uses a smart renewal schedule — calculates the exact time renewal
+ * is needed (1 hour before expiry) and only acts when that time arrives.
  *
- * Configured in vercel.json:
- *   { "path": "/api/cron", "schedule": "0 9 * * *" }
- *   (runs daily at 9am UTC — checks if renewal needed)
+ * This means:
+ * - Most cron runs do nothing (< 1 second, no API calls)
+ * - Exactly one run per subscription cycle does the renewal
+ * - No manual activation ever needed
  *
- * Vercel calls this endpoint automatically on schedule.
- * It is protected by the CRON_SECRET env var which Vercel
- * sets automatically when you use cron jobs.
+ * Schedule: "0 * * * *" — top of every hour
  */
 
 const {
   getSubscription,
   updateSubscriptionAfterRenewal,
   markExpired,
-  needsRenewal,
   isActive,
+  isTimeToRenew,
   saveSubscription,
 } = require('../lib/subscription');
 
@@ -29,85 +28,77 @@ const {
 } = require('../lib/graph');
 
 module.exports = async function handler(req, res) {
-  // Vercel automatically sets the Authorization header when calling cron jobs
-  // This prevents anyone else from triggering the cron endpoint
-  const authHeader = req.headers['authorization'];
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-    return res.status(401).json({ error: 'Unauthorised' });
+  // Allow Vercel's own cron calls through
+  // If CRON_SECRET is set, verify it
+  const cronSecret = process.env.CRON_SECRET;
+  if (cronSecret) {
+    const authHeader = req.headers['authorization'];
+    if (authHeader !== `Bearer ${cronSecret}`) {
+      return res.status(401).json({ error: 'Unauthorised' });
+    }
   }
 
-  console.log('[cron] Running subscription check...');
+  const now = new Date().toISOString();
+  console.log(`[cron] Running at ${now}`);
 
   try {
     const subscription = await getSubscription();
 
-    // ── Case 1: No subscription exists — create one ──
+    // ── Case 1: No subscription — create one ──
     if (!subscription) {
-      console.log('[cron] No subscription found — creating new subscription');
+      console.log('[cron] No subscription — creating');
       const notificationUrl = process.env.WEBHOOK_NOTIFICATION_URL;
       const result = await createSubscription(notificationUrl);
-
-      await saveSubscription(
-        result.id,
-        result.expirationDateTime,
-        `${notificationUrl}/api/webhook`
-      );
-
-      console.log(`[cron] ✅ Subscription created: ${result.id}, expires: ${result.expirationDateTime}`);
-      return res.status(200).json({
-        action: 'created',
-        subscriptionId: result.id,
-        expiresAt: result.expirationDateTime,
-      });
+      await saveSubscription(result.id, result.expirationDateTime, `${notificationUrl}/api/webhook`);
+      console.log(`[cron] ✅ Created. Expires: ${result.expirationDateTime}`);
+      return res.status(200).json({ action: 'created', expiresAt: result.expirationDateTime });
     }
 
-    // ── Case 2: Subscription exists but expired ──
+    // ── Case 2: Subscription expired — recreate ──
     if (!isActive(subscription)) {
-      console.log('[cron] Subscription expired — creating new subscription');
+      console.log('[cron] Subscription expired — recreating');
       await markExpired();
-
       const notificationUrl = process.env.WEBHOOK_NOTIFICATION_URL;
       const result = await createSubscription(notificationUrl);
+      await saveSubscription(result.id, result.expirationDateTime, `${notificationUrl}/api/webhook`);
+      console.log(`[cron] ✅ Recreated. Expires: ${result.expirationDateTime}`);
+      return res.status(200).json({ action: 'recreated', expiresAt: result.expirationDateTime });
+    }
 
-      await saveSubscription(
-        result.id,
-        result.expirationDateTime,
-        `${notificationUrl}/api/webhook`
-      );
-
-      console.log(`[cron] ✅ New subscription created: ${result.id}`);
+    // ── Case 3: Not yet time to renew — skip ──
+    if (!isTimeToRenew(subscription)) {
+      const renewAt = subscription.renewAt || 'unknown';
+      const expiresAt = subscription.expiresAt;
+      const hoursLeft = Math.round((new Date(expiresAt) - new Date()) / (1000 * 60 * 60));
+      console.log(`[cron] Not yet time to renew. ${hoursLeft}h until expiry. Renewal scheduled: ${renewAt}`);
       return res.status(200).json({
-        action: 'recreated',
-        subscriptionId: result.id,
-        expiresAt: result.expirationDateTime,
+        action: 'none',
+        message: `Renewal scheduled for ${renewAt}`,
+        expiresAt,
+        hoursLeft,
       });
     }
 
-    // ── Case 3: Subscription exists and needs renewal ──
-    if (needsRenewal(subscription)) {
-      console.log(`[cron] Subscription expiring soon — renewing ${subscription.subscriptionId}`);
-      const result = await renewSubscription(subscription.subscriptionId);
-
-      await updateSubscriptionAfterRenewal(result.id, result.expirationDateTime);
-
-      console.log(`[cron] ✅ Subscription renewed: ${result.id}, expires: ${result.expirationDateTime}`);
-      return res.status(200).json({
-        action: 'renewed',
-        subscriptionId: result.id,
-        expiresAt: result.expirationDateTime,
-      });
-    }
-
-    // ── Case 4: Subscription is active and not due for renewal ──
-    console.log(`[cron] ✅ Subscription active — no action needed. Expires: ${subscription.expiresAt}`);
-    return res.status(200).json({
-      action: 'none',
-      message: 'Subscription is active and not due for renewal',
-      expiresAt: subscription.expiresAt,
-    });
+    // ── Case 4: Time to renew — do it now ──
+    console.log(`[cron] Renewal time reached — renewing ${subscription.subscriptionId}`);
+    const result = await renewSubscription(subscription.subscriptionId);
+    await updateSubscriptionAfterRenewal(result.id, result.expirationDateTime);
+    console.log(`[cron] ✅ Renewed. Expires: ${result.expirationDateTime}`);
+    return res.status(200).json({ action: 'renewed', expiresAt: result.expirationDateTime });
 
   } catch (err) {
-    console.error('[cron] Error during subscription check:', err.message);
-    return res.status(500).json({ error: err.message });
+    console.error('[cron] Error:', err.message);
+    // On any error, try to recreate from scratch
+    try {
+      console.log('[cron] Error during renewal — attempting fresh creation');
+      const notificationUrl = process.env.WEBHOOK_NOTIFICATION_URL;
+      const result = await createSubscription(notificationUrl);
+      await saveSubscription(result.id, result.expirationDateTime, `${notificationUrl}/api/webhook`);
+      console.log(`[cron] ✅ Recovered — new subscription created`);
+      return res.status(200).json({ action: 'recovered', expiresAt: result.expirationDateTime });
+    } catch (recoveryErr) {
+      console.error('[cron] Recovery also failed:', recoveryErr.message);
+      return res.status(500).json({ error: err.message, recoveryError: recoveryErr.message });
+    }
   }
 };
