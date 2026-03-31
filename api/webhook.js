@@ -131,14 +131,31 @@ async function processFile(itemId, fileName, mode) {
     return;
   }
 
-  // Split PDF
+  // Split PDF — handle invalid/corrupted PDFs gracefully
   let pages, totalPages;
   try {
     ({ pages, totalPages } = await splitPdf(pdfBuffer));
     console.log(`[webhook] Split into ${totalPages} page(s)`);
-  } catch (err) {
-    console.error(`[webhook] Split failed:`, err.message);
-    await db.markError(itemId, err);
+  } catch (splitErr) {
+    console.error(`[webhook] Invalid PDF "${originalFileName}": ${splitErr.message}`);
+    try {
+      const nonOrderPath = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
+      const userId2 = process.env.ONEDRIVE_USER_ID;
+      const token2 = await getToken();
+      const destRes = await axios.get(
+        `https://graph.microsoft.com/v1.0/users/${userId2}/drive/root:/${nonOrderPath}`,
+        { headers: { Authorization: `Bearer ${token2}` } }
+      );
+      await axios.patch(
+        `https://graph.microsoft.com/v1.0/users/${userId2}/drive/items/${itemId}`,
+        { parentReference: { id: destRes.data.id }, name: fileName },
+        { headers: { Authorization: `Bearer ${token2}`, 'Content-Type': 'application/json' } }
+      );
+      console.log(`[webhook] Moved invalid PDF "${fileName}" to Non-Order Documents`);
+    } catch (moveErr) {
+      console.warn(`[webhook] Could not move invalid PDF:`, moveErr.message);
+    }
+    await db.markError(itemId, { message: `Invalid PDF: ${splitErr.message}` });
     return;
   }
 
