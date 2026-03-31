@@ -69,7 +69,9 @@ module.exports = async function handler(req, res) {
         totalPages: data.totalPages,
         pagesReturned: data.pagesReturned,
         renamedFiles: data.renamedFiles || [],
-        googleDriveFolderUrl: data.googleDriveFolderUrl,
+        // Top-level URL (set on completion) or fallback from first page that has one
+        googleDriveFolderUrl: data.googleDriveFolderUrl ||
+          Object.values(data.pages || {}).map(p => p?.googleDrive?.folderUrl).find(u => !!u) || null,
         oneDriveProcessedFolderUrl: data.oneDriveProcessedFolderUrl,
         createdAt: data.createdAt?.toDate?.()?.toISOString() || null,
         completedAt: data.completedAt?.toDate?.()?.toISOString() || null,
