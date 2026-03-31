@@ -207,7 +207,10 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
   <div class="fcol">
     <div class="fhead">
       <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">—</div></div>
-      <button class="rfbtn" onclick="loadScans()">&#8635;</button>
+      <div style="display:flex;gap:5px">
+        <button class="rfbtn" id="proc-all-btn" onclick="processAll()" style="display:none;border-color:#22c55e44;color:var(--gn)" title="Process all files in auto mode">&#9654; All</button>
+        <button class="rfbtn" onclick="loadScans()">&#8635;</button>
+      </div>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; <span>Scans</span></div>
     <div class="flist" id="scan-list">
@@ -302,6 +305,9 @@ function applyMode() {
   $('lbl-h').className = 'ml' + (h ? ' on' : '');
   var ss = $('stepsel');
   if (ss) ss.style.display = h ? 'block' : 'none';
+  // Show Process All only in auto mode
+  var pab = $('proc-all-btn');
+  if (pab) pab.style.display = h ? 'none' : 'inline-block';
   if (h) { $('stoparea').className = 'stoparea'; }
   else { loadStopState(); }
 }
@@ -449,18 +455,38 @@ async function loadProcessed() {
   }
 
   // Build lookup: renamedFile name → status record
+  // Also index by originalFileName for fallback matching
   var recsByFile = {};
+  var recsByOriginal = {};
   if (statusData && statusData.records) {
     statusData.records.forEach(function(r) {
       (r.renamedFiles || []).forEach(function(fname) {
         recsByFile[fname] = r;
       });
+      if (r.originalFileName) {
+        recsByOriginal[r.originalFileName.toLowerCase()] = r;
+      }
     });
   }
 
   $('proc-count').textContent = d.files.length + ' file' + (d.files.length===1?'':'s');
   $('proc-list').innerHTML = d.files.map(function(f, idx) {
+    // Try exact renamed file match first, then partial base name match, then original file name
     var rec = recsByFile[f.name] || null;
+    if (!rec) {
+      // Try matching by base name (strip page number suffix like _01, -2 etc.)
+      var baseName = f.name.replace(/[-_]d+.pdf$/i, '').replace(/.pdf$/i, '').toLowerCase();
+      rec = recsByOriginal[baseName] || null;
+    }
+    if (!rec) {
+      // Try matching any record whose customerName appears in the filename
+      if (statusData && statusData.records) {
+        rec = statusData.records.find(function(r) {
+          if (!r.customerName) return false;
+          return f.name.toLowerCase().includes(r.customerName.toLowerCase());
+        }) || null;
+      }
+    }
     var customer = rec && rec.customerName ? rec.customerName : '';
     var ref = rec && rec.ref ? rec.ref : '';
     var gdUrl = rec && rec.googleDriveFolderUrl ? rec.googleDriveFolderUrl : '';
@@ -619,6 +645,21 @@ function finErr(step, msg) {
   var btn = $('runbtn');
   btn.className = 'runbtn go'; btn.disabled = false;
   btn.innerHTML = '\u21ba Try Again';
+}
+
+// ── PROCESS ALL ──
+async function processAll() {
+  var btn = $('proc-all-btn');
+  var orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>';
+  var d = await api('/api/scan-now', { method: 'POST' });
+  btn.disabled = false;
+  btn.innerHTML = orig;
+  if (d && d.status === 'scanning') {
+    // Refresh file list after a moment
+    setTimeout(loadScans, 2000);
+  }
 }
 
 // ── INIT ──
