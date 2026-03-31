@@ -154,15 +154,25 @@ module.exports = async function handler(req, res) {
 
     const result = await pollForCompletion(fileId, totalPages, (event) => {
       if (event.type === 'extraction') {
-        // AI extraction received for a page — step 5 updates
-        progress(5, `AI extraction complete for page ${event.page}/${totalPages} ✓`, event.page >= totalPages ? 'done' : 'running');
+        // AI extraction received for this page
+        if (event.page >= totalPages) {
+          // All pages extracted — mark step 5 done
+          progress(5, `AI extraction complete ✓`, 'done');
+        } else {
+          progress(5, `AI extraction: page ${event.page}/${totalPages} complete...`, 'running');
+        }
       } else if (event.type === 'filing') {
-        // File has been filed — step 6
-        progress(5, `AI extraction complete for all ${totalPages} page(s) ✓`, 'done');
-        progress(6, `Filing page ${event.page}/${totalPages} to OneDrive & Google Drive...`);
+        // Filing started — step 5 must be done first, then step 6 starts
+        progress(5, `AI extraction complete ✓`, 'done');
+        progress(6, `Filing page ${event.page}/${totalPages} to OneDrive & Google Drive...`, 'running');
       } else if (event.type === 'filed') {
         // Page fully filed
-        progress(6, `Filed page ${event.page}/${totalPages} ✓`, event.page >= totalPages ? 'done' : 'running');
+        if (event.page >= totalPages) {
+          // All pages filed — mark step 6 done
+          progress(6, `Filed to OneDrive & Google Drive ✓`, 'done');
+        } else {
+          progress(6, `Filed page ${event.page}/${totalPages} ✓`, 'running');
+        }
       }
     });
 
