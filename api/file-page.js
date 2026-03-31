@@ -124,14 +124,7 @@ module.exports = async function handler(req, res) {
       });
     } catch(e) { /* non-fatal */ }
 
-    // Dispatch next page so pipeline continues
-    if (pageNumber < totalPages) {
-      const nextTempData = await waitForTempPage(fileId, pageNumber + 1, 20000);
-      if (nextTempData) {
-        const rec = await db.getRecord(fileId);
-        await dispatchToMake(pageNumber + 1, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId);
-      }
-    }
+    // Non-order document — do not dispatch further pages, stop processing
 
     return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason });
   }
@@ -273,13 +266,24 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     oneDriveProcessedFolderUrl: 'https://grovebedding-my.sharepoint.com/personal/files_grovebedding_com/Documents/Grove%20Group%20Scotland/Grove%20Bedding/Scans/Processed',
   });
 
-  // Delete original from Scans and clean up Temp — both in background
+  // Delete original from Scans and clean up Temp in background
   Promise.all([
     deleteOriginalFromScans(fileId),
     cleanupTempPages(fileId, finalRecord?.pageStore || {}),
   ]).catch(err => console.warn('[file-page] Cleanup warning:', err.message));
 
   console.log(`[file-page] ${T()} ✅ Complete — all ${totalPages} pages filed`);
+
+  // In auto mode, trigger scan-now to pick up the next file in the queue
+  const mode = await db.getMode().catch(() => 'auto');
+  if (mode === 'auto') {
+    const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+    axios.post(`${baseUrl}/api/scan-now`, {}, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 5000,
+    }).catch(err => console.warn('[file-page] scan-now trigger warning:', err.message));
+    console.log('[file-page] Auto mode — triggered scan-now for next file');
+  }
 }
 
 async function waitForTempPage(fileId, pageNumber, timeoutMs) {
