@@ -54,7 +54,7 @@ async function scanAndProcess() {
       const mime = item.file?.mimeType || '';
       return name.endsWith('.pdf') || mime.includes('pdf');
     })
-    .sort((a, b) => new Date(a.createdDateTime) - new Date(b.createdDateTime));
+    .sort((a, b) => new Date(b.createdDateTime) - new Date(a.createdDateTime)); // newest first
 
   const mode = await db.getMode();
   console.log(`[scan-now] Mode: ${mode} — ${pdfFiles.length} PDF(s) in Scans`);
