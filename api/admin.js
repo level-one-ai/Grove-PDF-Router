@@ -66,6 +66,18 @@ module.exports = async function handler(req, res) {
         await admin.firestore().collection('settings').doc('processingMode').set({
           mode, updatedAt: new Date().toISOString()
         });
+
+        // When switching to auto, trigger a scan of existing files immediately
+        if (mode === 'auto') {
+          const axios = require('axios');
+          const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+          axios.post(`${baseUrl}/api/scan-now`, {}, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 5000,
+          }).catch(err => console.warn('[admin] scan-now trigger warning:', err.message));
+          console.log('[admin] Switched to auto — triggered scan-now');
+        }
+
         return res.status(200).json({ success: true, mode });
       } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
