@@ -222,7 +222,10 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
   <div class="fcol">
     <div class="fhead">
       <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count">—</div></div>
-      <button class="rfbtn" onclick="loadProcessed()">&#8635;</button>
+      <div style="display:flex;gap:5px">
+        <button class="rfbtn" id="gd-retry-btn" onclick="retryGoogleDrive()" title="File missing Google Drive uploads" style="border-color:#22c55e44;color:var(--gn)">&#128230; GD</button>
+        <button class="rfbtn" onclick="loadProcessed()">&#8635;</button>
+      </div>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; Scans &rsaquo; <span>Processed</span></div>
     <div class="flist" id="proc-list">
@@ -491,8 +494,6 @@ async function loadProcessed() {
   var d = await api('/api/scan-files?folder=Processed');
   var statusData = { records: STATUS_CACHE };
 
-  // Silently trigger retry for any files missing Google Drive
-  api('/api/retry-gdrive', { method: 'POST' }).catch(function(){});
 
   if (!d || !d.success || !d.files || !d.files.length) {
     $('proc-count').textContent = d && d.files ? '0 files' : 'Error';
@@ -710,6 +711,32 @@ async function processAll() {
   if (d && d.status === 'scanning') {
     // Refresh file list after a moment
     setTimeout(loadScans, 2000);
+  }
+}
+
+// ── GOOGLE DRIVE RETRY ──
+async function retryGoogleDrive() {
+  var btn = document.getElementById('gd-retry-btn');
+  var orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>';
+  btn.style.color = 'var(--yl)';
+  var d = await api('/api/retry-gdrive', { method: 'POST' });
+  if (d) {
+    btn.innerHTML = '&#10003; Running';
+    btn.style.color = 'var(--gn)';
+    // Refresh processed panel after 15s to show updated GD links
+    setTimeout(function() {
+      loadStatus().then(function() { loadProcessed(); });
+      btn.disabled = false;
+      btn.innerHTML = orig;
+      btn.style.color = 'var(--gn)';
+    }, 15000);
+  } else {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+    btn.style.color = 'var(--rd)';
+    setTimeout(function(){ btn.style.color='var(--gn)'; }, 3000);
   }
 }
 
