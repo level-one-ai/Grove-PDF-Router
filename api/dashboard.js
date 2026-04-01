@@ -153,6 +153,26 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 .stopbtn.resuming{background:#0f1f0f;color:var(--gn);border:1px solid #22c55e44}
 .stopbtn.resuming:hover{background:#0f2a0f;border-color:var(--gn)}
 
+/* GD RETRY PANEL */
+.gdpanel{margin-top:10px;border:1px solid var(--bo);border-radius:8px;overflow:hidden;display:none}
+.gdpanel.open{display:block}
+.gdph{background:var(--s2);padding:8px 12px;font-size:11px;font-weight:600;color:var(--mu);display:flex;align-items:center;justify-content:space-between}
+.gdpbody{max-height:280px;overflow-y:auto;padding:6px 0}
+.gdrow{display:flex;align-items:flex-start;gap:8px;padding:5px 12px;border-bottom:1px solid var(--bo);font-size:11px}
+.gdrow:last-child{border-bottom:none}
+.gdrow-ic{width:14px;flex-shrink:0;margin-top:1px;text-align:center}
+.gdrow-body{flex:1;min-width:0}
+.gdrow-name{font-weight:500;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gdrow-detail{color:var(--mu);font-size:10px;margin-top:2px}
+.gdrow-link{color:var(--or);text-decoration:none;font-size:10px}
+.gdrow-link:hover{text-decoration:underline}
+.gdrow.filing .gdrow-ic{color:var(--yl)}
+.gdrow.success .gdrow-ic{color:var(--gn)}
+.gdrow.failed .gdrow-ic{color:var(--rd)}
+.gdrow.skipped .gdrow-ic{color:var(--mu)}
+.gd-send-btn{background:none;border:1px solid #22c55e44;color:var(--gn);border-radius:5px;padding:3px 8px;font-size:10px;cursor:pointer;font-weight:600}
+.gd-send-btn:hover{background:#1a2f1a}
+.gd-send-btn:disabled{opacity:0.5;cursor:not-allowed}
 /* PROCESSED ITEM DROPDOWN */
 .proc-drop{display:none;margin-top:7px;padding-top:7px;border-top:1px solid var(--bo)}
 .proc-drop.open{display:block}
@@ -228,6 +248,13 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       </div>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; Scans &rsaquo; <span>Processed</span></div>
+    <div id="gdpanel" class="gdpanel">
+      <div class="gdph">
+        <span id="gdp-title">Google Drive Filing</span>
+        <span id="gdp-count" style="color:var(--tx)"></span>
+      </div>
+      <div class="gdpbody" id="gdp-body"></div>
+    </div>
     <div class="flist" id="proc-list">
       <div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading...</div></div>
     </div>
@@ -581,10 +608,21 @@ async function loadProcessed() {
     if (gdUrl) {
       dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><a class="pd-link" href="' + esc(gdUrl) + '" target="_blank" onclick="event.stopPropagation()">Open folder &#8599;</a></div>';
     } else if (rec) {
-      dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><div class="pd-val" style="color:var(--yl)">Retrying... refresh in a moment</div></div>';
+      var sendBtnId = 'gdsend-' + idx;
+      dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
+        + '<button class="gd-send-btn" id="' + sendBtnId + '" '
+        + 'data-fname="' + esc(f.name) + '" data-fid="' + esc(rec.fileId || '') + '" '
+        + 'onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
+    } else if (!rec) {
+      // No Firestore record — can still try to send using filename only
+      var sendBtnId2 = 'gdsend-' + idx;
+      dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
+        + '<button class="gd-send-btn" id="' + sendBtnId2 + '" '
+        + 'data-fname="' + esc(f.name) + '" data-fid="" '
+        + 'onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
     }
     if (odUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
-    if (!rec) dropHtml += '<div class="pd-row"><div class="pd-lbl" style="color:var(--mu)">Processing record not found</div></div>';
+
     dropHtml += '</div>';
 
     return '<div class="fi done-f" data-dropid="' + dropId + '"  onclick="toggleProcDrop(this.dataset.dropid,this)" style="flex-direction:column;align-items:stretch;cursor:pointer">'
@@ -747,26 +785,150 @@ async function processAll() {
 // ── GOOGLE DRIVE RETRY ──
 async function retryGoogleDrive() {
   var btn = document.getElementById('gd-retry-btn');
-  var orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span>';
   btn.style.color = 'var(--yl)';
-  var d = await api('/api/retry-gdrive', { method: 'POST' });
-  if (d) {
-    btn.innerHTML = '&#10003; Running';
-    btn.style.color = 'var(--gn)';
-    // Refresh processed panel after 15s to show updated GD links
-    setTimeout(function() {
-      loadStatus().then(function() { loadProcessed(); });
-      btn.disabled = false;
-      btn.innerHTML = orig;
-      btn.style.color = 'var(--gn)';
-    }, 15000);
+
+  // Open progress panel
+  var panel = $('gdpanel');
+  var body = $('gdp-body');
+  var title = $('gdp-title');
+  var count = $('gdp-count');
+  panel.classList.add('open');
+  body.innerHTML = '<div class="gdrow"><div class="gdrow-ic">&#9203;</div><div class="gdrow-body"><div class="gdrow-name">Connecting...</div></div></div>';
+  title.textContent = 'Google Drive Filing';
+  count.textContent = '';
+
+  var fileRows = {}; // track rows by file name
+  var total = 0, succeeded = 0, failed = 0;
+
+  function addRow(id, iconClass, icon, name, detail, linkUrl, linkText) {
+    var existing = body.querySelector('[data-gdrow="' + id + '"]');
+    var html = '<div class="gdrow ' + iconClass + '" data-gdrow="' + esc(id) + '">'
+      + '<div class="gdrow-ic">' + icon + '</div>'
+      + '<div class="gdrow-body">'
+      + '<div class="gdrow-name" title="' + esc(name) + '">' + esc(name) + '</div>'
+      + (detail ? '<div class="gdrow-detail">' + esc(detail) + '</div>' : '')
+      + (linkUrl ? '<a class="gdrow-link" href="' + esc(linkUrl) + '" target="_blank" onclick="event.stopPropagation()">Open ' + (linkText||'folder') + ' &#8599;</a>' : '')
+      + '</div></div>';
+    if (existing) {
+      existing.outerHTML = html;
+    } else {
+      body.insertAdjacentHTML('beforeend', html);
+      // Remove connecting message once real data arrives
+      var connecting = body.querySelector('[data-gdrow="connecting"]');
+      if (connecting) connecting.remove();
+    }
+    // Scroll to bottom
+    body.scrollTop = body.scrollHeight;
+  }
+
+  try {
+    var resp = await fetch('/api/retry-gdrive', { method: 'POST' });
+    var reader = resp.body.getReader();
+    var dec = new TextDecoder();
+    var buf = '';
+
+    // Clear initial connecting message
+    body.innerHTML = '';
+
+    while (true) {
+      var chunk = await reader.read();
+      if (chunk.done) break;
+      buf += dec.decode(chunk.value, { stream: true });
+      var lines2 = buf.split('\\n');
+      buf = lines2.pop();
+      for (var i = 0; i < lines2.length; i++) {
+        var line = lines2[i].trim();
+        if (!line || line.startsWith(': ')) continue;
+        if (line.startsWith('data: ')) {
+          try {
+            var ev = JSON.parse(line.slice(6));
+            if (ev.type === 'start') {
+              total = ev.total;
+              title.textContent = 'Filing ' + total + ' file' + (total===1?'':'s') + ' to Google Drive';
+            } else if (ev.type === 'file' && ev.status === 'filing') {
+              addRow('file-' + ev.name, 'filing', '&#9203;', ev.name, 'Filing ' + ev.pages + ' page(s)...', null, null);
+            } else if (ev.type === 'file' && ev.status === 'success') {
+              succeeded++;
+              count.textContent = succeeded + '/' + total + ' done';
+              addRow('file-' + ev.name, 'success', '&#10003;', ev.name,
+                ev.pages + ' page(s) filed',
+                ev.gdFolderUrl, 'folder');
+            } else if (ev.type === 'file' && ev.status === 'failed') {
+              failed++;
+              addRow('file-' + ev.name, 'failed', '&#10007;', ev.name, 'Failed', null, null);
+            } else if (ev.type === 'file' && ev.status === 'skipped') {
+              addRow('file-' + ev.name, 'skipped', '&#8212;', ev.name, ev.reason || 'Skipped', null, null);
+            } else if (ev.type === 'page' && ev.status === 'success') {
+              addRow('page-' + ev.name + '-' + ev.page, 'success', '&#128196;',
+                ev.fileName,
+                'Page ' + ev.page + ' → ' + (ev.folder || ''),
+                ev.gdFileUrl || ev.gdFolderUrl, ev.gdFileUrl ? 'file' : 'folder');
+            } else if (ev.type === 'page' && ev.status === 'failed') {
+              addRow('page-' + ev.name + '-' + ev.page, 'failed', '&#10007;',
+                ev.fileName, 'Page ' + ev.page + ': ' + (ev.reason || 'failed'), null, null);
+            } else if (ev.type === 'done') {
+              var msg = ev.message || (ev.succeeded + ' succeeded, ' + ev.failed + ' failed');
+              if (ev.total === 0) {
+                body.innerHTML = '<div class="gdrow success"><div class="gdrow-ic">&#10003;</div><div class="gdrow-body"><div class="gdrow-name">All files already in Google Drive</div></div></div>';
+              }
+              count.textContent = ev.total === 0 ? 'Nothing to do' : (ev.succeeded + '/' + ev.total + ' done');
+              title.textContent = 'Google Drive Filing Complete';
+              // Refresh processed panel
+              setTimeout(function(){ loadStatus().then(loadProcessed); }, 1500);
+            }
+          } catch(ex) {}
+        }
+      }
+    }
+  } catch(err) {
+    body.insertAdjacentHTML('beforeend', '<div class="gdrow failed"><div class="gdrow-ic">&#10007;</div><div class="gdrow-body"><div class="gdrow-name">Connection error</div><div class="gdrow-detail">' + esc(err.message) + '</div></div></div>');
+  }
+
+  btn.disabled = false;
+  btn.innerHTML = '&#128230; GD';
+  btn.style.color = 'var(--gn)';
+}
+
+// ── SEND SINGLE FILE TO GOOGLE DRIVE ──
+async function sendToGDrive(btn) {
+  var fileName = btn.dataset.fname;
+  var fileId = btn.dataset.fid;
+  if (!fileName) return;
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>';
+
+  var d = await api('/api/file-to-gdrive', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileName: fileName, fileId: fileId || undefined }),
+  });
+
+  if (d && d.success) {
+    // Show success inline
+    btn.style.display = 'none';
+    var row = btn.closest('.pd-row');
+    if (row) {
+      row.innerHTML = '<div class="pd-lbl">Google Drive</div>'
+        + (d.gdFileUrl
+          ? '<a class="pd-link" href="' + esc(d.gdFileUrl) + '" target="_blank">Open file &#8599;</a>'
+          : '<a class="pd-link" href="' + esc(d.gdFolderUrl) + '" target="_blank">Open folder &#8599;</a>'
+        )
+        + ' <span style="color:var(--gn);font-size:10px">&#10003; Filed to ' + esc(d.folder || '') + '</span>';
+    }
+    // Refresh status cache and processed panel after a moment
+    setTimeout(function(){ loadStatus().then(loadProcessed); }, 2000);
   } else {
     btn.disabled = false;
-    btn.innerHTML = orig;
+    btn.innerHTML = '&#10007; Failed';
     btn.style.color = 'var(--rd)';
-    setTimeout(function(){ btn.style.color='var(--gn)'; }, 3000);
+    btn.title = (d && d.error) ? d.error : 'Unknown error';
+    setTimeout(function(){
+      btn.innerHTML = '&#128230; Send to GD';
+      btn.style.color = 'var(--gn)';
+    }, 4000);
   }
 }
 
