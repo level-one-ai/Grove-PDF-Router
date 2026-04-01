@@ -46,6 +46,7 @@ async function retryMissingGoogleDrive() {
     snapshot = await firestore
       .collection('processedFiles')
       .where('status', '==', 'completed')
+      .orderBy('createdAt', 'asc')
       .limit(50)
       .get();
   } catch (err) {
@@ -53,14 +54,16 @@ async function retryMissingGoogleDrive() {
     return;
   }
 
+  // Filter to only records missing Google Drive URL
+  const missing = snapshot.docs.filter(doc => !doc.data().googleDriveFolderUrl);
+  console.log(`[retry-gdrive] ${snapshot.docs.length} completed records, ${missing.length} missing Google Drive`);
+
   let retried = 0;
 
-  for (const doc of snapshot.docs) {
+  // Process ONE file at a time, oldest first
+  for (const doc of missing) {
     const record = doc.data();
     const fileId = record.fileId;
-
-    // Skip if already has Google Drive URL
-    if (record.googleDriveFolderUrl) continue;
 
     const pages = record.pages || {};
     const pageEntries = Object.entries(pages);
@@ -118,6 +121,9 @@ async function retryMissingGoogleDrive() {
       });
       console.log(`[retry-gdrive] Updated record for "${record.originalFileName}" ✓`);
     }
+
+    // Brief pause between files to avoid rate limiting
+    await new Promise(r => setTimeout(r, 500));
   }
 
   console.log(`[retry-gdrive] Done. Retried: ${retried} pages`);
