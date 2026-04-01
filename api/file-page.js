@@ -215,6 +215,15 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
 
   console.log(`[file-page] ${T()} Uploads done. OneDrive: ${!!oneDriveResult} | Google: ${!!googleDriveResult}`);
 
+  // Save Google Drive URL to top-level record immediately so dashboard can show it
+  if (googleDriveResult?.refFolderUrl) {
+    await db.updateRecord(fileId, {
+      googleDriveFolderUrl: googleDriveResult.refFolderUrl,
+      googleDriveFolderId: googleDriveResult.refFolderId || null,
+      googleDriveCustomerFolderUrl: googleDriveResult.customerFolderUrl || null,
+    });
+  }
+
   // Update Firestore
   await db.updatePageResult(fileId, pageNumber, {
     claudeJson,
