@@ -224,7 +224,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count">—</div></div>
       <div style="display:flex;gap:5px">
         <button class="rfbtn" id="gd-retry-btn" onclick="retryGoogleDrive()" title="File missing Google Drive uploads" style="border-color:#22c55e44;color:var(--gn)">&#128230; GD</button>
-        <button class="rfbtn" onclick="loadProcessed()">&#8635;</button>
+        <button class="rfbtn" onclick="loadStatus().then(loadProcessed)">&#8635;</button>
       </div>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; Scans &rsaquo; <span>Processed</span></div>
@@ -680,8 +680,8 @@ function finRun(success) {
     // Disable button — file is processed, no need to run again
     btn.className = 'runbtn'; btn.disabled = true;
     btn.innerHTML = '\u2705 Complete';
-    // Refresh cache and both columns
-    setTimeout(function(){ loadStatus().then(function(){ loadScans(); loadProcessed(); }); }, 1500);
+    // Refresh cache and both columns after giving Firestore time to write
+    setTimeout(function(){ loadStatus().then(function(){ loadScans(); loadProcessed(); }); }, 4000);
   } else {
     // Re-enable on failure so user can try again
     btn.className = 'runbtn go'; btn.disabled = false;
