@@ -206,7 +206,7 @@ module.exports = async function handler(req, res) {
 };
 
 async function pollForCompletion(fileId, totalPages, onEvent) {
-  const MAX_WAIT = 4 * 60 * 1000; // 4 minutes
+  const MAX_WAIT = 10 * 60 * 1000; // 10 minutes — large files (20+ pages) need more time
   const INTERVAL = 3000;
   const start = Date.now();
   // Track what we've already reported to avoid duplicate events
@@ -244,7 +244,7 @@ async function pollForCompletion(fileId, totalPages, onEvent) {
 
     if (record.status === 'completed') return record;
   }
-  return { status: 'error', error: 'Timed out after 4 minutes' };
+  return { status: 'error', error: 'Timed out after 10 minutes — file may still be processing in background' };
 }
 
 async function uploadRemainingPages(remainingPages, fileId, token, userId, pageStore) {
