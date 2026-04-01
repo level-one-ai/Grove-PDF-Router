@@ -17,7 +17,7 @@
  */
 
 const db = require('../lib/firebase');
-const { buildFilename, getSupplierLabel, getCustomerFolderName, getRefFolder } = require('../lib/namingEngine');
+const { buildFilename, getSupplierLabel, getCustomerFolderName, getRefFolder, isCompanyName } = require('../lib/namingEngine');
 const { uploadFile: uploadToOneDrive } = require('../lib/graph');
 const { fileDocuments } = require('../lib/googleDrive');
 const axios = require('axios');
@@ -186,6 +186,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   const supplierLabel = getSupplierLabel(claudeJson);
   const customerFolderName = getCustomerFolderName(claudeJson);
   const refFolderName = getRefFolder(claudeJson);
+  const folderIsCompany = isCompanyName(claudeJson);
   console.log(`[file-page] ${T()} Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
 
   // Upload to OneDrive and Google Drive in parallel
@@ -202,7 +203,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
         console.error(`[file-page] ${T()} OneDrive FAILED:`, err.message);
         return null;
       }),
-    fileDocuments(customerFolderName, refFolderName, [{ pageNumber, finalFileName, buffer: pageBuffer }])
+    fileDocuments(customerFolderName, refFolderName, [{ pageNumber, finalFileName, buffer: pageBuffer }], folderIsCompany)
       .then(result => {
         console.log(`[file-page] ${T()} Google Drive OK: "${customerFolderName}/${refFolderName}"`);
         return result;
