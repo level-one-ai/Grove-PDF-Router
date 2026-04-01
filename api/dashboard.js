@@ -209,7 +209,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">—</div></div>
       <div style="display:flex;gap:5px">
         <button class="rfbtn" id="proc-all-btn" onclick="processAll()" style="display:none;border-color:#22c55e44;color:var(--gn)" title="Process all files in auto mode">&#9654; All</button>
-        <button class="rfbtn" onclick="loadScans()">&#8635;</button>
+        <button class="rfbtn" onclick="loadStatus().then(loadScans)">&#8635;</button>
       </div>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; <span>Scans</span></div>
@@ -444,12 +444,17 @@ async function loadScans() {
     $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128589;</div><div class="ti">' + (d ? 'No PDFs found' : 'Failed to load') + '</div></div>';
     return;
   }
-  $('scan-count').textContent = d.files.length + ' file' + (d.files.length===1?'':'s');
   window.SCAN_FILES = d.files;
-  // Mark files that have been processed according to Firestore
+  // Filter out files already completed in Firestore — they've been processed and deleted
   var processedIds = {};
   STATUS_CACHE.forEach(function(r) { if (r.status === 'completed') processedIds[r.fileId] = r; });
-  $('scan-list').innerHTML = d.files.map(function(f, idx){
+  var unprocessedFiles = d.files.filter(function(f) { return !processedIds[f.id]; });
+  $('scan-count').textContent = unprocessedFiles.length + ' file' + (unprocessedFiles.length===1?'':'s');
+  if (!unprocessedFiles.length) {
+    $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#10003;</div><div class="ti">All files processed</div></div>';
+    return;
+  }
+  $('scan-list').innerHTML = unprocessedFiles.map(function(f, idx){
     return '<div class="fi" id="sf-' + f.id + '" data-fid="' + esc(f.id) + '" data-idx="' + idx + '" onclick="clickScan(this)">'
       + '<div class="fic">&#128196;</div>'
       + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div><div class="fmeta">' + fsize(f.size) + ' &middot; ' + fdate(f.createdAt) + '</div></div>'
@@ -709,8 +714,8 @@ async function processAll() {
   btn.disabled = false;
   btn.innerHTML = orig;
   if (d && d.status === 'scanning') {
-    // Refresh file list after a moment
-    setTimeout(loadScans, 2000);
+    // Refresh status cache then file list
+    setTimeout(function(){ loadStatus().then(loadScans); }, 3000);
   }
 }
 
