@@ -420,7 +420,28 @@ async function loadWaiting() {
   }
   refreshBadges();
 }
-function selWait(fid) { closeNotif(); var el=$('sf-'+fid); if(el) el.click(); }
+function selWait(fid) {
+  closeNotif();
+  // Find file in SCAN_FILES and select it directly
+  var f = window.SCAN_FILES && window.SCAN_FILES.find(function(x){ return x.id === fid; });
+  if (f) {
+    var el = $('sf-' + fid);
+    if (el) {
+      document.querySelectorAll('.fi').forEach(function(x){ x.classList.remove('sel'); });
+      el.classList.add('sel');
+    }
+    SF = f;
+    $('nosel').style.display = 'none';
+    $('seldet').style.display = 'block';
+    $('selname').textContent = f.name;
+    $('selmeta').textContent = fsize(f.size) + ' · ' + fdate(f.createdAt);
+    var btn = $('runbtn');
+    btn.className = 'runbtn go';
+    btn.disabled = false;
+    btn.textContent = '▶ Run (Waiting)';
+    resetProg();
+  }
+}
 function toggleNotif() { $('np').classList.toggle('show'); }
 function closeNotif() { $('np').classList.remove('show'); }
 document.addEventListener('click', function(ev){ if (!ev.target.closest('.bell-wrap')) closeNotif(); });
@@ -444,11 +465,12 @@ async function loadScans() {
     $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128589;</div><div class="ti">' + (d ? 'No PDFs found' : 'Failed to load') + '</div></div>';
     return;
   }
-  window.SCAN_FILES = d.files;
-  // Filter out files already completed in Firestore — they've been processed and deleted
+  // Filter out files already completed in Firestore
   var processedIds = {};
   STATUS_CACHE.forEach(function(r) { if (r.status === 'completed') processedIds[r.fileId] = r; });
   var unprocessedFiles = d.files.filter(function(f) { return !processedIds[f.id]; });
+  // Store the FILTERED list so idx in clickScan matches the rendered list
+  window.SCAN_FILES = unprocessedFiles;
   $('scan-count').textContent = unprocessedFiles.length + ' file' + (unprocessedFiles.length===1?'':'s');
   if (!unprocessedFiles.length) {
     $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#10003;</div><div class="ti">All files processed</div></div>';
@@ -468,8 +490,8 @@ async function loadScans() {
 
 function clickScan(el) {
   if (IR) return;
-  var idx = parseInt(el.dataset.idx);
-  var f = window.SCAN_FILES && window.SCAN_FILES[idx];
+  var fid = el.dataset.fid;
+  var f = window.SCAN_FILES && window.SCAN_FILES.find(function(x){ return x.id === fid; });
   if (!f) return;
   document.querySelectorAll('.fi').forEach(function(x){ x.classList.remove('sel'); });
   el.classList.add('sel');
@@ -599,6 +621,9 @@ async function doReset(ev, fid) {
 // ── RUN ──
 async function startRun() {
   if (!SF || IR) return;
+  // Re-resolve SF from SCAN_FILES by ID in case list was refreshed since selection
+  var currentFile = window.SCAN_FILES && window.SCAN_FILES.find(function(x){ return x.id === SF.id; });
+  if (currentFile) SF = currentFile;
   IR = true;
   var btn = $('runbtn');
   btn.className = 'runbtn going'; btn.disabled = true;
