@@ -264,6 +264,8 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 
 <script>
 var SF = null, IR = false, CM = 'auto', ST = 1, WF = {}, STOPPED = false;
+var STATUS_CACHE = []; // All Firestore records — loaded once, reused everywhere
+var STATUS_LOADED = false;
 var STEPS = [
   {id:1,l:'Initialise record'},
   {id:2,l:'Download from OneDrive'},
@@ -284,6 +286,44 @@ async function api(url, opts) {
     if (!r.ok) return null;
     return await r.json();
   } catch(ex) { return null; }
+}
+
+// ── STATUS CACHE ──
+// Loads all Firestore records once and caches them in memory.
+// All dashboard panels use this cache — no repeated Firestore calls.
+async function loadStatus() {
+  var d = await api('/api/status?limit=200');
+  if (d && d.records) {
+    STATUS_CACHE = d.records;
+    STATUS_LOADED = true;
+    console.log('[dashboard] Status cache loaded:', STATUS_CACHE.length, 'records');
+  }
+  return STATUS_CACHE;
+}
+
+// Build lookup maps from cache
+function buildStatusLookup() {
+  var byFile = {}, byOriginal = {}, byCustomer = [];
+  STATUS_CACHE.forEach(function(r) {
+    (r.renamedFiles || []).forEach(function(fname) { byFile[fname] = r; });
+    if (r.originalFileName) byOriginal[r.originalFileName.toLowerCase()] = r;
+    byCustomer.push(r);
+  });
+  return { byFile: byFile, byOriginal: byOriginal, byCustomer: byCustomer };
+}
+
+// Find the Firestore record matching an OneDrive filename
+function findRecord(fileName) {
+  var lookup = buildStatusLookup();
+  // 1. Exact renamed file match
+  if (lookup.byFile[fileName]) return lookup.byFile[fileName];
+  // 2. Base name match
+  var base = fileName.replace(/[-_]d+.pdf$/i, '').replace(/.pdf$/i, '').toLowerCase();
+  if (lookup.byOriginal[base]) return lookup.byOriginal[base];
+  // 3. Customer name in filename
+  return lookup.byCustomer.find(function(r) {
+    return r.customerName && fileName.toLowerCase().includes(r.customerName.toLowerCase());
+  }) || null;
 }
 
 // ── MODE ──
@@ -403,6 +443,9 @@ async function loadScans() {
   }
   $('scan-count').textContent = d.files.length + ' file' + (d.files.length===1?'':'s');
   window.SCAN_FILES = d.files;
+  // Mark files that have been processed according to Firestore
+  var processedIds = {};
+  STATUS_CACHE.forEach(function(r) { if (r.status === 'completed') processedIds[r.fileId] = r; });
   $('scan-list').innerHTML = d.files.map(function(f, idx){
     return '<div class="fi" id="sf-' + f.id + '" data-fid="' + esc(f.id) + '" data-idx="' + idx + '" onclick="clickScan(this)">'
       + '<div class="fic">&#128196;</div>'
@@ -441,12 +484,12 @@ async function loadProcessed() {
   $('proc-list').innerHTML = '<div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading...</div></div>';
   $('proc-count').textContent = '—';
 
-  // Load OneDrive files and Firestore status records in parallel
-  var results = await Promise.all([
-    api('/api/scan-files?folder=Processed'),
-    api('/api/status?limit=100'),
-  ]);
-  var d = results[0], statusData = results[1];
+  // Use cached status data — no extra Firestore call needed
+  // Refresh cache if not yet loaded
+  if (!STATUS_LOADED) await loadStatus();
+
+  var d = await api('/api/scan-files?folder=Processed');
+  var statusData = { records: STATUS_CACHE };
 
   // Silently trigger retry for any files missing Google Drive
   api('/api/retry-gdrive', { method: 'POST' }).catch(function(){});
@@ -457,18 +500,13 @@ async function loadProcessed() {
     return;
   }
 
-  // Build lookup: renamedFile name → status record
-  // Also index by originalFileName for fallback matching
+  // Build lookup from cached status data
   var recsByFile = {};
   var recsByOriginal = {};
   if (statusData && statusData.records) {
     statusData.records.forEach(function(r) {
-      (r.renamedFiles || []).forEach(function(fname) {
-        recsByFile[fname] = r;
-      });
-      if (r.originalFileName) {
-        recsByOriginal[r.originalFileName.toLowerCase()] = r;
-      }
+      (r.renamedFiles || []).forEach(function(fname) { recsByFile[fname] = r; });
+      if (r.originalFileName) recsByOriginal[r.originalFileName.toLowerCase()] = r;
     });
   }
 
@@ -641,8 +679,8 @@ function finRun(success) {
     // Disable button — file is processed, no need to run again
     btn.className = 'runbtn'; btn.disabled = true;
     btn.innerHTML = '\u2705 Complete';
-    // Refresh both columns — processed file disappears from Scans, appears in Processed
-    setTimeout(function(){ loadScans(); loadProcessed(); }, 1500);
+    // Refresh cache and both columns
+    setTimeout(function(){ loadStatus().then(function(){ loadScans(); loadProcessed(); }); }, 1500);
   } else {
     // Re-enable on failure so user can try again
     btn.className = 'runbtn go'; btn.disabled = false;
@@ -676,11 +714,16 @@ async function processAll() {
 }
 
 // ── INIT ──
-loadMode();
-loadScans();
-loadProcessed();
+// Load status cache first — everything else depends on it
+loadStatus().then(function() {
+  loadMode();
+  loadScans();
+  loadProcessed();
+  loadWaiting();
+});
 loadSub();
-loadWaiting();
+// Refresh status cache every 60 seconds
+setInterval(loadStatus, 60000);
 setInterval(loadWaiting, 30000);
 setInterval(function(){ if(CM==='auto') loadStopState(); }, 15000);
 </script>
