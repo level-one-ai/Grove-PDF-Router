@@ -1,12 +1,14 @@
 /**
  * /api/retry-gdrive
  *
- * Finds completed records missing Google Drive URL and retries filing them.
- * Uses lib/firebase.js which has preferRest + retry logic to avoid socket hang up.
+ * Iterates through all completed records missing Google Drive URL.
+ * Downloads each PDF from OneDrive Processed and files to Google Drive.
+ * Processes one file at a time, oldest first.
+ * All Firestore calls go through lib/firebase.js which has retry logic.
  */
 
 const db = require('../lib/firebase');
-const { getCustomerFolderName, getRefFolder, getSupplierLabel } = require('../lib/namingEngine');
+const { getCustomerFolderName, getRefFolder } = require('../lib/namingEngine');
 const { fileDocuments } = require('../lib/googleDrive');
 const axios = require('axios');
 
@@ -19,122 +21,129 @@ module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
-
   res.status(200).json({ status: 'checking' });
-
   try {
     await retryMissingGoogleDrive();
   } catch (err) {
-    console.error('[retry-gdrive] Error:', err.message);
+    console.error('[retry-gdrive] Fatal error:', err.message);
   }
 };
 
 async function retryMissingGoogleDrive() {
-  // Use admin directly but only after lib/firebase ensures it's initialised
-  // Trigger init via a db call
-  await db.getMode().catch(() => {});
-
-  const admin = require('firebase-admin');
-  if (!admin.apps.length) {
-    console.error('[retry-gdrive] Firebase not initialised');
-    return;
-  }
-
-  const firestore = admin.firestore();
-  let snapshot;
+  // Get all completed records missing Google Drive — uses withRetry internally
+  let records;
   try {
-    snapshot = await firestore
-      .collection('processedFiles')
-      .where('status', '==', 'completed')
-      .orderBy('createdAt', 'asc')
-      .limit(50)
-      .get();
+    records = await db.getCompletedMissingGoogleDrive(50);
   } catch (err) {
-    console.error('[retry-gdrive] Firestore query failed:', err.message);
+    console.error('[retry-gdrive] Could not load records:', err.message);
     return;
   }
 
-  // Filter to only records missing Google Drive URL
-  const missing = snapshot.docs.filter(doc => !doc.data().googleDriveFolderUrl);
-  console.log(`[retry-gdrive] ${snapshot.docs.length} completed records, ${missing.length} missing Google Drive`);
+  if (!records.length) {
+    console.log('[retry-gdrive] No records missing Google Drive');
+    return;
+  }
 
-  let retried = 0;
+  console.log(`[retry-gdrive] ${records.length} file(s) need Google Drive filing`);
+  const token = await getToken();
 
-  // Process ONE file at a time, oldest first
-  for (const doc of missing) {
-    const record = doc.data();
-    const fileId = record.fileId;
+  for (const record of records) {
+    await processRecord(record, token);
+    await sleep(500); // avoid rate limiting between files
+  }
 
-    const pages = record.pages || {};
-    const pageEntries = Object.entries(pages);
-    if (!pageEntries.length) continue;
+  console.log('[retry-gdrive] Complete');
+}
 
-    console.log(`[retry-gdrive] Retrying Google Drive for "${record.originalFileName}"`);
+async function processRecord(record, token) {
+  const fileId = record.fileId;
+  const pages = record.pages || {};
+  const pageEntries = Object.entries(pages).sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
 
-    let lastGdResult = null;
+  if (!pageEntries.length) {
+    console.log(`[retry-gdrive] "${record.originalFileName}" has no pages — skipping`);
+    return;
+  }
 
-    for (const [pageNum, pageData] of pageEntries) {
-      if (!pageData.claudeJson || !pageData.finalFileName) continue;
-      if (pageData.googleDrive?.folderUrl) {
-        lastGdResult = pageData.googleDrive;
+  console.log(`[retry-gdrive] Processing "${record.originalFileName}" (${pageEntries.length} page(s))`);
+
+  let lastGdResult = null;
+
+  for (const [pageNum, pageData] of pageEntries) {
+    // Page already filed to Google Drive
+    if (pageData.googleDrive?.folderUrl) {
+      lastGdResult = pageData.googleDrive;
+      console.log(`[retry-gdrive] Page ${pageNum} already in Google Drive — skipping`);
+      continue;
+    }
+
+    // Need claudeJson and filename to file
+    if (!pageData.claudeJson || !pageData.finalFileName) {
+      console.warn(`[retry-gdrive] Page ${pageNum} missing claudeJson or fileName — skipping`);
+      continue;
+    }
+
+    try {
+      // Download from OneDrive Processed
+      const pageBuffer = await downloadFromProcessed(pageData.finalFileName, token);
+      if (!pageBuffer) {
+        console.warn(`[retry-gdrive] Could not download "${pageData.finalFileName}" — skipping`);
         continue;
       }
 
-      try {
-        const pageBuffer = await downloadFromProcessed(pageData.finalFileName);
-        if (!pageBuffer) continue;
+      // Determine folder names from Claude JSON
+      const customerFolderName = getCustomerFolderName(pageData.claudeJson);
+      const refFolderName = getRefFolder(pageData.claudeJson);
 
-        const claudeJson = pageData.claudeJson;
-        const customerFolderName = getCustomerFolderName(claudeJson);
-        const refFolderName = getRefFolder(claudeJson);
-
-        const gdResult = await fileDocuments(customerFolderName, refFolderName, [{
-          pageNumber: parseInt(pageNum),
-          finalFileName: pageData.finalFileName,
-          buffer: pageBuffer,
-        }]);
-
-        lastGdResult = {
-          folderId: gdResult.refFolderId,
-          folderUrl: gdResult.refFolderUrl,
-          customerFolderUrl: gdResult.customerFolderUrl,
-        };
-
-        await db.updateRecord(fileId, {
-          [`pages.${pageNum}.googleDrive`]: lastGdResult,
-        });
-
-        console.log(`[retry-gdrive] Filed page ${pageNum} of "${record.originalFileName}" ✓`);
-        retried++;
-
-      } catch (pageErr) {
-        console.error(`[retry-gdrive] Page ${pageNum} failed:`, pageErr.message);
+      if (!customerFolderName || !refFolderName) {
+        console.warn(`[retry-gdrive] Missing customer/ref for page ${pageNum} — skipping`);
+        continue;
       }
-    }
 
-    // Update top-level record
-    if (lastGdResult?.folderUrl) {
+      // File to Google Drive
+      console.log(`[retry-gdrive] Filing page ${pageNum} → "${customerFolderName}/${refFolderName}"`);
+      const gdResult = await fileDocuments(customerFolderName, refFolderName, [{
+        pageNumber: parseInt(pageNum),
+        finalFileName: pageData.finalFileName,
+        buffer: pageBuffer,
+      }]);
+
+      lastGdResult = {
+        folderId: gdResult.refFolderId,
+        folderUrl: gdResult.refFolderUrl,
+        customerFolderUrl: gdResult.customerFolderUrl,
+      };
+
+      // Save page-level result
       await db.updateRecord(fileId, {
-        googleDriveFolderUrl: lastGdResult.folderUrl,
-        googleDriveFolderId: lastGdResult.folderId,
-        googleDriveCustomerFolderUrl: lastGdResult.customerFolderUrl || null,
+        [`pages.${pageNum}.googleDrive`]: lastGdResult,
       });
-      console.log(`[retry-gdrive] Updated record for "${record.originalFileName}" ✓`);
-    }
 
-    // Brief pause between files to avoid rate limiting
-    await new Promise(r => setTimeout(r, 500));
+      console.log(`[retry-gdrive] Page ${pageNum} filed ✓`);
+
+    } catch (err) {
+      console.error(`[retry-gdrive] Page ${pageNum} failed:`, err.message);
+    }
   }
 
-  console.log(`[retry-gdrive] Done. Retried: ${retried} pages`);
+  // Save Google Drive URL at top level of record
+  if (lastGdResult?.folderUrl) {
+    await db.updateRecord(fileId, {
+      googleDriveFolderUrl: lastGdResult.folderUrl,
+      googleDriveFolderId: lastGdResult.folderId,
+      googleDriveCustomerFolderUrl: lastGdResult.customerFolderUrl || null,
+    });
+    console.log(`[retry-gdrive] ✅ "${record.originalFileName}" → ${lastGdResult.folderUrl}`);
+  } else {
+    console.warn(`[retry-gdrive] No Google Drive result saved for "${record.originalFileName}"`);
+  }
 }
 
-async function downloadFromProcessed(fileName) {
+async function downloadFromProcessed(fileName, token) {
   try {
-    const token = await getToken();
     const userId = process.env.ONEDRIVE_USER_ID;
-    const path = `Grove Group Scotland/Grove Bedding/Scans/Processed`;
-    const url = `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${path}/${encodeURIComponent(fileName)}:/content`;
+    const folder = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
+    const url = `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${folder}/${encodeURIComponent(fileName)}:/content`;
     const response = await axios.get(url, {
       headers: { Authorization: `Bearer ${token}` },
       responseType: 'arraybuffer',
@@ -143,7 +152,7 @@ async function downloadFromProcessed(fileName) {
     });
     return Buffer.from(response.data);
   } catch (err) {
-    console.warn(`[retry-gdrive] Could not download "${fileName}":`, err.message);
+    console.warn(`[retry-gdrive] Download failed for "${fileName}":`, err.response?.status || err.message);
     return null;
   }
 }
@@ -161,3 +170,5 @@ async function getToken() {
   );
   return r.data.access_token;
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
