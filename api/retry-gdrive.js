@@ -9,7 +9,7 @@
  */
 
 const db = require('../lib/firebase');
-const { getCustomerFolderName, getRefFolder } = require('../lib/namingEngine');
+const { getCustomerFolderName, getRefFolder, isCompanyName } = require('../lib/namingEngine');
 const { fileDocuments } = require('../lib/googleDrive');
 const axios = require('axios');
 
