@@ -448,6 +448,9 @@ async function loadProcessed() {
   ]);
   var d = results[0], statusData = results[1];
 
+  // Silently trigger retry for any files missing Google Drive
+  api('/api/retry-gdrive', { method: 'POST' }).catch(function(){});
+
   if (!d || !d.success || !d.files || !d.files.length) {
     $('proc-count').textContent = d && d.files ? '0 files' : 'Error';
     $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128100;</div><div class="ti">' + (d ? 'No files yet' : 'Failed to load') + '</div></div>';
@@ -489,23 +492,33 @@ async function loadProcessed() {
     }
     var customer = rec && rec.customerName ? rec.customerName : '';
     var ref = rec && rec.ref ? rec.ref : '';
+    var supplier = rec && rec.supplier ? rec.supplier : '';
     var gdUrl = rec && rec.googleDriveFolderUrl ? rec.googleDriveFolderUrl : '';
     var odUrl = f.webUrl || '';
     var folderLabel = customer ? (customer + (ref ? ' / ' + ref : '')) : '';
 
-    // Folder tag
+    // Folder tags
     var tags = '';
-    if (gdUrl) tags += '<span class="folder-tag gd">&#128230; Google Drive</span> ';
+    if (gdUrl) {
+      tags += '<span class="folder-tag gd">&#128230; Google Drive</span> ';
+    } else if (rec) {
+      // Has Firestore record but no GD URL yet — show pending tag
+      tags += '<span class="folder-tag" style="background:#1a1a00;color:#eab308;border:1px solid #eab30833">&#9203; GD Pending</span> ';
+    }
     if (odUrl) tags += '<span class="folder-tag od">&#9729;&#65039; OneDrive</span>';
 
     // Dropdown content
     var dropId = 'pdrop-' + idx;
     var dropHtml = '<div class="proc-drop" id="' + dropId + '">';
+    if (supplier) dropHtml += '<div class="pd-row"><div class="pd-lbl">Supplier</div><div class="pd-val">' + esc(supplier) + '</div></div>';
     if (folderLabel) dropHtml += '<div class="pd-row"><div class="pd-lbl">Folder</div><div class="pd-val" title="' + esc(folderLabel) + '">' + esc(folderLabel) + '</div></div>';
-    if (rec && rec.supplier) dropHtml += '<div class="pd-row"><div class="pd-lbl">Supplier</div><div class="pd-val">' + esc(rec.supplier) + '</div></div>';
-    if (gdUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><a class="pd-link" href="' + esc(gdUrl) + '" target="_blank" onclick="event.stopPropagation()">Open folder &#8599;</a></div>';
+    if (gdUrl) {
+      dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><a class="pd-link" href="' + esc(gdUrl) + '" target="_blank" onclick="event.stopPropagation()">Open folder &#8599;</a></div>';
+    } else if (rec) {
+      dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><div class="pd-val" style="color:var(--yl)">Retrying... refresh in a moment</div></div>';
+    }
     if (odUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
-    if (!gdUrl && !odUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl" style="color:var(--mu)">No folder links available</div></div>';
+    if (!rec) dropHtml += '<div class="pd-row"><div class="pd-lbl" style="color:var(--mu)">Processing record not found</div></div>';
     dropHtml += '</div>';
 
     return '<div class="fi done-f" data-dropid="' + dropId + '"  onclick="toggleProcDrop(this.dataset.dropid,this)" style="flex-direction:column;align-items:stretch;cursor:pointer">'
