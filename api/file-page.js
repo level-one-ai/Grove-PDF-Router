@@ -189,24 +189,9 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   const folderIsCompany = isCompanyName(claudeJson);
   console.log(`[file-page] ${T()} Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
 
-  // Check if file already exists in OneDrive Processed (manually processed previously)
-  const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
-  let alreadyInProcessed = false;
-  try {
-    const userId = process.env.ONEDRIVE_USER_ID;
-    const token = await getToken();
-    await axios.get(
-      `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${processedPath}/${encodeURIComponent(finalFileName)}`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    alreadyInProcessed = true;
-    console.log(`[file-page] ${T()} "${finalFileName}" already in Processed — skipping Google Drive`);
-  } catch (e) {
-    // 404 = not there yet, continue normally
-  }
-
   // Upload to OneDrive and Google Drive in parallel
   console.log(`[file-page] ${T()} Starting parallel uploads...`);
+  const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
 
   const [oneDriveResult, googleDriveResult] = await Promise.all([
     uploadToOneDrive(processedPath, finalFileName, pageBuffer)
@@ -218,29 +203,21 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
         console.error(`[file-page] ${T()} OneDrive FAILED:`, err.message);
         return null;
       }),
-    alreadyInProcessed
-      ? Promise.resolve(null) // skip GD — file was manually processed
-      : fileDocuments(customerFolderName, refFolderName, [{ pageNumber, finalFileName, buffer: pageBuffer }], folderIsCompany)
-          .then(result => {
-            console.log(`[file-page] ${T()} Google Drive OK: "${customerFolderName}/${refFolderName}"`);
-            return result;
-          })
-          .catch(err => {
-            console.error(`[file-page] ${T()} Google Drive FAILED:`, err.message);
-            return null;
-          }),
+    fileDocuments(customerFolderName, refFolderName, [{ pageNumber, finalFileName, buffer: pageBuffer }], folderIsCompany)
+      .then(result => {
+        console.log(`[file-page] ${T()} Google Drive OK: "${customerFolderName}/${refFolderName}"`);
+        return result;
+      })
+      .catch(err => {
+        console.error(`[file-page] ${T()} Google Drive FAILED:`, err.message);
+        return null;
+      }),
   ]);
 
   console.log(`[file-page] ${T()} Uploads done. OneDrive: ${!!oneDriveResult} | Google: ${!!googleDriveResult}`);
 
-  // Save Google Drive URL to top-level record immediately so dashboard can show it
-  if (googleDriveResult?.refFolderUrl) {
-    await db.updateRecord(fileId, {
-      googleDriveFolderUrl: googleDriveResult.refFolderUrl,
-      googleDriveFolderId: googleDriveResult.refFolderId || null,
-      googleDriveCustomerFolderUrl: googleDriveResult.customerFolderUrl || null,
-    });
-  }
+  // Wait for GD to finish before saving final Firestore record
+  await gdPromise.catch(() => {});
 
   // Update Firestore
   await db.updatePageResult(fileId, pageNumber, {
@@ -256,6 +233,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
       folderUrl: googleDriveResult.refFolderUrl,
       uploadedFile: googleDriveResult.uploadedFiles?.[0] || null,
     } : null,
+    // googleDriveFolderUrl already saved inline above if GD succeeded
   });
   console.log(`[file-page] ${T()} Firestore updated`);
 
@@ -263,7 +241,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
     console.log(`[file-page] ${T()} Waiting for page ${nextPage} in Temp...`);
-    const nextTempData = await waitForTempPage(fileId, nextPage, 20000);
+    const nextTempData = await waitForTempPage(fileId, nextPage, 40000);
     if (nextTempData) {
       const rec = await db.getRecord(fileId);
       await Promise.all([
