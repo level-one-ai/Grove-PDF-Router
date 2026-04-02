@@ -313,8 +313,8 @@ function $(id){ return document.getElementById(id); }
 async function api(url, opts) {
   try {
     var r = await fetch(url, opts || {});
-    if (!r.ok) return null;
-    return await r.json();
+    var json = await r.json().catch(function(){ return null; });
+    return json; // return body even on error — caller checks d.success or d.error
   } catch(ex) { return null; }
 }
 
@@ -824,7 +824,7 @@ async function retryGoogleDrive() {
   }
 
   try {
-    var resp = await fetch('/api/retry-gdrive', { method: 'POST' });
+    var resp = await fetch('/api/gdrive?action=retry', { method: 'POST' });
     var reader = resp.body.getReader();
     var dec = new TextDecoder();
     var buf = '';
@@ -900,7 +900,7 @@ async function sendToGDrive(btn) {
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span>';
 
-  var d = await api('/api/file-to-gdrive', {
+  var d = await api('/api/gdrive?action=file', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ fileName: fileName, fileId: fileId || undefined }),
@@ -921,14 +921,26 @@ async function sendToGDrive(btn) {
     // Refresh status cache and processed panel after a moment
     setTimeout(function(){ loadStatus().then(loadProcessed); }, 2000);
   } else {
+    var errMsg = (d && d.error) ? d.error : 'Request failed — check Vercel logs';
     btn.disabled = false;
-    btn.innerHTML = '&#10007; Failed';
+    btn.innerHTML = '&#10007; Retry';
     btn.style.color = 'var(--rd)';
-    btn.title = (d && d.error) ? d.error : 'Unknown error';
-    setTimeout(function(){
-      btn.innerHTML = '&#128230; Send to GD';
-      btn.style.color = 'var(--gn)';
-    }, 4000);
+    // Show error message below the button
+    var row = btn.closest('.pd-row');
+    if (row) {
+      var existing = row.parentNode.querySelector('.gd-err-msg');
+      if (existing) existing.remove();
+      var errDiv = document.createElement('div');
+      errDiv.className = 'gd-err-msg';
+      errDiv.style.cssText = 'font-size:10px;color:var(--rd);padding:3px 12px 4px;word-break:break-all';
+      errDiv.textContent = '\u26a0 ' + errMsg;
+      row.parentNode.insertBefore(errDiv, row.nextSibling);
+      setTimeout(function(){
+        if (errDiv.parentNode) errDiv.remove();
+        btn.innerHTML = '&#128230; Send to GD';
+        btn.style.color = 'var(--gn)';
+      }, 8000);
+    }
   }
 }
 
