@@ -1,30 +1,14 @@
 {
   "version": 2,
   "functions": {
-    "api/test-run.js": {
-      "maxDuration": 300
-    },
-    "api/file-page.js": {
-      "maxDuration": 300
-    },
-    "api/webhook.js": {
-      "maxDuration": 300
-    },
-    "api/scan-now.js": {
-      "maxDuration": 300
-    },
-    "api/callback.js": {
-      "maxDuration": 30
-    },
-    "api/cron.js": {
-      "maxDuration": 60
-    },
-    "api/*.js": {
-      "maxDuration": 60
-    },
-    "api/gdrive.js": {
-      "maxDuration": 300
-    }
+    "api/test-run.js": { "maxDuration": 300 },
+    "api/file-page.js": { "maxDuration": 300 },
+    "api/webhook.js": { "maxDuration": 300 },
+    "api/scan-now.js": { "maxDuration": 300 },
+    "api/gdrive.js": { "maxDuration": 300 },
+    "api/cron.js": { "maxDuration": 60 },
+    "api/callback.js": { "maxDuration": 30 },
+    "api/*.js": { "maxDuration": 60 }
   },
   "crons": [
     {
@@ -33,13 +17,7 @@
     }
   ],
   "routes": [
-    {
-      "src": "/dashboard",
-      "dest": "/api/dashboard"
-    },
-    {
-      "src": "/api/(.*)",
-      "dest": "/api/$1"
-    }
+    { "src": "/dashboard", "dest": "/api/dashboard" },
+    { "src": "/api/(.*)", "dest": "/api/$1" }
   ]
 }
