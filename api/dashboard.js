@@ -5,17 +5,6 @@
  */
 
 module.exports = async function handler(req, res) {
-  const auth = req.headers['authorization'];
-  if (!auth || !auth.startsWith('Basic ')) {
-    res.setHeader('WWW-Authenticate', 'Basic realm="Grove PDF Router"');
-    return res.status(401).send('Login required');
-  }
-  const [user, ...pp] = Buffer.from(auth.slice(6), 'base64').toString().split(':');
-  const pass = pp.join(':');
-  if (user !== process.env.DASHBOARD_USERNAME || pass !== process.env.DASHBOARD_PASSWORD) {
-    res.setHeader('WWW-Authenticate', 'Basic realm="Grove PDF Router"');
-    return res.status(401).send('Invalid credentials');
-  }
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.status(200).send(HTML);
 };
@@ -674,17 +663,19 @@ async function startRun() {
     var body = {fileId:SF.id, fileName:SF.name, runMode:CM, runStep:ST, isWaiting:!!WF[SF.id]};
     var resp = await fetch('/api/test-run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     if (!resp.ok && resp.status !== 200) { finErr('unknown', 'Server error ' + resp.status); return; }
-    var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '';
+    var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '', evt = null;
     while (true) {
       var chunk = await reader.read();
       if (chunk.done) break;
       buf += dec.decode(chunk.value, {stream:true});
-      var lines = buf.split('\\n'); buf = lines.pop();
-      var evt = null;
+      var lines = buf.split('
+'); buf = lines.pop();
       lines.forEach(function(line){
         if (line.startsWith('event: ')) evt = line.slice(7).trim();
         else if (line.startsWith('data: ')) {
           try { handleEvt(evt, JSON.parse(line.slice(6))); } catch(ex){}
+        } else if (line === '') {
+          evt = null;
         }
       });
     }
