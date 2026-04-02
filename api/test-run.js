@@ -210,45 +210,55 @@ module.exports = async function handler(req, res) {
 };
 
 async function pollForCompletion(fileId, totalPages, onEvent) {
-  const MAX_WAIT = 10 * 60 * 1000; // 10 minutes — large files (20+ pages) need more time
+  // Adaptive timeout: max 3 minutes since last progress, or 15 minutes total
+  const MAX_TOTAL = 15 * 60 * 1000;
+  const MAX_IDLE  =  3 * 60 * 1000; // reset whenever a page progresses
   const INTERVAL = 3000;
   const start = Date.now();
-  // Track what we've already reported to avoid duplicate events
+  let lastProgress = Date.now();
   const reported = { extraction: new Set(), filing: new Set(), filed: new Set() };
 
-  while (Date.now() - start < MAX_WAIT) {
+  while (Date.now() - start < MAX_TOTAL) {
     await sleep(INTERVAL);
     const record = await db.getRecord(fileId);
     if (!record) continue;
     if (record.status === 'error') return { status: 'error', error: record.error };
 
-    // Check each page's status and fire events in order
     const pages = record.pages || {};
+    let anyNew = false;
     for (let p = 1; p <= totalPages; p++) {
       const pageData = pages[p] || pages[String(p)];
       if (!pageData) continue;
       const st = pageData.status;
 
-      // Page JSON saved (AI extraction done) — covers filing, skipped, completed, pending-filing
       if (!reported.extraction.has(p) && st && st !== 'pending') {
         reported.extraction.add(p);
         onEvent({ type: 'extraction', page: p });
+        anyNew = true;
       }
-      // Page filing started
       if (!reported.filing.has(p) && (st === 'filing' || st === 'completed' || st === 'skipped')) {
         reported.filing.add(p);
         onEvent({ type: 'filing', page: p });
+        anyNew = true;
       }
-      // Page fully filed or skipped
       if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
         reported.filed.add(p);
         onEvent({ type: 'filed', page: p });
+        anyNew = true;
       }
     }
 
+    // Reset idle timer whenever any page progresses
+    if (anyNew) lastProgress = Date.now();
+
     if (record.status === 'completed') return record;
+
+    // Idle timeout — no progress for 3 minutes
+    if (Date.now() - lastProgress > MAX_IDLE) {
+      return { status: 'error', error: `No progress for 3 minutes — ${reported.filed.size}/${totalPages} pages filed. File may still be processing in background.` };
+    }
   }
-  return { status: 'error', error: 'Timed out after 10 minutes — file may still be processing in background' };
+  return { status: 'error', error: `15 minute limit reached — ${reported.filed.size}/${totalPages} pages filed. File is still processing in background.` };
 }
 
 async function uploadRemainingPages(remainingPages, fileId, token, userId, pageStore) {
