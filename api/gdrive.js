@@ -37,16 +37,22 @@ async function handleTest(req, res) {
   res.setHeader('Content-Type', 'application/json');
   const results = {};
 
+  const hasOAuth = !!(process.env.GOOGLE_OAUTH_CLIENT_ID && process.env.GOOGLE_OAUTH_CLIENT_SECRET && process.env.GOOGLE_OAUTH_REFRESH_TOKEN);
   results.envVars = {
+    authMethod: hasOAuth ? 'OAuth (personal account)' : 'Service Account',
     hasClientEmail: !!process.env.GOOGLE_CLIENT_EMAIL,
     clientEmail: process.env.GOOGLE_CLIENT_EMAIL || 'NOT SET',
     hasPrivateKey: !!process.env.GOOGLE_PRIVATE_KEY,
     privateKeyLength: (process.env.GOOGLE_PRIVATE_KEY || '').length,
-    privateKeyStart: (process.env.GOOGLE_PRIVATE_KEY || '').slice(0, 30),
-    privateKeyHasNewlines: (process.env.GOOGLE_PRIVATE_KEY || '').includes('\n'),
     rootFolderId: process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || 'NOT SET',
     hasRootFolderId: !!process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID,
     ownerEmail: process.env.GOOGLE_DRIVE_OWNER_EMAIL || 'NOT SET',
+    oauth: {
+      hasClientId: !!process.env.GOOGLE_OAUTH_CLIENT_ID,
+      hasClientSecret: !!process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+      hasRefreshToken: !!process.env.GOOGLE_OAUTH_REFRESH_TOKEN,
+      active: hasOAuth,
+    },
   };
 
   try {
