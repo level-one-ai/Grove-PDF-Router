@@ -216,9 +216,6 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
 
   console.log(`[file-page] ${T()} Uploads done. OneDrive: ${!!oneDriveResult} | Google: ${!!googleDriveResult}`);
 
-  // Wait for GD to finish before saving final Firestore record
-  await gdPromise.catch(() => {});
-
   // Update Firestore
   await db.updatePageResult(fileId, pageNumber, {
     claudeJson,
