@@ -692,7 +692,14 @@ async function startRun() {
 }
 
 function handleEvt(ev, d) {
-  if (ev==='progress') updStep(d.step, d.message, d.status);
+  if (ev==='progress') {
+    if (d.status === 'running') {
+      // Defer running state slightly so any pending 'done' renders first
+      requestAnimationFrame(function(){ updStep(d.step, d.message, d.status); });
+    } else {
+      updStep(d.step, d.message, d.status);
+    }
+  }
   else if (ev==='complete') {
     updStep(6, 'Filed to OneDrive & Google Drive \u2713', 'done');
     showRes(d);
@@ -703,7 +710,13 @@ function handleEvt(ev, d) {
 
 function updStep(n, msg, st) {
   STEPS.forEach(function(s){
-    if (s.id < n) { var el=$('st-'+s.id); if(el && el.dataset.status==='pending') el.outerHTML=mkStep(s.id,s.l,'','done'); }
+    if (s.id < n) {
+      var el=$('st-'+s.id);
+      // Mark any earlier step that is still pending OR running as done
+      if(el && (el.dataset.status==='pending' || el.dataset.status==='running')) {
+        el.outerHTML=mkStep(s.id,s.l,'','done');
+      }
+    }
   });
   var ex = $('st-'+n), step = STEPS.find(function(s){return s.id===n;});
   if (!step) return;
