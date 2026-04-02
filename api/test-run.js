@@ -86,6 +86,7 @@ module.exports = async function handler(req, res) {
     try {
       pdfBuffer = await downloadFile(fileId);
       progress(2, `Downloaded ${formatBytes(pdfBuffer.length)} ✓`, 'done');
+      await sleep(300);
     } catch (err) {
       await db.markError(fileId, err);
       return fail(2, `Download failed: ${err.message}`);
@@ -97,6 +98,7 @@ module.exports = async function handler(req, res) {
     try {
       ({ pages, totalPages } = await splitPdf(pdfBuffer));
       progress(3, `Split into ${totalPages} page(s) ✓`, 'done');
+      await sleep(300);
     } catch (err) {
       await db.markError(fileId, err);
       return fail(3, `Split failed: ${err.message}`);
@@ -134,6 +136,7 @@ module.exports = async function handler(req, res) {
       progress(4, `Sending page 1/${totalPages} to Make.com...`);
       await dispatchToMake(1, page1.zeroPadded, fileId, originalFileName, totalPages, page1ItemId);
       progress(4, `Page 1/${totalPages} dispatched to Make.com ✓`, 'done');
+      await sleep(300);
 
       // Upload remaining pages in background
       uploadRemainingPages(pages.slice(1), fileId, token, userId, pageStore)
@@ -162,7 +165,8 @@ module.exports = async function handler(req, res) {
           progress(5, `AI extraction: page ${event.page}/${totalPages} complete...`, 'running');
         }
       } else if (event.type === 'filing') {
-        // Filing started — step 5 must be done first, then step 6 starts
+        // Filing started — mark step 5 done first, then start step 6
+        // The SSE flush between these two writes gives the browser time to render step 5 as done
         progress(5, `AI extraction complete ✓`, 'done');
         progress(6, `Filing page ${event.page}/${totalPages} to OneDrive & Google Drive...`, 'running');
       } else if (event.type === 'filed') {
