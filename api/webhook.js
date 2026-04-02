@@ -31,8 +31,14 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Respond immediately — Graph API requires response within 3 seconds
-  res.status(202).json({ status: 'accepted' });
+  // Respond immediately — Graph API requires response within 3 seconds.
+  // Graph sometimes drops the connection before TLS completes on a cold start,
+  // causing ECONNRESET. Catch it so background processing still runs regardless.
+  try {
+    res.status(202).json({ status: 'accepted' });
+  } catch (connErr) {
+    console.warn('[webhook] Could not send 202 (Graph disconnected early — harmless):', connErr.message);
+  }
 
   try {
     const notifications = req.body?.value || [];
