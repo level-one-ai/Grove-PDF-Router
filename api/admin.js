@@ -68,6 +68,7 @@ module.exports = async function handler(req, res) {
         });
 
         // When switching to auto, trigger a scan of existing files immediately
+        // and start the server-side auto-poll loop
         if (mode === 'auto') {
           const axios = require('axios');
           const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
@@ -75,7 +76,12 @@ module.exports = async function handler(req, res) {
             headers: { 'Content-Type': 'application/json' },
             timeout: 5000,
           }).catch(err => console.warn('[admin] scan-now trigger warning:', err.message));
-          console.log('[admin] Switched to auto — triggered scan-now');
+          // Start the server-side auto-poll loop (checks Scans folder every 10s)
+          axios.post(`${baseUrl}/api/auto-poll`, {}, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 5000,
+          }).catch(err => console.warn('[admin] auto-poll trigger warning:', err.message));
+          console.log('[admin] Switched to auto — triggered scan-now + auto-poll');
         }
 
         return res.status(200).json({ success: true, mode });
