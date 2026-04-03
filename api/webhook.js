@@ -107,7 +107,8 @@ async function scanAndProcess() {
       }
     }
 
-    console.log(`[webhook] Processing: "${file.name}"`);
+    const isOldFile = await db.isOldFile(file.id);
+    console.log(`[webhook] Processing: "${file.name}" (${isOldFile ? 'old-queue' : 'NEW — priority'})`);
     await processFile(file.id, file.name, mode);
   }
 }
