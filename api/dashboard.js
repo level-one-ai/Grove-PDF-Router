@@ -503,15 +503,17 @@ async function loadScans() {
   $('scan-list').innerHTML = '<div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading...</div></div>';
   $('scan-count').textContent = '--';
 
-  // Fetch scans and processed names in parallel
-  var results = await Promise.all([api('/api/scan-files'), loadProcessedNames()]);
-  var d = results[0];
+  // Fetch scans first — this must succeed for the list to show
+  var d = await api('/api/scan-files');
 
   if (!d || !d.success || !d.files) {
     $('scan-count').textContent = 'Error';
     $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128589;</div><div class="ti">Failed to load</div></div>';
     return;
   }
+
+  // Fetch processed names separately — failure here is non-fatal, just skip duplicate marking
+  try { await loadProcessedNames(); } catch(e) { PROCESSED_NAMES = new Set(); }
 
   // Show all files from the Scans folder — do NOT filter by Firestore status
   // (Firestore records may be missing or stale; trust what OneDrive actually has)
