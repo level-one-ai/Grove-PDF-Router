@@ -7,6 +7,10 @@
  * Paginates through all Graph API results (max 200 per page).
  */
 
+module.exports.config = {
+  maxDuration: 30, // Vercel Pro allows up to 300s; 30s is plenty for paginated OneDrive listing
+};
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
@@ -48,7 +52,7 @@ module.exports = async function handler(req, res) {
     console.log('[scan-files] Fetching folder:', folderPath);
 
     // Paginate through all results — Graph API returns max 200 per page
-    const TIMEOUT_MS = 20000;
+    const TIMEOUT_MS = 8000; // Stay well under Vercel default 10s limit
     const deadline = Date.now() + TIMEOUT_MS;
     let allItems = [];
     let nextPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file&$top=200`;
