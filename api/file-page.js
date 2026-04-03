@@ -243,6 +243,32 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   // Dispatch next page or mark complete
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
+    // ── PRIORITY CHECK ──
+    // Before dispatching the next page of this (potentially old) file, check whether
+    // a new higher-priority file has arrived. If so, pause here and let scan-now
+    // pick up the new file first. We resume this file once new files are done.
+    const autoMode = await db.getMode().catch(() => 'auto');
+    if (autoMode === 'auto') {
+      const isOld = await db.isOldFile(fileId);
+      if (isOld) {
+        const newFileArrived = await checkForNewPriorityFile(fileId);
+        if (newFileArrived) {
+          console.log(`[file-page] ${T()} NEW FILE DETECTED — pausing old file after page ${pageNumber}, will resume from page ${nextPage}`);
+          const rec = await db.getRecord(fileId);
+          await Promise.all([
+            db.setPausedFile(fileId, nextPage, totalPages, rec.originalFileName),
+            db.updateRecord(fileId, { status: 'paused', pausedAtPage: pageNumber }),
+          ]);
+          // Trigger scan-now to pick up the new file immediately
+          const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+          axios.post(`${baseUrl}/api/scan-now`, {}, {
+            headers: { 'Content-Type': 'application/json' }, timeout: 5000,
+          }).catch(err => console.warn('[file-page] scan-now trigger warning:', err.message));
+          return; // Stop processing this file for now
+        }
+      }
+    }
+
     console.log(`[file-page] ${T()} Waiting for page ${nextPage} in Temp...`);
     const nextTempData = await waitForTempPage(fileId, nextPage, 40000);
     if (nextTempData) {
@@ -417,6 +443,42 @@ async function deleteOriginalFromScans(fileId) {
     } else {
       console.warn(`[file-page] Could not delete original from Scans:`, err.message);
     }
+  }
+}
+
+async function checkForNewPriorityFile(currentFileId) {
+  // Returns true if there is a file in the Scans folder that is NOT marked as old
+  // (i.e. it arrived after auto mode was switched on) and hasn't started processing yet.
+  try {
+    const userId = process.env.ONEDRIVE_USER_ID;
+    const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
+    const token = await getToken();
+    const response = await axios.get(
+      `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${folderPath}:/children` +
+      `?=id,name,file,createdDateTime&=200`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const items = response.data?.value || [];
+    const pdfs = items.filter(item => {
+      const name = (item.name || '').toLowerCase();
+      return name.endsWith('.pdf') || (item.file?.mimeType || '').includes('pdf');
+    });
+
+    for (const pdf of pdfs) {
+      if (pdf.id === currentFileId) continue; // skip self
+      const isOld = await db.isOldFile(pdf.id);
+      if (isOld) continue; // skip other old files
+      // This file is new — check it hasn't already started processing
+      const existing = await db.getRecord(pdf.id);
+      if (!existing || ['reset', null, undefined].includes(existing?.status)) {
+        console.log(`[file-page] Priority check: new file found — ${pdf.name}`);
+        return true;
+      }
+    }
+    return false;
+  } catch (err) {
+    console.warn('[file-page] Priority check error (non-fatal):', err.message);
+    return false; // fail safe — don't pause if check fails
   }
 }
 
