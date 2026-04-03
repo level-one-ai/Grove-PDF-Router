@@ -99,10 +99,11 @@ module.exports = async function handler(req, res) {
   res.status(200).json({ status: 'received', pageNumber });
 
   // Trigger /api/file-page in background — non-blocking
+  // Forward the full payload so file-page has claudeJson and document_type
   const filPageUrl = `${process.env.WEBHOOK_NOTIFICATION_URL}/api/file-page`;
   console.log(`[callback] Triggering file-page for page ${pageNumber}`);
 
-  axios.post(filPageUrl, { fileId, pageNumber, totalPages }, {
+  axios.post(filPageUrl, body, {
     headers: { 'Content-Type': 'application/json' },
     timeout: 5000, // just need to trigger it, not wait
   }).catch(err => {
