@@ -321,6 +321,9 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 var SF = null, IR = false, CM = 'auto', ST = 1, WF = {}, STOPPED = false;
 var STATUS_CACHE = []; // All Firestore records — loaded once, reused everywhere
 var STATUS_LOADED = false;
+var AUTO_POLL_INTERVAL = null;
+var AUTO_KNOWN_IDS = null; // Set of file IDs known to exist in Scans (for new-file detection)
+var AUTO_PROCESSING = false; // True while auto mode is running a file
 var STEPS = [
   {id:1,l:'Initialise record'},
   {id:2,l:'Download from OneDrive'},
@@ -403,8 +406,145 @@ function applyMode() {
   // Show Process All only in auto mode
   var pab = $('proc-all-btn');
   if (pab) pab.style.display = h ? 'none' : 'inline-block';
-  if (h) { $('stoparea').className = 'stoparea'; }
-  else { loadStopState(); }
+  if (h) {
+    $('stoparea').className = 'stoparea';
+    stopAutoPolling();
+  } else {
+    loadStopState();
+    startAutoPolling();
+  }
+}
+
+// ── AUTO MODE POLLING ──
+function startAutoPolling() {
+  stopAutoPolling();
+  AUTO_POLL_INTERVAL = setInterval(autoPollScans, 8000);
+  // Seed known IDs immediately so first poll detects only NEW files added after this point
+  seedAutoKnownIds();
+}
+
+function stopAutoPolling() {
+  if (AUTO_POLL_INTERVAL) { clearInterval(AUTO_POLL_INTERVAL); AUTO_POLL_INTERVAL = null; }
+}
+
+async function seedAutoKnownIds() {
+  var d = await api('/api/scan-files');
+  if (d && d.files) {
+    var processedIds = {};
+    STATUS_CACHE.forEach(function(r){ if (r.status==='completed') processedIds[r.fileId]=true; });
+    var unprocessed = d.files.filter(function(f){ return !processedIds[f.id]; });
+    AUTO_KNOWN_IDS = {};
+    unprocessed.forEach(function(f){ AUTO_KNOWN_IDS[f.id] = true; });
+  }
+}
+
+async function autoPollScans() {
+  // Don't poll while already processing or stopped
+  if (AUTO_PROCESSING || STOPPED || CM !== 'auto') return;
+
+  var d = await api('/api/scan-files');
+  if (!d || !d.success || !d.files) return;
+
+  // Refresh status cache so completed files are excluded
+  await loadStatus();
+  var processedIds = {};
+  STATUS_CACHE.forEach(function(r){ if (r.status==='completed') processedIds[r.fileId]=true; });
+  var unprocessed = d.files.filter(function(f){ return !processedIds[f.id]; });
+
+  // Initialise known IDs on first poll if not seeded yet
+  if (AUTO_KNOWN_IDS === null) {
+    AUTO_KNOWN_IDS = {};
+    unprocessed.forEach(function(f){ AUTO_KNOWN_IDS[f.id] = true; });
+    return;
+  }
+
+  // Find files that are NEW (not in our known set)
+  var newFiles = unprocessed.filter(function(f){ return !AUTO_KNOWN_IDS[f.id]; });
+
+  if (!newFiles.length) return;
+
+  // Add new files to known set immediately so we don't trigger again
+  newFiles.forEach(function(f){ AUTO_KNOWN_IDS[f.id] = true; });
+
+  // Refresh the Scans panel to show the new file
+  window.SCAN_FILES = unprocessed;
+  $('scan-count').textContent = unprocessed.length + ' file' + (unprocessed.length===1?'':'s');
+  $('scan-list').innerHTML = unprocessed.map(function(f, idx){
+    return '<div class="fi" id="sf-' + f.id + '" data-fid="' + esc(f.id) + '" data-idx="' + idx + '" onclick="clickScan(this)">'
+      + '<div class="fic">&#128196;</div>'
+      + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div><div class="fmeta">' + fsize(f.size) + ' &middot; ' + fdate(f.createdAt) + '</div></div>'
+      + '<div class="fac"><span class="wbadge">&#9203;</span>'
+      + '<button class="rstbtn" data-rid="' + esc(f.id) + '" onclick="doReset(event,this.dataset.rid)" title="Reset">&#8635;</button>'
+      + '<div class="chk">&#10003;</div></div>'
+      + '</div>';
+  }).join('');
+  refreshBadges();
+
+  // Auto-process the first new file
+  var fileToProcess = newFiles[0];
+  autoRunFile(fileToProcess);
+}
+
+async function autoRunFile(f) {
+  if (AUTO_PROCESSING || STOPPED) return;
+  AUTO_PROCESSING = true;
+
+  // Highlight the file in the Scans list
+  document.querySelectorAll('.fi').forEach(function(x){ x.classList.remove('sel'); });
+  var el = $('sf-' + f.id);
+  if (el) el.classList.add('sel');
+
+  // Show file details in the right panel
+  SF = f;
+  $('nosel').style.display = 'none';
+  $('seldet').style.display = 'block';
+  $('selname').textContent = f.name;
+  $('selmeta').textContent = fsize(f.size) + ' \u00b7 ' + fdate(f.createdAt) + ' \u2022 Auto';
+  var ss = $('stepsel');
+  if (ss) ss.style.display = 'none';
+  var btn = $('runbtn');
+  btn.className = 'runbtn going'; btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> Auto running...';
+
+  // Show progress steps
+  IR = true;
+  $('progidle').style.display = 'none';
+  $('rescard').innerHTML = '';
+  $('steplist').innerHTML = STEPS.map(function(s){ return mkStep(s.id, s.l, '', 'pending'); }).join('');
+
+  try {
+    var body = {fileId:f.id, fileName:f.name, runMode:'auto', runStep:1, isWaiting:!!WF[f.id]};
+    var resp = await fetch('/api/test-run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!resp.ok && resp.status !== 200) { autoFinErr('unknown', 'Server error ' + resp.status); return; }
+    var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '', evt = null;
+    while (true) {
+      var chunk = await reader.read();
+      if (chunk.done) break;
+      buf += dec.decode(chunk.value, {stream:true});
+      var lines = buf.split('\\n'); buf = lines.pop();
+      lines.forEach(function(line){
+        if (line.startsWith('event: ')) evt = line.slice(7).trim();
+        else if (line.startsWith('data: ')) {
+          try { handleEvt(evt, JSON.parse(line.slice(6))); } catch(ex){}
+        } else if (line === '') {
+          evt = null;
+        }
+      });
+    }
+  } catch(err) { autoFinErr('unknown', err.message); }
+}
+
+function autoFinErr(step, msg) {
+  IR = false;
+  AUTO_PROCESSING = false;
+  if (step !== 'unknown') updStep(step, msg, 'error');
+  $('rescard').innerHTML = '<div class="rescard err"><div class="restitle">\u274c Auto Run Failed</div>'
+    + '<div class="resrow"><div class="reslbl">Error</div><div class="resval" style="color:var(--rd)">' + esc(msg) + '</div></div></div>';
+  var btn = $('runbtn');
+  btn.className = 'runbtn go'; btn.disabled = false;
+  btn.innerHTML = '\u21ba Try Again';
+  // Refresh both panels even on error
+  setTimeout(function(){ loadStatus().then(function(){ loadScans(); loadProcessed(); }); }, 2000);
 }
 function setSt(n) {
   ST = n;
@@ -775,16 +915,28 @@ function resetProg() {
 
 function finRun(success) {
   IR = false;
+  AUTO_PROCESSING = false;
   var btn = $('runbtn');
   loadWaiting();
   if (success) {
-    // Disable button — file is processed, no need to run again
     btn.className = 'runbtn'; btn.disabled = true;
     btn.innerHTML = '\u2705 Complete';
-    // Refresh cache and both columns after giving Firestore time to write
-    setTimeout(function(){ loadStatus().then(function(){ loadScans(); loadProcessed(); }); }, 4000);
+    if (CM === 'auto') {
+      // Auto mode: hold result visible for 5s then fully reset the right panel
+      setTimeout(function(){
+        if (SF && AUTO_KNOWN_IDS) delete AUTO_KNOWN_IDS[SF.id];
+        loadStatus().then(function(){ loadScans(); loadProcessed(); });
+        document.querySelectorAll('.fi').forEach(function(x){ x.classList.remove('sel'); });
+        SF = null;
+        $('seldet').style.display = 'none';
+        $('nosel').style.display = 'flex';
+        resetProg();
+      }, 5000);
+    } else {
+      // Human mode: refresh panels after a short delay as before
+      setTimeout(function(){ loadStatus().then(function(){ loadScans(); loadProcessed(); }); }, 4000);
+    }
   } else {
-    // Re-enable on failure so user can try again
     btn.className = 'runbtn go'; btn.disabled = false;
     btn.innerHTML = '\u21ba Run Again';
   }
