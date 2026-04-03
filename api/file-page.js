@@ -181,7 +181,7 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages) {
   if (nextPage <= totalPages) {
     console.log(`[file-page] Dispatching next page ${nextPage} after page ${pageNumber}`);
     try {
-      const nextTempData = await waitForTempPage(fileId, nextPage, 40000);
+      const nextTempData = await waitForTempPage(fileId, nextPage, 120000);
       if (nextTempData) {
         const rec = await db.getRecord(fileId);
         await Promise.all([
@@ -358,7 +358,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     }
 
     console.log(`[file-page] ${T()} Waiting for page ${nextPage} in Temp...`);
-    const nextTempData = await waitForTempPage(fileId, nextPage, 40000);
+    const nextTempData = await waitForTempPage(fileId, nextPage, 120000);
     if (nextTempData) {
       const rec = await db.getRecord(fileId);
       await Promise.all([
