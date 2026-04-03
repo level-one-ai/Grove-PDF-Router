@@ -107,9 +107,9 @@ module.exports = async function handler(req, res) {
     const skipReason = docType
       ? `Document type is "${docType}" — not a customer order`
       : 'Document field is null — not a customer order';
-    console.log(`[file-page] Non-order page ${pageNumber} — moving to Branch Transfers folder`);
+    console.log(`[file-page] Non-order page ${pageNumber} — moving to Non-Order Documents folder`);
 
-    // Download the page from Temp
+    // Download the page from Temp and move to Non-Order Documents (keep original name)
     try {
       const record = await db.getRecord(fileId);
       const ps = record?.pageStore || {};
@@ -118,15 +118,11 @@ module.exports = async function handler(req, res) {
         const pageBuffer = await downloadTempPage(td.tempItemId);
         const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
         const zeroPadded = String(pageNumber).padStart(padWidth, '0');
-        const branchFileName = `${record.originalFileName}_${zeroPadded}.pdf`;
+        // Keep original filename — don't rename non-order documents
+        const nonOrderFileName = `${record.originalFileName}_${zeroPadded}.pdf`;
         const nonOrderFolder = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
-        await uploadToOneDrive(nonOrderFolder, branchFileName, pageBuffer);
-        console.log(`[file-page] Moved "${branchFileName}" to Non-Order Documents folder`);
-
-        // If this is the last page, delete the original from Scans
-        if (pageNumber >= totalPages) {
-          await deleteOriginalFromScans(fileId);
-        }
+        await uploadToOneDrive(nonOrderFolder, nonOrderFileName, pageBuffer);
+        console.log(`[file-page] Moved "${nonOrderFileName}" to Non-Order Documents folder`);
       }
     } catch (moveErr) {
       console.error('[file-page] Failed to move to Non-Order Documents:', moveErr.message);
@@ -140,7 +136,51 @@ module.exports = async function handler(req, res) {
       });
     } catch(e) { /* non-fatal */ }
 
-    // Non-order document — do not dispatch further pages, stop processing
+    // Dispatch next page or mark complete — non-order pages must NOT stop the chain
+    const nextPage = pageNumber + 1;
+    if (nextPage <= totalPages) {
+      console.log(`[file-page] Non-order page ${pageNumber} done — dispatching next page ${nextPage}`);
+      try {
+        const nextTempData = await waitForTempPage(fileId, nextPage, 40000);
+        if (nextTempData) {
+          const rec = await db.getRecord(fileId);
+          await Promise.all([
+            dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId),
+            db.updateRecord(fileId, { currentDispatchPage: nextPage }),
+          ]);
+          console.log(`[file-page] Dispatched page ${nextPage}/${totalPages} after skipping non-order page ${pageNumber}`);
+        } else {
+          console.error(`[file-page] Timed out waiting for page ${nextPage} in Temp after non-order skip`);
+        }
+      } catch (dispatchErr) {
+        console.error(`[file-page] Failed to dispatch next page after non-order skip:`, dispatchErr.message);
+      }
+    } else {
+      // This was the last page — mark the file as complete and clean up
+      console.log(`[file-page] Non-order page ${pageNumber} was the last page — marking complete`);
+      try {
+        const finalRecord = await db.getRecord(fileId);
+        const pagesData = finalRecord?.pages || {};
+        const renamedFiles = Object.values(pagesData).map(p => p.finalFileName).filter(Boolean);
+        await db.markCompleted(fileId, { renamedFiles });
+        Promise.all([
+          deleteOriginalFromScans(fileId),
+          cleanupTempPages(fileId, finalRecord?.pageStore || {}),
+        ]).catch(err => console.warn('[file-page] Cleanup warning:', err.message));
+      } catch (completeErr) {
+        console.error('[file-page] Failed to mark complete after last non-order page:', completeErr.message);
+      }
+
+      // In auto mode, trigger scan-now to pick up the next file
+      const mode = await db.getMode().catch(() => 'auto');
+      if (mode === 'auto') {
+        const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+        axios.post(`${baseUrl}/api/scan-now`, {}, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 5000,
+        }).catch(err => console.warn('[file-page] scan-now trigger warning:', err.message));
+      }
+    }
 
     return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason });
   }
@@ -161,10 +201,54 @@ module.exports = async function handler(req, res) {
     try {
       await db.updateRecord(fileId, {
         [`pages.${pageNumber}`]: { status: 'error', error: err.message },
+        pagesReturned: require('firebase-admin').firestore.FieldValue.increment(1),
       });
     } catch (dbErr) {
       console.error('[file-page] Firestore update failed:', dbErr.message);
     }
+
+    // Even on error, dispatch the next page so the chain keeps going
+    const nextPage = pageNumber + 1;
+    if (nextPage <= totalPages) {
+      console.log(`[file-page] Error on page ${pageNumber} — still dispatching next page ${nextPage}`);
+      try {
+        const nextTempData = await waitForTempPage(fileId, nextPage, 40000);
+        if (nextTempData) {
+          const rec = await db.getRecord(fileId);
+          await Promise.all([
+            dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId),
+            db.updateRecord(fileId, { currentDispatchPage: nextPage }),
+          ]);
+          console.log(`[file-page] Dispatched page ${nextPage}/${totalPages} after error on page ${pageNumber}`);
+        }
+      } catch (dispatchErr) {
+        console.error(`[file-page] Failed to dispatch next page after error:`, dispatchErr.message);
+      }
+    } else {
+      // This was the last page — mark complete despite the error on this page
+      try {
+        const finalRecord = await db.getRecord(fileId);
+        const pagesData = finalRecord?.pages || {};
+        const renamedFiles = Object.values(pagesData).map(p => p.finalFileName).filter(Boolean);
+        await db.markCompleted(fileId, { renamedFiles });
+        Promise.all([
+          deleteOriginalFromScans(fileId),
+          cleanupTempPages(fileId, finalRecord?.pageStore || {}),
+        ]).catch(cleanupErr => console.warn('[file-page] Cleanup warning:', cleanupErr.message));
+      } catch (completeErr) {
+        console.error('[file-page] Failed to mark complete after error on last page:', completeErr.message);
+      }
+
+      const mode = await db.getMode().catch(() => 'auto');
+      if (mode === 'auto') {
+        const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+        axios.post(`${baseUrl}/api/scan-now`, {}, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 5000,
+        }).catch(scanErr => console.warn('[file-page] scan-now trigger warning:', scanErr.message));
+      }
+    }
+
     return res.status(500).json({ error: err.message, pageNumber });
   }
 };
