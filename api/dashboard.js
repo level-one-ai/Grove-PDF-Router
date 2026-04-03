@@ -178,6 +178,32 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 .spin{width:10px;height:10px;border:2px solid rgba(255,255,255,.25);border-top-color:currentColor;border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .pulse{animation:pulse 1.4s ease-in-out infinite}
+
+/* DIAGNOSTIC PANEL */
+.diagpanel{display:none;flex-direction:column;flex-shrink:0;border-bottom:1px solid var(--bo);background:var(--su);overflow:hidden}
+.diagpanel.open{display:flex}
+.diagph{padding:7px 14px;border-bottom:1px solid var(--bo);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.diagph-title{font-size:11px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.06em;display:flex;align-items:center;gap:6px}
+.diagph-close{background:none;border:none;color:var(--mu);cursor:pointer;font-size:13px;padding:0;line-height:1;transition:color .15s}
+.diagph-close:hover{color:var(--tx)}
+.diagbody{overflow-y:auto;max-height:280px;padding:6px 8px}
+.diagbody::-webkit-scrollbar{width:4px}.diagbody::-webkit-scrollbar-thumb{background:var(--bo);border-radius:2px}
+.diagrow{display:flex;align-items:flex-start;gap:7px;padding:6px 8px;border-radius:6px;border:1px solid transparent;margin-bottom:3px}
+.diagrow.ok{background:#0a180a;border-color:#22c55e22}
+.diagrow.fail{background:#1f0f0f;border-color:#ef444433}
+.diagrow.loading{background:var(--s2);border-color:var(--bo)}
+.diag-ic{font-size:11px;flex-shrink:0;width:14px;text-align:center;margin-top:1px}
+.diag-label{font-size:11px;font-weight:600;color:var(--tx);flex-shrink:0;min-width:160px}
+.diag-detail{font-size:10px;color:var(--mu);word-break:break-all;flex:1;line-height:1.4}
+.diagrow.ok .diag-detail{color:#4ade80}
+.diagrow.fail .diag-detail{color:#f87171}
+.diagsummary{margin:4px 0 2px;padding:6px 10px;border-radius:6px;font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px}
+.diagsummary.ok{background:#0a180a;color:#4ade80;border:1px solid #22c55e33}
+.diagsummary.fail{background:#1f0f0f;color:#f87171;border:1px solid #ef444433}
+.diagsummary.loading{background:var(--s2);color:var(--mu);border:1px solid var(--bo)}
+.diagbtn{background:none;border:1px solid var(--bo);color:var(--mu);padding:3px 8px;border-radius:5px;font-size:11px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.diagbtn:hover{border-color:#d9770088;color:var(--or)}
+.diagbtn.active{border-color:var(--or);color:var(--or);background:#1f150033}
 </style>
 </head>
 <body>
@@ -217,11 +243,21 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
     <div class="fhead">
       <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">—</div></div>
       <div style="display:flex;gap:5px">
+        <button class="rfbtn diagbtn" id="diag-btn" onclick="toggleDiag()" title="Run system diagnostics">&#128295; Diag</button>
         <button class="rfbtn" id="proc-all-btn" onclick="processAll()" style="display:none;border-color:#22c55e44;color:var(--gn)" title="Process all files in auto mode">&#9654; All</button>
         <button class="rfbtn" onclick="loadStatus().then(loadScans)">&#8635;</button>
       </div>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; <span>Scans</span></div>
+    <div class="diagpanel" id="diagpanel">
+      <div class="diagph">
+        <div class="diagph-title">&#128295; System Diagnostics</div>
+        <button class="diagph-close" onclick="toggleDiag()" title="Close">&#10005;</button>
+      </div>
+      <div class="diagbody" id="diagbody">
+        <div class="diagrow loading"><div class="diag-ic"><span class="spin"></span></div><div class="diag-label">Running checks...</div></div>
+      </div>
+    </div>
     <div class="flist" id="scan-list">
       <div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading...</div></div>
     </div>
@@ -939,6 +975,60 @@ async function sendToGDrive(btn) {
       }, 8000);
     }
   }
+}
+
+// ── DIAGNOSTICS ──
+var DIAG_OPEN = false;
+var DIAG_RUNNING = false;
+
+function toggleDiag() {
+  var panel = $('diagpanel');
+  var btn = $('diag-btn');
+  DIAG_OPEN = !DIAG_OPEN;
+  if (DIAG_OPEN) {
+    panel.className = 'diagpanel open';
+    btn.className = 'rfbtn diagbtn active';
+    runDiag();
+  } else {
+    panel.className = 'diagpanel';
+    btn.className = 'rfbtn diagbtn';
+  }
+}
+
+async function runDiag() {
+  if (DIAG_RUNNING) return;
+  DIAG_RUNNING = true;
+  var body = $('diagbody');
+  body.innerHTML = '<div class="diagrow loading"><div class="diag-ic"><span class="spin"></span></div><div class="diag-label">Running checks\u2026</div><div class="diag-detail">Contacting server</div></div>';
+
+  try {
+    var r = await fetch('/api/diag?format=json');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+
+    var rows = (d.results || []).map(function(item) {
+      var cls = item.ok ? 'ok' : 'fail';
+      var ic  = item.ok ? '&#9989;' : '&#10060;';
+      return '<div class="diagrow ' + cls + '">'
+        + '<div class="diag-ic">' + ic + '</div>'
+        + '<div class="diag-label">' + esc(item.label) + '</div>'
+        + '<div class="diag-detail">' + esc(String(item.detail || '')) + '</div>'
+        + '</div>';
+    }).join('');
+
+    var sumCls = d.ok ? 'ok' : 'fail';
+    var sumIc  = d.ok ? '&#9989;' : '&#10060;';
+    var summary = '<div class="diagsummary ' + sumCls + '">'
+      + '<span>' + sumIc + '</span>'
+      + '<span>' + esc(d.summary || '') + ' \u2014 ' + (d.ok ? 'All checks passed' : 'One or more checks failed') + '</span>'
+      + '</div>';
+
+    body.innerHTML = rows + summary;
+  } catch (err) {
+    body.innerHTML = '<div class="diagrow fail"><div class="diag-ic">&#10060;</div><div class="diag-label">Request failed</div><div class="diag-detail">' + esc(err.message) + '</div></div>';
+  }
+
+  DIAG_RUNNING = false;
 }
 
 // ── INIT ──
