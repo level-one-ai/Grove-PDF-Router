@@ -1,15 +1,17 @@
 /**
  * /api/callback
  *
- * Lightweight receiver for Claude JSON from Make.com.
- * Does THREE things only:
+ * Receiver for Claude JSON from Make.com.
+ * Does THREE things:
  *   1. Validates the request
  *   2. Saves Claude JSON to Firestore
- *   3. Triggers /api/file-page in background
- *   4. Responds 200 immediately
+ *   3. Triggers /api/file-page (BEFORE responding — Vercel kills
+ *      serverless functions after the response is sent, so any
+ *      async work after res.send() is unreliable)
+ *   4. Responds 200
  *
  * All slow work (OneDrive upload, Google Drive filing) happens
- * in /api/file-page to stay under Vercel's 60s timeout.
+ * in /api/file-page.
  */
 
 const db = require('../lib/firebase');
@@ -18,6 +20,7 @@ const axios = require('axios');
 // Tell Vercel to parse JSON bodies up to 10MB
 module.exports.config = {
   api: { bodyParser: { sizeLimit: '10mb' } },
+  maxDuration: 60,
 };
 
 module.exports = async function handler(req, res) {
@@ -95,21 +98,29 @@ module.exports = async function handler(req, res) {
     return res.status(500).json({ error: 'Firestore save failed', detail: err.message });
   }
 
-  // Respond immediately before triggering file-page
-  res.status(200).json({ status: 'received', pageNumber });
-
-  // Trigger /api/file-page in background — non-blocking
-  // Forward the full payload so file-page has claudeJson and document_type
+  // Trigger /api/file-page BEFORE responding.
+  // We fire the request and wait a short moment to ensure the TCP connection
+  // establishes, but we don't wait for file-page to finish its full processing.
   const filPageUrl = `${process.env.WEBHOOK_NOTIFICATION_URL}/api/file-page`;
   console.log(`[callback] Triggering file-page for page ${pageNumber}`);
 
-  axios.post(filPageUrl, body, {
+  // Fire the request — don't await the full response, just ensure it's sent
+  const triggerPromise = axios.post(filPageUrl, body, {
     headers: { 'Content-Type': 'application/json' },
-    timeout: 5000, // just need to trigger it, not wait
+    timeout: 55000, // just under callback's 60s maxDuration
+  }).then(() => {
+    console.log(`[callback] file-page completed for page ${pageNumber}`);
   }).catch(err => {
-    // Non-fatal — file-page may still run even if this times out
+    // file-page may still be running — timeout just means it took longer than expected
     console.warn('[callback] file-page trigger warning:', err.message);
   });
+
+  // Wait for file-page to complete (or timeout). This keeps the callback function
+  // alive so Vercel doesn't kill it before the outbound request is sent.
+  await triggerPromise;
+
+  // Respond AFTER the trigger has been sent
+  return res.status(200).json({ status: 'received', pageNumber });
 };
 
 function buildFromFlatFields(body) {
