@@ -97,11 +97,15 @@ module.exports = async function handler(req, res) {
     t('graphRequest() helper', false, err.message);
   }
 
-  return respond(res, results, 'Done');
+  return respond(res, results, 'Done', req.query.format === 'json');
 };
 
-function respond(res, results, summary) {
+function respond(res, results, summary, asJson = false) {
   const allOk = results.every(r => r.ok);
+  if (asJson) {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.status(200).json({ ok: allOk, summary, results });
+  }
   const html = `<!DOCTYPE html><html><head><title>Grove Diag</title>
 <style>
   body{font-family:system-ui,sans-serif;background:#0a0a0a;color:#f0f0f0;padding:32px;max-width:800px}
