@@ -3,12 +3,10 @@
  * Lists PDFs in OneDrive Scans or Processed folder.
  * GET /api/scan-files            → Scans folder
  * GET /api/scan-files?folder=Processed → Processed folder
- *
- * Paginates through all Graph API results (max 200 per page).
  */
 
 module.exports.config = {
-  maxDuration: 30, // Vercel Pro allows up to 300s; 30s is plenty for paginated OneDrive listing
+  maxDuration: 30,
 };
 
 module.exports = async function handler(req, res) {
@@ -49,26 +47,17 @@ module.exports = async function handler(req, res) {
       folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
     }
 
-    console.log('[scan-files] Fetching folder:', folderPath);
+    const apiPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file`;
+    console.log('[scan-files] Calling Graph API:', apiPath);
 
-    // Paginate through all results — Graph API returns max 200 per page
-    const TIMEOUT_MS = 8000; // Stay well under Vercel default 10s limit
-    const deadline = Date.now() + TIMEOUT_MS;
-    let allItems = [];
-    let nextPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file&$top=200`;
+    // Timeout after 8 seconds
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('OneDrive request timed out after 8 seconds')), 8000)
+    );
+    const result = await Promise.race([graphRequest('GET', apiPath), timeoutPromise]);
+    const items = result?.value || [];
 
-    while (nextPath) {
-      if (Date.now() > deadline) {
-        console.warn('[scan-files] Pagination timeout — returning partial results');
-        break;
-      }
-      const page = await graphRequest('GET', nextPath);
-      allItems = allItems.concat(page?.value || []);
-      const nextLink = page?.['@odata.nextLink'];
-      nextPath = nextLink ? nextLink.replace('https://graph.microsoft.com/v1.0', '') : null;
-    }
-
-    const pdfFiles = allItems
+    const pdfFiles = items
       .filter((item) => {
         const name = (item.name || '').toLowerCase();
         const mime = item.file?.mimeType || '';
@@ -83,8 +72,6 @@ module.exports = async function handler(req, res) {
         webUrl: item.webUrl,
       }))
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-
-    console.log(`[scan-files] Found ${pdfFiles.length} PDF(s) in ${folderParam || 'Scans'}`);
 
     return res.status(200).json({
       success: true,
