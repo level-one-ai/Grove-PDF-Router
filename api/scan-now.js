@@ -1,12 +1,17 @@
 /**
  * /api/scan-now
  *
- * Manually triggers scanAndProcess() — processes all existing PDFs
- * in the Scans folder in auto mode, oldest first.
+ * Triggered by:
+ *   - The dashboard "Process All" button (auto mode)
+ *   - file-page.js after each file completes (to pick up next)
+ *   - file-page.js when pausing an old file (to pick up new priority file)
+ *   - webhook.js when a new file arrives
  *
- * Called by the dashboard "Process All" button in auto mode.
- * This is the same logic the webhook uses when a new file arrives,
- * but triggered manually so existing files get picked up immediately.
+ * Priority logic (auto mode):
+ *   1. New files (arrived after auto mode was enabled) are always processed first
+ *   2. If a new file arrives while an old file is mid-page, the old file is paused
+ *      after its current page completes, then the new file runs in full
+ *   3. Once all new files are done, paused old files resume, then remaining old files
  *
  * POST /api/scan-now
  */
@@ -39,71 +44,201 @@ module.exports = async function handler(req, res) {
 };
 
 async function scanAndProcess() {
-  const userId = process.env.ONEDRIVE_USER_ID;
-  const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
-
-  const result = await graphRequest(
-    'GET',
-    `/users/${userId}/drive/root:/${folderPath}:/children` +
-    `?$select=id,name,file,createdDateTime&$top=100`
-  );
-
-  const pdfFiles = (result?.value || [])
-    .filter(item => {
-      const name = (item.name || '').toLowerCase();
-      const mime = item.file?.mimeType || '';
-      return name.endsWith('.pdf') || mime.includes('pdf');
-    })
-    .sort((a, b) => new Date(b.createdDateTime) - new Date(a.createdDateTime)); // newest first
-
   const mode = await db.getMode();
-  console.log(`[scan-now] Mode: ${mode} — ${pdfFiles.length} PDF(s) in Scans`);
-
   if (mode !== 'auto') {
     console.log('[scan-now] Not in auto mode — skipping');
     return;
   }
 
+  const stopped = await db.isAutoStopped();
+  if (stopped) {
+    console.log('[scan-now] Stopped flag set — halting');
+    return;
+  }
+
+  const userId = process.env.ONEDRIVE_USER_ID;
+  const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
   const token = await getToken();
 
-  let dispatched = 0;
+  // Fetch all PDFs in Scans folder
+  const result = await graphRequest(
+    'GET',
+    `/users/${userId}/drive/root:/${folderPath}:/children` +
+    `?$select=id,name,file,createdDateTime&$top=200`
+  );
 
-  for (const file of pdfFiles) {
+  const allPdfs = (result?.value || [])
+    .filter(item => {
+      const name = (item.name || '').toLowerCase();
+      const mime = item.file?.mimeType || '';
+      return name.endsWith('.pdf') || mime.includes('pdf');
+    });
+
+  console.log(`[scan-now] ${allPdfs.length} PDF(s) in Scans`);
+
+  // Separate into new (priority) and old files
+  const queue = await db.getQueue();
+  const oldFileIds = queue.oldFiles || {};
+
+  const newFiles = [];
+  const oldFiles = [];
+
+  for (const file of allPdfs) {
     const existing = await db.getRecord(file.id);
 
-    // Already completed — delete from Scans
+    // Already completed — clean up from Scans
     if (existing && existing.status === 'completed') {
       console.log(`[scan-now] "${file.name}" already completed — removing from Scans`);
       await deleteFromScans(file.id, file.name, userId, token);
       continue;
     }
 
-    // Already in progress — skip (Make.com is handling it)
-    if (existing && !['reset', null, undefined].includes(existing.status)) {
-      console.log(`[scan-now] Skipping "${file.name}" — status: ${existing.status}`);
+    // Already actively processing — leave it alone
+    if (existing && existing.status === 'processing') {
+      console.log(`[scan-now] "${file.name}" already processing — skipping`);
       continue;
     }
 
-    // Check stop flag
-    const stopped = await db.isAutoStopped();
-    if (stopped) {
-      console.log('[scan-now] Stopped flag set — halting');
-      break;
+    // Paused — will be handled separately below
+    if (existing && existing.status === 'paused') {
+      console.log(`[scan-now] "${file.name}" is paused — queued for resume`);
+      oldFiles.push({ file, existing, paused: true });
+      continue;
     }
 
-    console.log(`[scan-now] Processing: "${file.name}"`);
-    await processFile(file.id, file.name, token, userId);
-    dispatched++;
-
-    // Only dispatch one file at a time — Make.com processes it page by page
-    // file-page.js will call /api/scan-now again after completion to pick up the next file
-    // This prevents overwhelming Make.com with concurrent files
-    console.log(`[scan-now] Dispatched "${file.name}" — waiting for Make.com to process before next file`);
-    break;
+    // Not yet started or reset
+    if (!existing || ['reset', null, undefined].includes(existing.status)) {
+      if (oldFileIds[file.id]) {
+        oldFiles.push({ file, existing, paused: false });
+      } else {
+        newFiles.push({ file, existing, paused: false });
+      }
+    }
   }
 
-  if (dispatched === 0) {
-    console.log('[scan-now] No files to process — all done or in progress');
+  // Sort each group: newest first for new files, oldest first for old files
+  newFiles.sort((a, b) => new Date(b.file.createdDateTime) - new Date(a.file.createdDateTime));
+  oldFiles.sort((a, b) => new Date(a.file.createdDateTime) - new Date(b.file.createdDateTime));
+
+  console.log(`[scan-now] Queue: ${newFiles.length} new file(s), ${oldFiles.length} old/paused file(s)`);
+
+  // ── PRIORITY: Process new files first ──
+  if (newFiles.length > 0) {
+    const next = newFiles[0];
+    console.log(`[scan-now] Processing NEW file: "${next.file.name}"`);
+    await processFile(next.file.id, next.file.name, token, userId);
+    return;
+  }
+
+  // ── No new files — check paused old file first, then unstarted old files ──
+  const pausedEntry = oldFiles.find(e => e.paused);
+  if (pausedEntry) {
+    console.log(`[scan-now] Resuming PAUSED old file: "${pausedEntry.file.name}"`);
+    await resumePausedFile(pausedEntry.file, queue.pausedFile, token, userId);
+    return;
+  }
+
+  // ── Process next unstarted old file ──
+  const nextOld = oldFiles.find(e => !e.paused);
+  if (nextOld) {
+    console.log(`[scan-now] Processing OLD file: "${nextOld.file.name}"`);
+    await processFile(nextOld.file.id, nextOld.file.name, token, userId);
+    return;
+  }
+
+  console.log('[scan-now] No files to process — queue empty');
+}
+
+async function resumePausedFile(file, pausedData, token, userId) {
+  if (!pausedData || !pausedData.resumeFromPage) {
+    // Fallback — restart from beginning if resume data is missing
+    console.warn(`[scan-now] No pause data for "${file.name}" — restarting from page 1`);
+    await db.clearPausedFile();
+    await processFile(file.id, file.name, token, userId);
+    return;
+  }
+
+  const { resumeFromPage, totalPages } = pausedData;
+  console.log(`[scan-now] Resuming "${file.name}" from page ${resumeFromPage}/${totalPages}`);
+
+  // Clear the paused state
+  await Promise.all([
+    db.clearPausedFile(),
+    db.updateRecord(file.id, { status: 'processing' }),
+  ]);
+
+  // Check the page is already in Temp (it was uploaded before the pause)
+  const record = await db.getRecord(file.id);
+  const pageStore = record?.pageStore || {};
+  const tempData = pageStore[resumeFromPage] || pageStore[String(resumeFromPage)];
+
+  if (tempData?.tempItemId) {
+    // Page already in Temp — dispatch directly
+    const originalFileName = file.name.replace(/\.pdf$/i, '');
+    const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
+    const zeroPadded = String(resumeFromPage).padStart(padWidth, '0');
+    await Promise.all([
+      dispatchToMake(resumeFromPage, zeroPadded, file.id, originalFileName, totalPages, tempData.tempItemId),
+      db.updateRecord(file.id, { currentDispatchPage: resumeFromPage }),
+    ]);
+    console.log(`[scan-now] Dispatched resume page ${resumeFromPage}/${totalPages} for "${originalFileName}"`);
+  } else {
+    // Page not in Temp — need to re-download and re-split then upload remaining pages
+    console.log(`[scan-now] Page ${resumeFromPage} not in Temp — re-uploading from page ${resumeFromPage}`);
+    await reuploadFromPage(file.id, file.name, resumeFromPage, totalPages, token, userId);
+  }
+}
+
+async function reuploadFromPage(fileId, fileName, fromPage, totalPages, token, userId) {
+  // Download the full PDF again and re-upload missing pages to Temp
+  const originalFileName = fileName.replace(/\.pdf$/i, '');
+  let pdfBuffer;
+  try {
+    pdfBuffer = await downloadFile(fileId);
+  } catch (err) {
+    console.error(`[scan-now] Re-download failed for "${originalFileName}":`, err.message);
+    await db.markError(fileId, err);
+    return;
+  }
+
+  let pages, tp;
+  try {
+    ({ pages, totalPages: tp } = await splitPdf(pdfBuffer));
+  } catch (err) {
+    console.error(`[scan-now] Re-split failed:`, err.message);
+    await db.markError(fileId, err);
+    return;
+  }
+
+  // Upload only the pages from fromPage onwards that aren't already in Temp
+  const record = await db.getRecord(fileId);
+  const pageStore = record?.pageStore || {};
+  const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
+
+  for (const page of pages) {
+    if (page.pageNumber < fromPage) continue;
+    if (pageStore[String(page.pageNumber)]?.tempItemId) continue; // already there
+    const tempItemId = await uploadPageToTemp(page, fileId, token, userId);
+    pageStore[String(page.pageNumber)] = {
+      zeroPadded: page.zeroPadded,
+      tempItemId,
+      tempFileName: `${fileId}_page_${page.zeroPadded}.pdf`,
+    };
+    await db.updateRecord(fileId, {
+      [`pageStore.${page.pageNumber}`]: pageStore[String(page.pageNumber)],
+    });
+  }
+
+  // Dispatch the resume page
+  const zeroPadded = String(fromPage).padStart(padWidth, '0');
+  const tempData = pageStore[String(fromPage)];
+  if (tempData?.tempItemId) {
+    await dispatchToMake(fromPage, zeroPadded, fileId, originalFileName, totalPages, tempData.tempItemId);
+    await db.updateRecord(fileId, { currentDispatchPage: fromPage });
+    console.log(`[scan-now] Dispatched re-upload resume page ${fromPage}/${totalPages}`);
+  } else {
+    console.error(`[scan-now] Could not get tempItemId for resume page ${fromPage}`);
+    await db.markError(fileId, { message: `Resume failed — could not upload page ${fromPage}` });
   }
 }
 
@@ -115,6 +250,7 @@ async function processFile(itemId, fileName, token, userId) {
     await db.updateRecord(itemId, {
       status: 'processing', pagesReturned: 0, totalPages: null,
       pages: {}, renamedFiles: [], pageStore: {}, completedAt: null, error: null,
+      pausedAtPage: null,
     });
   } else {
     await db.createRecord(itemId, originalFileName);
@@ -140,16 +276,14 @@ async function processFile(itemId, fileName, token, userId) {
     console.error(`[scan-now] Invalid PDF "${originalFileName}": ${splitErr.message}`);
     try {
       const nonOrderPath = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
-      const userId2 = process.env.ONEDRIVE_USER_ID;
-      const token2 = await getToken();
       const destRes = await axios.get(
-        `https://graph.microsoft.com/v1.0/users/${userId2}/drive/root:/${nonOrderPath}`,
-        { headers: { Authorization: `Bearer ${token2}` } }
+        `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${nonOrderPath}`,
+        { headers: { Authorization: `Bearer ${token}` } }
       );
       await axios.patch(
-        `https://graph.microsoft.com/v1.0/users/${userId2}/drive/items/${itemId}`,
+        `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${itemId}`,
         { parentReference: { id: destRes.data.id }, name: fileName },
-        { headers: { Authorization: `Bearer ${token2}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
       );
       console.log(`[scan-now] Moved invalid PDF "${fileName}" to Non-Order Documents`);
     } catch (moveErr) {
