@@ -189,20 +189,26 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   const folderIsCompany = isCompanyName(claudeJson);
   console.log(`[file-page] ${T()} Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
 
-  // Upload to OneDrive and Google Drive in parallel
+  // Duplicate check — skip OneDrive upload if file already exists in Processed
   console.log(`[file-page] ${T()} Starting parallel uploads...`);
   const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
+  const alreadyInProcessed = await checkFileExistsInProcessed(finalFileName);
+  if (alreadyInProcessed) {
+    console.warn(`[file-page] ${T()} DUPLICATE DETECTED: "${finalFileName}" already in Processed — skipping OneDrive upload`);
+  }
 
   const [oneDriveResult, googleDriveResult] = await Promise.all([
-    uploadToOneDrive(processedPath, finalFileName, pageBuffer)
-      .then(uploaded => {
-        console.log(`[file-page] ${T()} OneDrive OK: "${finalFileName}"`);
-        return { fileName: finalFileName, oneDriveId: uploaded.id, oneDriveUrl: uploaded.webUrl };
-      })
-      .catch(err => {
-        console.error(`[file-page] ${T()} OneDrive FAILED:`, err.message);
-        return null;
-      }),
+    alreadyInProcessed
+      ? Promise.resolve({ fileName: finalFileName, oneDriveId: null, oneDriveUrl: null, skipped: true })
+      : uploadToOneDrive(processedPath, finalFileName, pageBuffer)
+          .then(uploaded => {
+            console.log(`[file-page] ${T()} OneDrive OK: "${finalFileName}"`);
+            return { fileName: finalFileName, oneDriveId: uploaded.id, oneDriveUrl: uploaded.webUrl };
+          })
+          .catch(err => {
+            console.error(`[file-page] ${T()} OneDrive FAILED:`, err.message);
+            return null;
+          }),
     fileDocuments(customerFolderName, refFolderName, [{ pageNumber, finalFileName, buffer: pageBuffer }], folderIsCompany)
       .then(result => {
         console.log(`[file-page] ${T()} Google Drive OK: "${customerFolderName}/${refFolderName}"`);
@@ -411,6 +417,29 @@ async function deleteOriginalFromScans(fileId) {
     } else {
       console.warn(`[file-page] Could not delete original from Scans:`, err.message);
     }
+  }
+}
+
+async function checkFileExistsInProcessed(fileName) {
+  // Check if a file with this name already exists in the OneDrive Processed folder.
+  // Used to prevent duplicate uploads when a page is retried.
+  try {
+    const token = await getToken();
+    const userId = process.env.ONEDRIVE_USER_ID;
+    const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
+    const url = `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${processedPath}/${encodeURIComponent(fileName)}`;
+    const response = await axios.get(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (response.data && response.data.id) {
+      console.log(`[file-page] Duplicate check: "${fileName}" already exists in Processed (id: ${response.data.id})`);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    // 404 means file does not exist — that is the normal/expected case
+    if (err.response?.status === 404) return false;
+    // Any other error: log and allow upload to proceed (fail safe)
+    console.warn(`[file-page] Duplicate check error for "${fileName}":`, err.message);
+    return false;
   }
 }
 
