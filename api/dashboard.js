@@ -662,7 +662,7 @@ async function startRun() {
       var chunk = await reader.read();
       if (chunk.done) break;
       buf += dec.decode(chunk.value, {stream:true});
-      var lines = buf.split('\n'); buf = lines.pop();
+      var lines = buf.split('\\n'); buf = lines.pop();
       lines.forEach(function(line){
         if (line.startsWith('event: ')) evt = line.slice(7).trim();
         else if (line.startsWith('data: ')) {
