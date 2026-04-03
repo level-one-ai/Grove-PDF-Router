@@ -5,9 +5,10 @@
     "api/file-page.js": { "maxDuration": 300 },
     "api/webhook.js": { "maxDuration": 300 },
     "api/scan-now.js": { "maxDuration": 300 },
+    "api/auto-poll.js": { "maxDuration": 300 },
     "api/gdrive.js": { "maxDuration": 300 },
     "api/cron.js": { "maxDuration": 60 },
-    "api/callback.js": { "maxDuration": 30 },
+    "api/callback.js": { "maxDuration": 60 },
     "api/*.js": { "maxDuration": 60 }
   },
   "crons": [
