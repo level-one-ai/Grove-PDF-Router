@@ -471,35 +471,64 @@ function refreshBadges() {
   });
 }
 
-// ── SCANS FOLDER ──
+// -- SCANS FOLDER --
+// PROCESSED_NAMES: set of filenames already in OneDrive Processed folder (for duplicate detection)
+var PROCESSED_NAMES = new Set();
+
+async function loadProcessedNames() {
+  var d = await api('/api/scan-files?folder=Processed');
+  PROCESSED_NAMES = new Set();
+  if (d && d.success && d.files) {
+    d.files.forEach(function(f) {
+      // Store both full name and base name (strip page suffix like _01.pdf) for fuzzy matching
+      PROCESSED_NAMES.add(f.name.toLowerCase());
+      PROCESSED_NAMES.add(f.name.replace(/[-_]\d+\.pdf$/i, '').toLowerCase());
+    });
+  }
+  return PROCESSED_NAMES;
+}
+
+function isAlreadyProcessed(scanFileName) {
+  var lower = scanFileName.toLowerCase();
+  var base = lower.replace(/\.pdf$/i, '');
+  // Check if any processed file starts with the same base name
+  for (var name of PROCESSED_NAMES) {
+    if (name === lower) return true;
+    if (name.startsWith(base)) return true;
+  }
+  return false;
+}
+
 async function loadScans() {
   $('scan-list').innerHTML = '<div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading...</div></div>';
-  $('scan-count').textContent = '—';
-  var d = await api('/api/scan-files');
-  if (!d || !d.success || !d.files || !d.files.length) {
-    $('scan-count').textContent = d && d.files ? '0 files' : 'Error';
-    $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128589;</div><div class="ti">' + (d ? 'No PDFs found' : 'Failed to load') + '</div></div>';
+  $('scan-count').textContent = '--';
+
+  // Fetch scans and processed names in parallel
+  var results = await Promise.all([api('/api/scan-files'), loadProcessedNames()]);
+  var d = results[0];
+
+  if (!d || !d.success || !d.files) {
+    $('scan-count').textContent = 'Error';
+    $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128589;</div><div class="ti">Failed to load</div></div>';
     return;
   }
-  // Filter out files already completed in Firestore
-  var processedIds = {};
-  STATUS_CACHE.forEach(function(r) { if (r.status === 'completed') processedIds[r.fileId] = r; });
-  var unprocessedFiles = d.files.filter(function(f) { return !processedIds[f.id]; });
-  // Store the FILTERED list so idx in clickScan matches the rendered list
-  window.SCAN_FILES = unprocessedFiles;
-  $('scan-count').textContent = unprocessedFiles.length + ' file' + (unprocessedFiles.length===1?'':'s');
-  if (!unprocessedFiles.length) {
-    $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#10003;</div><div class="ti">All files processed</div></div>';
+
+  // Show all files from the Scans folder — do NOT filter by Firestore status
+  // (Firestore records may be missing or stale; trust what OneDrive actually has)
+  // Mark files that are already in Processed so user can see them but knows they are done
+  var allFiles = d.files;
+  window.SCAN_FILES = allFiles;
+
+  $('scan-count').textContent = allFiles.length + ' file' + (allFiles.length===1?'':'s');
+  if (!allFiles.length) {
+    $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#10003;</div><div class="ti">No files in Scans folder</div></div>';
     return;
   }
-  $('scan-list').innerHTML = unprocessedFiles.map(function(f, idx){
-    return '<div class="fi" id="sf-' + f.id + '" data-fid="' + esc(f.id) + '" data-idx="' + idx + '" onclick="clickScan(this)">'
-      + '<div class="fic">&#128196;</div>'
-      + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div><div class="fmeta">' + fsize(f.size) + ' &middot; ' + fdate(f.createdAt) + '</div></div>'
-      + '<div class="fac"><span class="wbadge">&#9203;</span>'
-      + '<button class="rstbtn" data-rid="' + esc(f.id) + '" onclick="doReset(event,this.dataset.rid)" title="Reset">&#8635;</button>'
-      + '<div class="chk">&#10003;</div></div>'
-      + '</div>';
+
+  $('scan-list').innerHTML = allFiles.map(function(f) {
+    var alreadyDone = isAlreadyProcessed(f.name);
+    var cls = 'fi' + (alreadyDone ? ' done-f' : '');
+    return '<div class="' + cls + '" id="sf-' + f.id + '" data-fid="' + esc(f.id) + '" onclick="clickScan(this)">'      + '<div class="fic">&#128196;</div>'      + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div><div class="fmeta">' + fsize(f.size) + ' &middot; ' + fdate(f.createdAt) + (alreadyDone ? ' &middot; <span style="color:var(--gn)">&#10003; In Processed</span>' : '') + '</div></div>'      + '<div class="fac"><span class="wbadge">&#9203;</span>'      + '<button class="rstbtn" data-rid="' + esc(f.id) + '" onclick="doReset(event,this.dataset.rid)" title="Reset">&#8635;</button>'      + '<div class="chk">&#10003;</div></div>'      + '</div>';
   }).join('');
   refreshBadges();
 }
