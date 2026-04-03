@@ -65,7 +65,22 @@ module.exports = async function handler(req, res) {
       claudeJson = { document_type: body.document_type, document: null };
       console.log('[file-page] Built minimal claudeJson for non-order document');
     } else {
-      return res.status(400).json({ error: 'Missing json field', keys: Object.keys(body) });
+      // Fallback: callback.js may have already saved claudeJson to Firestore —
+      // retrieve it so the processing chain continues when triggered via /api/callback
+      try {
+        const record = await db.getRecord(fileId);
+        const savedPage = record?.pages?.[pageNumber] || record?.pages?.[String(pageNumber)];
+        if (savedPage?.claudeJson) {
+          claudeJson = savedPage.claudeJson;
+          console.log('[file-page] Retrieved claudeJson from Firestore (saved by callback)');
+        }
+      } catch (lookupErr) {
+        console.warn('[file-page] Firestore claudeJson lookup failed:', lookupErr.message);
+      }
+
+      if (!claudeJson) {
+        return res.status(400).json({ error: 'Missing json field', keys: Object.keys(body) });
+      }
     }
   }
 
