@@ -266,7 +266,22 @@ async function pollForCompletion(fileId, totalPages, onEvent) {
     // Reset idle timer whenever any page progresses
     if (anyNew) lastProgress = Date.now();
 
-    if (record.status === 'completed') return record;
+    // Check completed AFTER firing events so the last 'filed' event always reaches
+    // the dashboard before the poll loop returns. Previously the return happened
+    // before the filed event for the final page, leaving step 6 stuck orange.
+    if (record.status === 'completed') {
+      // Fire any unfired filed events for the last page before returning
+      for (let p = 1; p <= totalPages; p++) {
+        const pageData = (record.pages || {})[p] || (record.pages || {})[String(p)];
+        if (!pageData) continue;
+        const st = pageData.status;
+        if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
+          reported.filed.add(p);
+          onEvent({ type: 'filed', page: p });
+        }
+      }
+      return record;
+    }
 
     // Idle timeout — no progress for 3 minutes
     if (Date.now() - lastProgress > MAX_IDLE) {
