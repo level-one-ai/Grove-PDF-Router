@@ -246,6 +246,16 @@ async function processFile(itemId, fileName, token, userId) {
   const originalFileName = fileName.replace(/\.pdf$/i, '');
 
   const existing = await db.getRecord(itemId);
+
+  // Safety guard — if this file is already actively processing, do not reset it.
+  // This can happen if auto-poll triggers scan-now while a multi-page file is
+  // mid-chain. Resetting pageStore here would wipe temp page references and
+  // break the page dispatch chain.
+  if (existing && existing.status === 'processing') {
+    console.log(`[scan-now] "${originalFileName}" is already processing — skipping reset`);
+    return;
+  }
+
   if (existing) {
     await db.updateRecord(itemId, {
       status: 'processing', pagesReturned: 0, totalPages: null,
