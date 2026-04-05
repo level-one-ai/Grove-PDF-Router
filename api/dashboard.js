@@ -327,10 +327,10 @@ var AUTO_PROCESSING = false; // True while auto mode is running a file
 var STEPS = [
   {id:1,l:'Initialise record'},
   {id:2,l:'Download from OneDrive'},
-  {id:3,l:'Split PDF pages'},
-  {id:4,l:'Dispatch to Make.com'},
-  {id:5,l:'AI extraction (Make.com + Claude)'},
-  {id:6,l:'File to OneDrive & Google Drive'}
+  {id:3,l:'Split PDF into pages'},
+  {id:4,l:'Send page 1 to Make.com'},
+  {id:5,l:'AI extraction — Claude reads page'},
+  {id:6,l:'File page to OneDrive & Google Drive'}
 ];
 
 function esc(s){ return s ? String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : ''; }
