@@ -108,7 +108,7 @@ module.exports = async function handler(req, res) {
     await db.updateRecord(fileId, { totalPages, currentDispatchPage: 1, pagesReturned: 0 });
 
     // Step 4 — Upload page 1 to Temp and dispatch
-    progress(4, `Uploading page 1 to temp storage...`);
+    progress(4, `Uploading page 1/${totalPages} to temp storage...`);
     try {
       const token = await getToken();
       const userId = process.env.ONEDRIVE_USER_ID;
@@ -156,26 +156,32 @@ module.exports = async function handler(req, res) {
     progress(5, `Waiting for Make.com + Claude to process page 1/${totalPages}...`);
 
     const result = await pollForCompletion(fileId, totalPages, (event) => {
-      if (event.type === 'extraction') {
-        // AI extraction received for this page
-        if (event.page >= totalPages) {
-          // All pages extracted — mark step 5 done
-          progress(5, `AI extraction complete ✓`, 'done');
+      if (event.type === 'dispatched') {
+        // Next page sent to Make.com
+        progress(4, `Sending page ${event.page}/${totalPages} to Make.com...`, 'running');
+      } else if (event.type === 'extraction') {
+        // AI extraction received for this page — update step 4 label to show which page
+        if (event.page < totalPages) {
+          progress(4, `Page ${event.page}/${totalPages} sent to Make.com ✓`, 'running');
         } else {
-          progress(5, `AI extraction: page ${event.page}/${totalPages} complete...`, 'running');
+          progress(4, `All ${totalPages} page(s) sent to Make.com ✓`, 'done');
+        }
+        // Update step 5 to show extraction in progress
+        if (event.page >= totalPages) {
+          progress(5, `AI extraction complete — all ${totalPages} page(s) ✓`, 'done');
+        } else {
+          progress(5, `AI extracting page ${event.page}/${totalPages}...`, 'running');
         }
       } else if (event.type === 'filing') {
-        // Filing started — mark step 5 done first, then start step 6
-        // The SSE flush between these two writes gives the browser time to render step 5 as done
+        // Filing started — mark step 5 done, start step 6
         progress(5, `AI extraction complete ✓`, 'done');
         progress(6, `Filing page ${event.page}/${totalPages} to OneDrive & Google Drive...`, 'running');
       } else if (event.type === 'filed') {
         // Page fully filed
         if (event.page >= totalPages) {
-          // All pages filed — mark step 6 done
-          progress(6, `Filed to OneDrive & Google Drive ✓`, 'done');
+          progress(6, `All ${totalPages} page(s) filed to OneDrive & Google Drive ✓`, 'done');
         } else {
-          progress(6, `Filed page ${event.page}/${totalPages} ✓`, 'running');
+          progress(6, `Page ${event.page}/${totalPages} filed ✓ — waiting for next page...`, 'running');
         }
       }
     });
@@ -216,7 +222,7 @@ async function pollForCompletion(fileId, totalPages, onEvent) {
   const INTERVAL = 3000;
   const start = Date.now();
   let lastProgress = Date.now();
-  const reported = { extraction: new Set(), filing: new Set(), filed: new Set() };
+  const reported = { dispatched: new Set(), extraction: new Set(), filing: new Set(), filed: new Set() };
 
   while (Date.now() - start < MAX_TOTAL) {
     await sleep(INTERVAL);
@@ -226,6 +232,15 @@ async function pollForCompletion(fileId, totalPages, onEvent) {
 
     const pages = record.pages || {};
     let anyNew = false;
+
+    // Detect when Vercel dispatches the next page to Make.com
+    const dispatchedPage = record.currentDispatchPage || 1;
+    if (!reported.dispatched.has(dispatchedPage) && dispatchedPage > 1) {
+      reported.dispatched.add(dispatchedPage);
+      onEvent({ type: 'dispatched', page: dispatchedPage });
+      anyNew = true;
+    }
+
     for (let p = 1; p <= totalPages; p++) {
       const pageData = pages[p] || pages[String(p)];
       if (!pageData) continue;
@@ -282,12 +297,20 @@ async function uploadRemainingPages(remainingPages, fileId, token, userId, pageS
 }
 
 async function dispatchToMake(pageNumber, zeroPadded, fileId, originalFileName, totalPages, tempItemId) {
+  // Strip control characters (raw newlines, tabs, etc.) from all string fields
+  // to prevent "Bad control character in JSON" errors in Make.com's HTTP module
+  const clean = s => (typeof s === 'string' ? s.replace(/[\x00-\x1F\x7F]/g, '') : s);
+
   const webhookUrl = process.env.MAKE_WEBHOOK_URL;
   const payload = {
-    fileName: `${originalFileName}_${zeroPadded}.pdf`,
-    fileId, tempItemId, pageNumber, totalPages,
-    originalName: originalFileName, zeroPadded,
-    secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
+    fileName: clean(`${originalFileName}_${zeroPadded}.pdf`),
+    fileId: clean(fileId),
+    tempItemId: clean(tempItemId),
+    pageNumber,
+    totalPages,
+    originalName: clean(originalFileName),
+    zeroPadded: clean(zeroPadded),
+    secret: clean(process.env.CALLBACK_SECRET || 'grove-pdf-router-secret'),
   };
   await axios.post(webhookUrl, payload, {
     headers: { 'Content-Type': 'application/json' },
