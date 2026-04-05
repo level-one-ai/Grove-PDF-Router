@@ -485,33 +485,53 @@ function buildFromFlatFields(body) {
   // Always build if we have any document fields OR a document_type
   // Non-order documents have document_type but empty document fields
   if (!body.title && !body.customer_name && !body.document_type) return null;
+
+  // Sanitise string: strip control characters (raw newlines, tabs etc.) that
+  // are illegal inside JSON strings and cause Make.com's HTTP module to reject payloads.
+  const s = v => (typeof v === 'string' ? v.replace(/[\x00-\x1F\x7F]/g, ' ').trim() : (v || ''));
+
+  // Handle dynamic handwritten object — Claude now returns a key-value object
+  // with variable keys depending on what annotations appear on each page.
+  // If Make.com sends it as a nested object use it directly; otherwise fall back
+  // to the legacy handwritten_notes flat string for backwards compatibility.
+  let handwritten = {};
+  if (body.handwritten && typeof body.handwritten === 'object') {
+    // Sanitise every value in the dynamic handwritten object
+    for (const [k, v] of Object.entries(body.handwritten)) {
+      handwritten[k] = s(v);
+    }
+  } else if (body.handwritten_notes) {
+    // Legacy flat field fallback
+    handwritten = { notes: s(body.handwritten_notes) };
+  }
+
   return {
     document: {
       header: {
-        title: body.title || '',
-        etd: body.etd || '',
-        ref: body.ref || '',
-        inv_no: body.inv_no || '',
-        customer_po_no: body.customer_po_no || '',
+        title: s(body.title),
+        etd: s(body.etd),
+        ref: s(body.ref),
+        inv_no: s(body.inv_no),
+        customer_po_no: s(body.customer_po_no),
       },
       customer: {
-        company_name: (body.company_name && body.company_name !== 'null') ? body.company_name : null,
-        name: body.customer_name || '',
+        company_name: (body.company_name && body.company_name !== 'null') ? s(body.company_name) : null,
+        name: s(body.customer_name),
         address: {
-          street: body.street || '',
-          city: body.city || '',
-          region: body.region || '',
-          postcode: body.postcode || '',
-          country: body.country || '',
+          street: s(body.street),
+          city: s(body.city),
+          region: s(body.region),
+          postcode: s(body.postcode),
+          country: s(body.country),
         },
-        phone: body.phone || '',
-        mobile: body.mobile || '',
+        phone: s(body.phone),
+        mobile: s(body.mobile),
       },
       ship_to: {
-        name: body.ship_to_name || '',
+        name: s(body.ship_to_name),
         address: { street: '', city: '', region: '', postcode: '', country: '' },
       },
-      handwritten_notes: body.handwritten_notes || '',
+      handwritten,
       product_selection: [],
     }
   };
