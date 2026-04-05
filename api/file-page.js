@@ -447,11 +447,19 @@ async function cleanupTempPages(fileId, pageStore) {
 }
 
 async function dispatchToMake(pageNumber, zeroPadded, fileId, originalFileName, totalPages, tempItemId) {
+  // Strip control characters (raw newlines, tabs, etc.) from all string fields
+  // to prevent "Bad control character in JSON" errors in Make.com's HTTP module
+  const clean = s => (typeof s === 'string' ? s.replace(/[\x00-\x1F\x7F]/g, '') : s);
+
   const payload = {
-    fileName: `${originalFileName}_${zeroPadded}.pdf`,
-    fileId, tempItemId, pageNumber, totalPages,
-    originalName: originalFileName, zeroPadded,
-    secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
+    fileName: clean(`${originalFileName}_${zeroPadded}.pdf`),
+    fileId: clean(fileId),
+    tempItemId: clean(tempItemId),
+    pageNumber,
+    totalPages,
+    originalName: clean(originalFileName),
+    zeroPadded: clean(zeroPadded),
+    secret: clean(process.env.CALLBACK_SECRET || 'grove-pdf-router-secret'),
   };
   await axios.post(process.env.MAKE_WEBHOOK_URL, payload, {
     headers: { 'Content-Type': 'application/json' },
