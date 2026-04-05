@@ -861,7 +861,7 @@ function handleEvt(ev, d) {
     }
   }
   else if (ev==='complete') {
-    updStep(6, 'Filed to OneDrive & Google Drive \u2713', 'done');
+    updStep(6, 'All ' + (d.totalPages || '') + ' page(s) filed to OneDrive & Google Drive \u2713', 'done');
     showRes(d);
     finRun(true);
   }
@@ -921,21 +921,16 @@ function finRun(success) {
   if (success) {
     btn.className = 'runbtn'; btn.disabled = true;
     btn.innerHTML = '\u2705 Complete';
-    if (CM === 'auto') {
-      // Auto mode: hold result visible for 5s then fully reset the right panel
-      setTimeout(function(){
-        if (SF && AUTO_KNOWN_IDS) delete AUTO_KNOWN_IDS[SF.id];
-        loadStatus().then(function(){ loadScans(); loadProcessed(); });
-        document.querySelectorAll('.fi').forEach(function(x){ x.classList.remove('sel'); });
-        SF = null;
-        $('seldet').style.display = 'none';
-        $('nosel').style.display = 'flex';
-        resetProg();
-      }, 5000);
-    } else {
-      // Human mode: refresh panels after a short delay as before
-      setTimeout(function(){ loadStatus().then(function(){ loadScans(); loadProcessed(); }); }, 4000);
-    }
+    // Hold result visible for 5s then fully reset in both auto and human mode
+    setTimeout(function(){
+      if (SF && AUTO_KNOWN_IDS) delete AUTO_KNOWN_IDS[SF.id];
+      loadStatus().then(function(){ loadScans(); loadProcessed(); });
+      document.querySelectorAll('.fi').forEach(function(x){ x.classList.remove('sel'); });
+      SF = null;
+      $('seldet').style.display = 'none';
+      $('nosel').style.display = 'flex';
+      resetProg();
+    }, 5000);
   } else {
     btn.className = 'runbtn go'; btn.disabled = false;
     btn.innerHTML = '\u21ba Run Again';
