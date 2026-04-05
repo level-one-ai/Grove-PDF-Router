@@ -94,10 +94,20 @@ async function pollLoop() {
           // Subsequent scans — detect new arrivals
           const arrivals = newFiles.unprocessed.filter(f => !knownIds[f.id]);
           if (arrivals.length > 0) {
-            console.log(`[auto-poll] ${arrivals.length} new file(s) detected — triggering scan-now`);
+            console.log(`[auto-poll] ${arrivals.length} new file(s) detected`);
             // Add to known set immediately so we don't retrigger
             arrivals.forEach(f => { knownIds[f.id] = true; });
-            await triggerScanNow();
+
+            // Only trigger scan-now if nothing is currently being processed.
+            // Triggering while a file is mid-processing causes scan-now to reset
+            // the pageStore, wiping temp page references and breaking the page chain.
+            const activelyProcessing = await isAnyFileProcessing();
+            if (!activelyProcessing) {
+              console.log('[auto-poll] No active processing — triggering scan-now');
+              await triggerScanNow();
+            } else {
+              console.log('[auto-poll] A file is currently processing — scan-now will be triggered automatically when it completes');
+            }
           }
           // Also add any new IDs we see (even if already processed)
           newFiles.unprocessed.forEach(f => { knownIds[f.id] = true; });
@@ -254,6 +264,20 @@ function getFirestore() {
     });
   }
   return admin.firestore();
+}
+
+async function isAnyFileProcessing() {
+  try {
+    const firestore = getFirestore();
+    const snapshot = await firestore.collection('files')
+      .where('status', '==', 'processing')
+      .limit(1)
+      .get();
+    return !snapshot.empty;
+  } catch (err) {
+    console.warn('[auto-poll] isAnyFileProcessing check error (non-fatal):', err.message);
+    return false; // fail safe — don't block scan-now if check fails
+  }
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
