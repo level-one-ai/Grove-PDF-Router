@@ -106,8 +106,8 @@ async function scanAndProcess() {
       continue;
     }
 
-    // Not yet started or reset
-    if (!existing || ['reset', null, undefined].includes(existing.status)) {
+    // Not yet started, reset, detected (webhook saw it), or waiting (human mode queued it)
+    if (!existing || ['reset', 'detected', 'waiting', null, undefined].includes(existing.status)) {
       if (oldFileIds[file.id]) {
         oldFiles.push({ file, existing, paused: false });
       } else {
