@@ -175,13 +175,33 @@ module.exports = async function handler(req, res) {
       } else if (event.type === 'filing') {
         // Filing started — mark step 5 done, start step 6
         progress(5, `AI extraction complete ✓`, 'done');
-        progress(6, `Filing page ${event.page}/${totalPages} to OneDrive & Google Drive...`, 'running');
-      } else if (event.type === 'filed') {
-        // Page fully filed
-        if (event.page >= totalPages) {
-          progress(6, `All ${totalPages} page(s) filed to OneDrive & Google Drive ✓`, 'done');
+        if (event.skipped) {
+          // Non-order document — stored in Non-Order Documents folder, not Google Drive
+          const docType = (event.pageData && event.pageData.docType)
+            ? event.pageData.docType.replace(/_/g, ' ')
+            : 'non-order document';
+          progress(6, `Page ${event.page}/${totalPages} — ${docType} stored in Non-Order Documents...`, 'running');
         } else {
-          progress(6, `Page ${event.page}/${totalPages} filed ✓ — waiting for next page...`, 'running');
+          progress(6, `Filing page ${event.page}/${totalPages} to OneDrive & Google Drive...`, 'running');
+        }
+      } else if (event.type === 'filed') {
+        // Page fully filed or skipped
+        if (event.skipped) {
+          // Non-order document — mark step 6 done with appropriate message
+          const docType = (event.pageData && event.pageData.docType)
+            ? event.pageData.docType.replace(/_/g, ' ')
+            : 'non-order document';
+          if (event.page >= totalPages) {
+            progress(6, `All ${totalPages} page(s) processed ✓`, 'done');
+          } else {
+            progress(6, `Page ${event.page}/${totalPages} — ${docType} filed ✓ — waiting for next page...`, 'running');
+          }
+        } else {
+          if (event.page >= totalPages) {
+            progress(6, `All ${totalPages} page(s) filed to OneDrive & Google Drive ✓`, 'done');
+          } else {
+            progress(6, `Page ${event.page}/${totalPages} filed ✓ — waiting for next page...`, 'running');
+          }
         }
       }
     });
@@ -253,12 +273,13 @@ async function pollForCompletion(fileId, totalPages, onEvent) {
       }
       if (!reported.filing.has(p) && (st === 'filing' || st === 'completed' || st === 'skipped')) {
         reported.filing.add(p);
-        onEvent({ type: 'filing', page: p });
+        // Pass skipped flag so the event handler can show the right message
+        onEvent({ type: 'filing', page: p, skipped: st === 'skipped', pageData });
         anyNew = true;
       }
       if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
         reported.filed.add(p);
-        onEvent({ type: 'filed', page: p });
+        onEvent({ type: 'filed', page: p, skipped: st === 'skipped', pageData });
         anyNew = true;
       }
     }
@@ -277,7 +298,7 @@ async function pollForCompletion(fileId, totalPages, onEvent) {
         const st = pageData.status;
         if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
           reported.filed.add(p);
-          onEvent({ type: 'filed', page: p });
+          onEvent({ type: 'filed', page: p, skipped: st === 'skipped', pageData });
         }
       }
       return record;
