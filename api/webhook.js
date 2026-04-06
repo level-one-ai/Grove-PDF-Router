@@ -13,11 +13,9 @@
  */
 
 const db = require('../lib/firebase');
-const { downloadFile, graphRequest } = require('../lib/graph');
-const { splitPdf } = require('../lib/pdfSplitter');
+const { graphRequest } = require('../lib/graph');
 const axios = require('axios');
 
-const TEMP_FOLDER = 'Grove Group Scotland/Grove Bedding/Scans/Temp';
 
 module.exports = async function handler(req, res) {
   // Graph API validation handshake
@@ -60,12 +58,11 @@ module.exports = async function handler(req, res) {
 async function scanAndProcess() {
   const userId = process.env.ONEDRIVE_USER_ID;
   const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
-  const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
 
   const result = await graphRequest(
     'GET',
     `/users/${userId}/drive/root:/${folderPath}:/children` +
-    `?$select=id,name,file,createdDateTime&$top=100`
+    `?$select=id,name,file,size,createdDateTime&$top=100`
   );
 
   const pdfFiles = (result?.value || [])
@@ -74,18 +71,18 @@ async function scanAndProcess() {
       const mime = item.file?.mimeType || '';
       return name.endsWith('.pdf') || mime.includes('pdf');
     })
-    .sort((a, b) => new Date(b.createdDateTime) - new Date(a.createdDateTime)); // newest first
+    .sort((a, b) => new Date(b.createdDateTime) - new Date(a.createdDateTime));
 
   const mode = await db.getMode();
   console.log(`[webhook] Mode: ${mode} — ${pdfFiles.length} PDF(s)`);
 
-  // Get token once for all file checks
   const token = await getToken();
+  let newFilesDetected = [];
 
   for (const file of pdfFiles) {
     const existing = await db.getRecord(file.id);
 
-    // Already completed — check if still in Scans and delete it
+    // Already completed — clean up
     if (existing && existing.status === 'completed') {
       console.log(`[webhook] "${file.name}" already completed — removing from Scans`);
       await deleteFromScans(file.id, file.name, userId, token);
@@ -98,166 +95,78 @@ async function scanAndProcess() {
       continue;
     }
 
-    // Check stop flag in auto mode
-    if (mode === 'auto') {
-      const stopped = await db.isAutoStopped();
-      if (stopped) {
-        console.log('[webhook] Stopped — halting');
-        break;
+    // This is a new file — record it
+    console.log(`[webhook] New file detected: "${file.name}"`);
+    newFilesDetected.push(file);
+  }
+
+  if (newFilesDetected.length === 0) {
+    console.log('[webhook] No new files to process');
+    return;
+  }
+
+  // ── STEP 1: Notify dashboard immediately so scans panel updates ──
+  // This fires regardless of mode — the dashboard always sees new files instantly.
+  await notifyDashboard(newFilesDetected);
+
+  // ── STEP 2: Mode-aware processing ──
+  if (mode === 'auto') {
+    const stopped = await db.isAutoStopped();
+    if (stopped) {
+      console.log('[webhook] Auto stopped — notified dashboard but not processing');
+      return;
+    }
+
+    // Wait 3 seconds so dashboard has time to update visually before processing starts
+    await sleep(3000);
+
+    // Trigger scan-now which handles the full processing logic including priority ordering
+    const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+    try {
+      await axios.post(`${baseUrl}/api/scan-now`, {}, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 10000,
+      });
+      console.log('[webhook] Auto mode — triggered scan-now after 3s delay');
+    } catch (err) {
+      console.warn('[webhook] scan-now trigger warning:', err.message);
+    }
+
+  } else {
+    // Human mode — create Firestore records with status 'detected' so they appear
+    // in the scans list. Processing only starts when the user clicks Run.
+    for (const file of newFilesDetected) {
+      const existing = await db.getRecord(file.id);
+      if (!existing) {
+        const originalFileName = file.name.replace(/\.pdf$/i, '');
+        await db.createDetectedRecord(file.id, originalFileName);
+        console.log(`[webhook] Human mode — "${file.name}" marked as detected, waiting for manual run`);
       }
     }
-
-    const isOldFile = await db.isOldFile(file.id);
-    console.log(`[webhook] Processing: "${file.name}" (${isOldFile ? 'old-queue' : 'NEW — priority'})`);
-    await processFile(file.id, file.name, mode);
   }
 }
 
-async function processFile(itemId, fileName, mode) {
-  const originalFileName = fileName.replace(/\.pdf$/i, '');
-
-  // Create Firestore record
-  const existing = await db.getRecord(itemId);
-  if (existing) {
-    await db.updateRecord(itemId, {
-      status: 'processing', pagesReturned: 0, totalPages: null,
-      pages: {}, renamedFiles: [], pageStore: {}, completedAt: null, error: null,
+async function notifyDashboard(files) {
+  const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+  try {
+    await axios.post(`${baseUrl}/api/notify`, {
+      secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
+      event: 'new-file',
+      data: {
+        count: files.length,
+        files: files.map(f => ({ id: f.id, name: f.name, size: f.size, createdAt: f.createdDateTime })),
+      },
+    }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 5000,
     });
-  } else {
-    await db.createRecord(itemId, originalFileName);
-  }
-
-  // Download PDF
-  let pdfBuffer;
-  try {
-    pdfBuffer = await downloadFile(itemId);
-    console.log(`[webhook] Downloaded "${originalFileName}" (${pdfBuffer.length} bytes)`);
+    console.log(`[webhook] Dashboard notified — ${files.length} new file(s)`);
   } catch (err) {
-    console.error(`[webhook] Download failed:`, err.message);
-    await db.markError(itemId, err);
-    return;
-  }
-
-  // Split PDF — handle invalid/corrupted PDFs gracefully
-  let pages, totalPages;
-  try {
-    ({ pages, totalPages } = await splitPdf(pdfBuffer));
-    console.log(`[webhook] Split into ${totalPages} page(s)`);
-  } catch (splitErr) {
-    console.error(`[webhook] Invalid PDF "${originalFileName}": ${splitErr.message}`);
-    try {
-      const nonOrderPath = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
-      const userId2 = process.env.ONEDRIVE_USER_ID;
-      const token2 = await getToken();
-      const destRes = await axios.get(
-        `https://graph.microsoft.com/v1.0/users/${userId2}/drive/root:/${nonOrderPath}`,
-        { headers: { Authorization: `Bearer ${token2}` } }
-      );
-      await axios.patch(
-        `https://graph.microsoft.com/v1.0/users/${userId2}/drive/items/${itemId}`,
-        { parentReference: { id: destRes.data.id }, name: fileName },
-        { headers: { Authorization: `Bearer ${token2}`, 'Content-Type': 'application/json' } }
-      );
-      console.log(`[webhook] Moved invalid PDF "${fileName}" to Non-Order Documents`);
-    } catch (moveErr) {
-      console.warn(`[webhook] Could not move invalid PDF:`, moveErr.message);
-    }
-    await db.markError(itemId, { message: `Invalid PDF: ${splitErr.message}` });
-    return;
-  }
-
-  // Update record with total pages
-  await db.updateRecord(itemId, { totalPages, currentDispatchPage: 1, pagesReturned: 0 });
-
-  if (mode === 'human') {
-    // Upload all pages to Temp then add to waiting list
-    const pageStore = await uploadAllPagesToTemp(pages, itemId);
-    await db.updateRecord(itemId, { pageStore, status: 'waiting', mode: 'human' });
-    await db.addWaitingFile(itemId, fileName, totalPages);
-    console.log(`[webhook] Human mode — "${originalFileName}" waiting`);
-  } else {
-    // AUTO: Upload page 1 first, dispatch it, then upload remaining pages
-    const token = await getToken();
-    const userId = process.env.ONEDRIVE_USER_ID;
-
-    // Upload page 1
-    const page1 = pages[0];
-    const page1ItemId = await uploadPageToTemp(page1, itemId, token, userId);
-    const pageStore = {};
-    pageStore[String(page1.pageNumber)] = {
-      zeroPadded: page1.zeroPadded,
-      tempItemId: page1ItemId,
-      tempFileName: `${itemId}_page_${page1.zeroPadded}.pdf`,
-    };
-
-    // Save page 1 to Firestore and dispatch immediately
-    await db.updateRecord(itemId, { pageStore });
-    await dispatchToMake(page1.pageNumber, page1.zeroPadded, itemId, originalFileName, totalPages, page1ItemId);
-    console.log(`[webhook] Page 1/${totalPages} dispatched for "${originalFileName}"`);
-
-    // Upload remaining pages in background (non-blocking)
-    // These will be ready when Make.com callbacks arrive
-    uploadRemainingPages(pages.slice(1), itemId, originalFileName, token, userId, pageStore)
-      .catch(err => console.error('[webhook] Error uploading remaining pages:', err.message));
+    // Non-fatal — dashboard will catch up on its next poll
+    console.warn('[webhook] Dashboard notify warning (non-fatal):', err.message);
   }
 }
 
-async function uploadRemainingPages(remainingPages, fileId, originalFileName, token, userId, pageStore) {
-  for (const page of remainingPages) {
-    if (!page.buffer) continue;
-    const tempItemId = await uploadPageToTemp(page, fileId, token, userId);
-    pageStore[String(page.pageNumber)] = {
-      zeroPadded: page.zeroPadded,
-      tempItemId,
-      tempFileName: `${fileId}_page_${page.zeroPadded}.pdf`,
-    };
-    // Update Firestore after each page upload so it's available for callbacks
-    await db.updateRecord(fileId, { [`pageStore.${page.pageNumber}`]: pageStore[String(page.pageNumber)] });
-    console.log(`[webhook] Uploaded page ${page.pageNumber} to Temp`);
-  }
-}
-
-async function uploadAllPagesToTemp(pages, fileId) {
-  const token = await getToken();
-  const userId = process.env.ONEDRIVE_USER_ID;
-  const pageStore = {};
-  for (const page of pages) {
-    if (!page.buffer) continue;
-    const tempItemId = await uploadPageToTemp(page, fileId, token, userId);
-    pageStore[String(page.pageNumber)] = {
-      zeroPadded: page.zeroPadded,
-      tempItemId,
-      tempFileName: `${fileId}_page_${page.zeroPadded}.pdf`,
-    };
-  }
-  return pageStore;
-}
-
-async function uploadPageToTemp(page, fileId, token, userId) {
-  const tempFileName = `${fileId}_page_${page.zeroPadded}.pdf`;
-  const url = `https://graph.microsoft.com/v1.0/users/${userId}/drive/root:/${TEMP_FOLDER}/${tempFileName}:/content`;
-  const response = await axios.put(url, page.buffer, {
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/pdf' },
-    maxBodyLength: Infinity,
-  });
-  return response.data.id;
-}
-
-async function dispatchToMake(pageNumber, zeroPadded, fileId, originalFileName, totalPages, tempItemId) {
-  const webhookUrl = process.env.MAKE_WEBHOOK_URL;
-  const fileName = `${originalFileName}_${zeroPadded}.pdf`;
-  const payload = {
-    fileName, fileId, tempItemId,
-    pageNumber, totalPages,
-    originalName: originalFileName,
-    zeroPadded,
-    secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
-  };
-  await axios.post(webhookUrl, payload, {
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 30000,
-  });
-}
 
 async function deleteFromScans(itemId, fileName, userId, token) {
   try {
@@ -280,6 +189,8 @@ async function deleteFromScans(itemId, fileName, userId, token) {
     }
   }
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function getToken() {
   const url = `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`;
