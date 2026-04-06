@@ -146,13 +146,13 @@ async function checkForNewFiles(knownIds) {
   const allIds = {};
   allPdfs.forEach(f => { allIds[f.id] = true; });
 
-  // Filter out already-completed files
+  // Filter out already-completed and actively-processing files
   const unprocessed = [];
   for (const pdf of allPdfs) {
     const record = await db.getRecord(pdf.id);
     if (record && record.status === 'completed') continue;
-    // Skip files already actively processing
     if (record && record.status === 'processing') continue;
+    // detected and waiting are valid unprocessed states — include them
     unprocessed.push(pdf);
   }
 
