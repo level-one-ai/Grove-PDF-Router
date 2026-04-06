@@ -324,6 +324,7 @@ var STATUS_LOADED = false;
 var AUTO_POLL_INTERVAL = null;
 var AUTO_KNOWN_IDS = null; // Set of file IDs known to exist in Scans (for new-file detection)
 var AUTO_PROCESSING = false; // True while auto mode is running a file
+var NOTIFY_ES = null; // SSE connection to /api/notify for instant new-file detection
 var STEPS = [
   {id:1,l:'Initialise record'},
   {id:2,l:'Download from OneDrive'},
@@ -415,9 +416,10 @@ function applyMode() {
   }
 }
 
-// ── AUTO MODE POLLING ──
+// ── AUTO MODE POLLING + SSE NOTIFY ──
 function startAutoPolling() {
   stopAutoPolling();
+  // Keep the polling interval as a safety net (catches files if SSE misses anything)
   AUTO_POLL_INTERVAL = setInterval(autoPollScans, 8000);
   // Seed known IDs immediately so first poll detects only NEW files added after this point
   seedAutoKnownIds();
@@ -425,6 +427,61 @@ function startAutoPolling() {
 
 function stopAutoPolling() {
   if (AUTO_POLL_INTERVAL) { clearInterval(AUTO_POLL_INTERVAL); AUTO_POLL_INTERVAL = null; }
+}
+
+// ── SSE NOTIFY CONNECTION ──
+// Opens a persistent SSE connection to /api/notify.
+// When webhook.js detects a new file it broadcasts a "new-file" event here,
+// causing the scans panel to refresh instantly (≤2s) rather than waiting for
+// the next 8-second auto-poll cycle.
+// The connection auto-reconnects when the server sends a "reconnect" event
+// (every ~55s before Vercel's function timeout) or if the connection drops.
+function openNotifyStream() {
+  if (NOTIFY_ES) { NOTIFY_ES.close(); NOTIFY_ES = null; }
+
+  var es = new EventSource('/api/notify');
+  NOTIFY_ES = es;
+
+  es.addEventListener('connected', function() {
+    console.log('[dashboard] Notify stream connected');
+  });
+
+  es.addEventListener('new-file', function(e) {
+    try {
+      var d = JSON.parse(e.data);
+      console.log('[dashboard] New file(s) detected via notify:', d.count);
+    } catch(ex) {}
+    // Refresh scans panel immediately
+    loadStatus().then(function(){ loadScans(); loadWaiting(); });
+    // If in auto mode and not already processing, trigger auto-run after scans refresh
+    if (CM === 'auto' && !AUTO_PROCESSING && !STOPPED) {
+      setTimeout(function(){
+        // Re-check after short delay to let loadScans finish
+        if (!AUTO_PROCESSING && !STOPPED && window.SCAN_FILES && window.SCAN_FILES.length > 0) {
+          var newFile = window.SCAN_FILES.find(function(f){ return !AUTO_KNOWN_IDS || !AUTO_KNOWN_IDS[f.id]; });
+          if (newFile) {
+            if (AUTO_KNOWN_IDS) AUTO_KNOWN_IDS[newFile.id] = true;
+            autoRunFile(newFile);
+          }
+        }
+      }, 500);
+    }
+  });
+
+  es.addEventListener('reconnect', function() {
+    console.log('[dashboard] Notify stream reconnecting...');
+    es.close();
+    NOTIFY_ES = null;
+    // Reconnect after a short pause
+    setTimeout(openNotifyStream, 1000);
+  });
+
+  es.onerror = function() {
+    console.log('[dashboard] Notify stream error — will retry in 5s');
+    es.close();
+    NOTIFY_ES = null;
+    setTimeout(openNotifyStream, 5000);
+  };
 }
 
 async function seedAutoKnownIds() {
@@ -861,7 +918,9 @@ function handleEvt(ev, d) {
     }
   }
   else if (ev==='complete') {
-    updStep(6, 'All ' + (d.totalPages || '') + ' page(s) filed to OneDrive & Google Drive \u2713', 'done');
+    // Use a generic completion message — individual page steps already showed
+    // the correct message (filed to GD, or stored in Non-Order Documents)
+    updStep(6, 'All ' + (d.totalPages || '') + ' page(s) processed \u2713', 'done');
     showRes(d);
     finRun(true);
   }
@@ -1187,6 +1246,8 @@ loadStatus().then(function() {
   loadWaiting();
 });
 loadSub();
+// Open SSE notify stream for instant new-file detection
+openNotifyStream();
 // Refresh status cache every 60 seconds
 setInterval(loadStatus, 60000);
 setInterval(loadWaiting, 30000);
