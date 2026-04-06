@@ -109,7 +109,16 @@ module.exports = async function handler(req, res) {
       : 'Document field is null — not a customer order';
     console.log(`[file-page] Non-order page ${pageNumber} — moving to Non-Order Documents folder`);
 
-    // Download the page from Temp and move to Non-Order Documents (keep original name)
+    // Build a descriptive filename: <docType>_<YYYY-MM-DD>_<zeroPadded>.pdf
+    // e.g. "branch_transfer_2026-04-06_01.pdf"
+    // Falls back to "non_order_document" if Claude didn't return a document type.
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const typeSlug = docType
+      ? docType.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
+      : 'non_order_document';
+
+    // Download the page from Temp and store in Non-Order Documents with new name
+    let nonOrderFileName = null;
     try {
       const record = await db.getRecord(fileId);
       const ps = record?.pageStore || {};
@@ -118,29 +127,34 @@ module.exports = async function handler(req, res) {
         const pageBuffer = await downloadTempPage(td.tempItemId);
         const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
         const zeroPadded = String(pageNumber).padStart(padWidth, '0');
-        // Keep original filename — don't rename non-order documents
-        const nonOrderFileName = `${record.originalFileName}_${zeroPadded}.pdf`;
+        // Rename with document type and processed date
+        nonOrderFileName = `${typeSlug}_${today}_${zeroPadded}.pdf`;
         const nonOrderFolder = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
         await uploadToOneDrive(nonOrderFolder, nonOrderFileName, pageBuffer);
-        console.log(`[file-page] Moved "${nonOrderFileName}" to Non-Order Documents folder`);
+        console.log(`[file-page] Stored non-order page as "${nonOrderFileName}" in Non-Order Documents`);
       }
     } catch (moveErr) {
       console.error('[file-page] Failed to move to Non-Order Documents:', moveErr.message);
     }
 
-    // Save skipped status to Firestore
+    // Save skipped status to Firestore — include the final filename so it shows on the dashboard
     try {
       await db.updateRecord(fileId, {
-        [`pages.${pageNumber}`]: { status: 'skipped', skipReason },
+        [`pages.${pageNumber}`]: {
+          status: 'skipped',
+          skipReason,
+          nonOrderFileName: nonOrderFileName || null,
+          docType: typeSlug,
+        },
         pagesReturned: require('firebase-admin').firestore.FieldValue.increment(1),
       });
     } catch(e) { /* non-fatal */ }
 
     // Dispatch next page or mark complete — non-order pages must NOT stop the chain
-    await dispatchNextOrComplete(fileId, pageNumber, totalPages);
+    await dispatchNextOrComplete(fileId, pageNumber, totalPages, typeSlug);
 
     // Respond 200 AFTER all work — Make.com expects 200
-    return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason });
+    return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason, nonOrderFileName });
   }
 
   // If Claude returned { document_type: "delivery_order", document: {...} }
