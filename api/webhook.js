@@ -109,12 +109,6 @@ async function scanAndProcess() {
   await notifyDashboard(newFilesDetected);
 
   // ── STEP 2: Always auto-process — system is always watching ──
-  const stopped = await db.isAutoStopped();
-  if (stopped) {
-    console.log('[webhook] Processing paused — notified dashboard but not processing');
-    return;
-  }
-
   // Wait 3 seconds so dashboard has time to update visually before processing starts
   await sleep(3000);
 
