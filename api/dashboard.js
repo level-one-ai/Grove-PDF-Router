@@ -291,13 +291,13 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
             <label class="stopt" id="sopt3"><input type="radio" name="rs" value="3" onchange="setSt(3)"><div class="stoptx"><strong>Split only</strong><span>Download &amp; split, skip Make.com</span></div></label>
           </div>
         </div>
-        <button class="runbtn" id="runbtn" onclick="startRun()" disabled>&#9654; Run</button>
+        <button class="runbtn" id="runbtn" onclick="startRun()" disabled>&#9654; Process</button>
       </div>
     </div>
 
     <div class="progpanel" id="progpanel">
       <div class="progtitle">Progress</div>
-      <div class="progidle" id="progidle"><div class="ic">&#129514;</div><div class="de">Select a file and click <strong style="color:var(--tx)">Run</strong></div></div>
+      <div class="progidle" id="progidle"><div class="ic">&#129514;</div><div class="de">Select a file and click <strong style="color:var(--tx)">Process</strong></div></div>
       <div id="steplist"></div>
       <div id="rescard"></div>
     </div>
@@ -647,7 +647,7 @@ function selWait(fid) {
     var btn = $('runbtn');
     btn.className = 'runbtn go';
     btn.disabled = false;
-    btn.textContent = '▶ Run (Waiting)';
+    btn.textContent = '▶ Process';
     resetProg();
   }
 }
@@ -709,7 +709,7 @@ function clickScan(el) {
   btn.style.display = '';
   btn.className = 'runbtn go';
   btn.disabled = false;
-  btn.textContent = WF[f.id] ? '\u25b6 Run (Waiting)' : '\u25b6 Run';
+  btn.textContent = '\u25b6 Process';
   resetProg();
 }
 
