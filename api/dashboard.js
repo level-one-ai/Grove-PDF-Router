@@ -302,14 +302,12 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       <div id="rescard"></div>
     </div>
 
-    <div class="stoparea show" id="stoparea">
-      <button class="stopbtn stopping" id="stopbtn" onclick="doStop()">&#9646;&#9646; Pause Processing</button>
-    </div>
+
   </div>
 </div>
 
 <script>
-var SF = null, IR = false, CM = 'auto', ST = 1, WF = {}, STOPPED = false; // CM always 'auto' — unified mode
+var SF = null, IR = false, CM = 'auto', ST = 1, WF = {}; // Unified always-on mode
 var STATUS_CACHE = []; // All Firestore records — loaded once, reused everywhere
 var STATUS_LOADED = false;
 var AUTO_POLL_INTERVAL = null;
@@ -424,10 +422,10 @@ function openNotifyStream() {
     // Refresh scans panel immediately
     loadStatus().then(function(){ loadScans(); loadWaiting(); });
     // If in auto mode and not already processing, trigger auto-run after scans refresh
-    if (!AUTO_PROCESSING && !STOPPED) {
+    if (!AUTO_PROCESSING) {
       setTimeout(function(){
         // Re-check after short delay to let loadScans finish
-        if (!AUTO_PROCESSING && !STOPPED && window.SCAN_FILES && window.SCAN_FILES.length > 0) {
+        if (!AUTO_PROCESSING && window.SCAN_FILES && window.SCAN_FILES.length > 0) {
           var newFile = window.SCAN_FILES.find(function(f){ return !AUTO_KNOWN_IDS || !AUTO_KNOWN_IDS[f.id]; });
           if (newFile) {
             if (AUTO_KNOWN_IDS) AUTO_KNOWN_IDS[newFile.id] = true;
@@ -467,7 +465,7 @@ async function seedAutoKnownIds() {
 
 async function autoPollScans() {
   // Don't poll while already processing or stopped
-  if (AUTO_PROCESSING || STOPPED) return;
+  if (AUTO_PROCESSING) return;
 
   var d = await api('/api/scan-files');
   if (!d || !d.success || !d.files) return;
@@ -513,7 +511,7 @@ async function autoPollScans() {
 }
 
 async function autoRunFile(f) {
-  if (AUTO_PROCESSING || STOPPED) return;
+  if (AUTO_PROCESSING) return;
   AUTO_PROCESSING = true;
 
   // Highlight the file in the Scans list
@@ -529,9 +527,9 @@ async function autoRunFile(f) {
   $('selmeta').textContent = fsize(f.size) + ' \u00b7 ' + fdate(f.createdAt) + ' \u2022 Auto-detected';
   var ss = $('stepsel');
   if (ss) ss.style.display = 'none';
+  // Hide Run button during auto processing — only shown for manual selection
   var btn = $('runbtn');
-  btn.className = 'runbtn going'; btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Auto running...';
+  btn.style.display = 'none';
 
   // Show progress steps
   IR = true;
@@ -568,6 +566,7 @@ function autoFinErr(step, msg) {
   $('rescard').innerHTML = '<div class="rescard err"><div class="restitle">\u274c Auto Run Failed</div>'
     + '<div class="resrow"><div class="reslbl">Error</div><div class="resval" style="color:var(--rd)">' + esc(msg) + '</div></div></div>';
   var btn = $('runbtn');
+  btn.style.display = '';
   btn.className = 'runbtn go'; btn.disabled = false;
   btn.innerHTML = '\u21ba Try Again';
   // Refresh both panels even on error
@@ -583,22 +582,13 @@ function setSt(n) {
 
 // ── STOP/RESUME ──
 async function loadStopState() {
-  var d = await api('/api/admin?action=control');
-  if (!d) return;
-  STOPPED = d.stopped || false;
-  updateStopBtn();
-}
-function updateStopBtn() {
-  // Always visible — system is always in auto-watch mode
-  $('stoparea').className = 'stoparea show';
-  var btn = $('stopbtn');
-  if (STOPPED) { btn.className='stopbtn resuming'; btn.innerHTML='&#9654; Resume Processing'; }
-  else { btn.className='stopbtn stopping'; btn.innerHTML='&#9646;&#9646; Pause Processing'; }
-}
-async function doStop() {
-  var action = STOPPED ? 'resume' : 'stop';
-  var d = await api('/api/admin?action=control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:action})});
-  if (d) { STOPPED = d.stopped; updateStopBtn(); }
+  // Clear any previously set stop flag so the system always starts watching.
+  // The stop/resume concept is removed — processing is always on.
+  await api('/api/admin?action=control', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'resume'})
+  });
 }
 
 // ── SUBSCRIPTION ──
@@ -716,6 +706,7 @@ function clickScan(el) {
   var ss = $('stepsel');
   if (ss) ss.style.display = 'none'; // Step selector hidden — unified mode
   var btn = $('runbtn');
+  btn.style.display = '';
   btn.className = 'runbtn go';
   btn.disabled = false;
   btn.textContent = WF[f.id] ? '\u25b6 Run (Waiting)' : '\u25b6 Run';
@@ -940,6 +931,11 @@ function resetProg() {
   $('progidle').style.display = 'flex';
   $('steplist').innerHTML = '';
   $('rescard').innerHTML = '';
+  // Reset right panel to idle state
+  $('nosel').style.display = 'flex';
+  $('seldet').style.display = 'none';
+  var btn = $('runbtn');
+  if (btn) { btn.style.display = 'none'; btn.className = 'runbtn'; btn.disabled = true; btn.innerHTML = '\u25b6 Run'; }
 }
 
 function finRun(success) {
@@ -948,6 +944,7 @@ function finRun(success) {
   var btn = $('runbtn');
   loadWaiting();
   if (success) {
+    btn.style.display = '';
     btn.className = 'runbtn'; btn.disabled = true;
     btn.innerHTML = '\u2705 Complete';
     // Hold result visible for 5s then fully reset in both auto and human mode
@@ -972,6 +969,7 @@ function finErr(step, msg) {
   $('rescard').innerHTML = '<div class="rescard err"><div class="restitle">\u274c Failed</div>'
     + '<div class="resrow"><div class="reslbl">Error</div><div class="resval" style="color:var(--rd)">' + esc(msg) + '</div></div></div>';
   var btn = $('runbtn');
+  btn.style.display = '';
   btn.className = 'runbtn go'; btn.disabled = false;
   btn.innerHTML = '\u21ba Try Again';
 }
@@ -1209,6 +1207,6 @@ openNotifyStream();
 // Refresh status cache every 60 seconds
 setInterval(loadStatus, 60000);
 setInterval(loadWaiting, 30000);
-setInterval(loadStopState, 15000); // Always refresh stop state — unified mode
+// Stop state cleared on load — no need to poll it
 </script>
 </body></html>`;
