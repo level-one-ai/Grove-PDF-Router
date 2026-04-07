@@ -710,7 +710,7 @@ function clickScan(el) {
   btn.className = 'runbtn go';
   btn.disabled = false;
   btn.textContent = '\u25b6 Process';
-  resetProg();
+  resetProgOnly();
 }
 
 // ── PROCESSED FOLDER ──
@@ -927,15 +927,21 @@ function showRes(d) {
     + '</div>';
 }
 
-function resetProg() {
+function resetProgOnly() {
+  // Clears only the progress steps panel — leaves file selection visible.
+  // Called when a new file is clicked so the progress area is fresh.
   $('progidle').style.display = 'flex';
   $('steplist').innerHTML = '';
   $('rescard').innerHTML = '';
-  // Reset right panel to idle state
+}
+
+function resetProg() {
+  // Full reset — clears both progress and file selection. Called after completion.
+  resetProgOnly();
   $('nosel').style.display = 'flex';
   $('seldet').style.display = 'none';
   var btn = $('runbtn');
-  if (btn) { btn.style.display = 'none'; btn.className = 'runbtn'; btn.disabled = true; btn.innerHTML = '\u25b6 Run'; }
+  if (btn) { btn.style.display = 'none'; btn.className = 'runbtn'; btn.disabled = true; btn.innerHTML = '\u25b6 Process'; }
 }
 
 function finRun(success) {
