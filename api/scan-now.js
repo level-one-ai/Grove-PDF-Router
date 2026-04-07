@@ -50,11 +50,7 @@ async function scanAndProcess() {
     return;
   }
 
-  const stopped = await db.isAutoStopped();
-  if (stopped) {
-    console.log('[scan-now] Stopped flag set — halting');
-    return;
-  }
+  // No stop flag check — system always processes
 
   const userId = process.env.ONEDRIVE_USER_ID;
   const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
