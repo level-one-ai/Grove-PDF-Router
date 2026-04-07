@@ -68,11 +68,7 @@ async function pollLoop() {
 
       // Check if we should still be polling (stop flag only — no mode check, always watching)
 
-      const stopped = await db.isAutoStopped();
-      if (stopped) {
-        console.log('[auto-poll] Stop flag set — stopping');
-        break;
-      }
+      // No stop flag check — system always watches
 
       // Refresh the lock heartbeat so it doesn't expire while we're alive
       await refreshPollLock();
