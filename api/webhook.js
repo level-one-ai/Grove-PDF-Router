@@ -73,8 +73,7 @@ async function scanAndProcess() {
     })
     .sort((a, b) => new Date(b.createdDateTime) - new Date(a.createdDateTime));
 
-  const mode = await db.getMode();
-  console.log(`[webhook] Mode: ${mode} — ${pdfFiles.length} PDF(s)`);
+  console.log(`[webhook] ${pdfFiles.length} PDF(s) in Scans`);
 
   const token = await getToken();
   let newFilesDetected = [];
@@ -109,40 +108,26 @@ async function scanAndProcess() {
   // This fires regardless of mode — the dashboard always sees new files instantly.
   await notifyDashboard(newFilesDetected);
 
-  // ── STEP 2: Mode-aware processing ──
-  if (mode === 'auto') {
-    const stopped = await db.isAutoStopped();
-    if (stopped) {
-      console.log('[webhook] Auto stopped — notified dashboard but not processing');
-      return;
-    }
+  // ── STEP 2: Always auto-process — system is always watching ──
+  const stopped = await db.isAutoStopped();
+  if (stopped) {
+    console.log('[webhook] Processing paused — notified dashboard but not processing');
+    return;
+  }
 
-    // Wait 3 seconds so dashboard has time to update visually before processing starts
-    await sleep(3000);
+  // Wait 3 seconds so dashboard has time to update visually before processing starts
+  await sleep(3000);
 
-    // Trigger scan-now which handles the full processing logic including priority ordering
-    const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-    try {
-      await axios.post(`${baseUrl}/api/scan-now`, {}, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 10000,
-      });
-      console.log('[webhook] Auto mode — triggered scan-now after 3s delay');
-    } catch (err) {
-      console.warn('[webhook] scan-now trigger warning:', err.message);
-    }
-
-  } else {
-    // Human mode — create Firestore records with status 'detected' so they appear
-    // in the scans list. Processing only starts when the user clicks Run.
-    for (const file of newFilesDetected) {
-      const existing = await db.getRecord(file.id);
-      if (!existing) {
-        const originalFileName = file.name.replace(/\.pdf$/i, '');
-        await db.createDetectedRecord(file.id, originalFileName);
-        console.log(`[webhook] Human mode — "${file.name}" marked as detected, waiting for manual run`);
-      }
-    }
+  // Trigger scan-now which handles the full processing logic including priority ordering
+  const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+  try {
+    await axios.post(`${baseUrl}/api/scan-now`, {}, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000,
+    });
+    console.log('[webhook] Triggered scan-now after 3s delay');
+  } catch (err) {
+    console.warn('[webhook] scan-now trigger warning:', err.message);
   }
 }
 
