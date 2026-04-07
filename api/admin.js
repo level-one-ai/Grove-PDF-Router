@@ -40,18 +40,12 @@ module.exports = async function handler(req, res) {
   // ── MODE ──
   if (action === 'mode') {
     if (req.method === 'GET') {
-      try {
-        const mode = await db.getMode();
-        return res.status(200).json({ success: true, mode });
-      } catch (err) {
-        return res.status(200).json({ success: true, mode: 'auto' });
-      }
+      // Always auto — unified mode
+      return res.status(200).json({ success: true, mode: 'auto' });
     }
     if (req.method === 'POST') {
-      const { mode } = req.body || {};
-      if (!['auto', 'human'].includes(mode)) {
-        return res.status(400).json({ error: 'mode must be auto or human' });
-      }
+      // System is always in unified auto-watch mode.
+      // Accept mode param for backward compat but always store and return 'auto'.
       try {
         const admin = require('firebase-admin');
         if (!admin.apps.length) {
@@ -64,27 +58,21 @@ module.exports = async function handler(req, res) {
           });
         }
         await admin.firestore().collection('settings').doc('processingMode').set({
-          mode, updatedAt: new Date().toISOString()
+          mode: 'auto', updatedAt: new Date().toISOString()
         });
-
-        // When switching to auto, trigger a scan of existing files immediately
-        // and start the server-side auto-poll loop
-        if (mode === 'auto') {
-          const axios = require('axios');
-          const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-          axios.post(`${baseUrl}/api/scan-now`, {}, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 5000,
-          }).catch(err => console.warn('[admin] scan-now trigger warning:', err.message));
-          // Start the server-side auto-poll loop (checks Scans folder every 10s)
-          axios.post(`${baseUrl}/api/auto-poll`, {}, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 5000,
-          }).catch(err => console.warn('[admin] auto-poll trigger warning:', err.message));
-          console.log('[admin] Switched to auto — triggered scan-now + auto-poll');
-        }
-
-        return res.status(200).json({ success: true, mode });
+        // Always trigger scan-now + auto-poll on startup
+        const axios = require('axios');
+        const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+        axios.post(`${baseUrl}/api/scan-now`, {}, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 5000,
+        }).catch(err => console.warn('[admin] scan-now trigger warning:', err.message));
+        axios.post(`${baseUrl}/api/auto-poll`, {}, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 5000,
+        }).catch(err => console.warn('[admin] auto-poll trigger warning:', err.message));
+        console.log('[admin] Triggered scan-now + auto-poll');
+        return res.status(200).json({ success: true, mode: 'auto' });
       } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
       }
