@@ -212,14 +212,6 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
     <div class="li">&#128196;</div>
     <div><div class="lt">Grove PDF Router</div><div class="ls">Dashboard</div></div>
   </div>
-  <div class="mw">
-    <span class="ml on" id="lbl-a" onclick="toggleMode()">Auto</span>
-    <div class="ts" onclick="toggleMode()">
-      <div class="tt" id="tt"></div>
-      <div class="tk" id="tk"></div>
-    </div>
-    <span class="ml" id="lbl-h" onclick="toggleMode()">Human</span>
-  </div>
   <div style="display:flex;align-items:center;gap:7px;position:relative">
     <div class="sub-row">
       <div class="dot" id="sdot"></div>
@@ -227,10 +219,10 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
     </div>
     <button class="act-btn" id="actbtn" onclick="activateSub()">Activate</button>
     <div class="bell-wrap">
-      <button class="bell-btn" onclick="toggleNotif()">&#128276;<span class="bell-num" id="bnum"></span></button>
+      <button class="bell-btn" onclick="toggleNotif()">&#9203;<span class="bell-num" id="bnum"></span></button>
       <div class="np" id="np">
-        <div style="font-size:12px;font-weight:600;margin-bottom:8px">&#9203; Waiting Files</div>
-        <div id="nlist"><div style="font-size:12px;color:var(--mu);text-align:center;padding:8px">None waiting</div></div>
+        <div style="font-size:12px;font-weight:600;margin-bottom:8px">&#9203; Queue</div>
+        <div id="nlist"><div style="font-size:11px;color:var(--mu);text-align:center;padding:8px">Queue empty</div></div>
       </div>
     </div>
   </div>
@@ -244,7 +236,6 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">—</div></div>
       <div style="display:flex;gap:5px">
         <button class="rfbtn diagbtn" id="diag-btn" onclick="toggleDiag()" title="Run system diagnostics">&#128295; Diag</button>
-        <button class="rfbtn" id="proc-all-btn" onclick="processAll()" style="display:none;border-color:#22c55e44;color:var(--gn)" title="Process all files in auto mode">&#9654; All</button>
         <button class="rfbtn" onclick="loadStatus().then(loadScans)">&#8635;</button>
       </div>
     </div>
@@ -311,14 +302,14 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       <div id="rescard"></div>
     </div>
 
-    <div class="stoparea" id="stoparea">
-      <button class="stopbtn stopping" id="stopbtn" onclick="doStop()">&#9632; Stop Processing</button>
+    <div class="stoparea show" id="stoparea">
+      <button class="stopbtn stopping" id="stopbtn" onclick="doStop()">&#9646;&#9646; Pause Processing</button>
     </div>
   </div>
 </div>
 
 <script>
-var SF = null, IR = false, CM = 'auto', ST = 1, WF = {}, STOPPED = false;
+var SF = null, IR = false, CM = 'auto', ST = 1, WF = {}, STOPPED = false; // CM always 'auto' — unified mode
 var STATUS_CACHE = []; // All Firestore records — loaded once, reused everywhere
 var STATUS_LOADED = false;
 var AUTO_POLL_INTERVAL = null;
@@ -387,33 +378,12 @@ function findRecord(fileName) {
 
 // ── MODE ──
 async function loadMode() {
-  var d = await api('/api/admin?action=mode');
-  CM = (d && d.mode) ? d.mode : 'auto';
-  applyMode();
-}
-async function toggleMode() {
-  CM = CM === 'auto' ? 'human' : 'auto';
-  applyMode();
-  await api('/api/admin?action=mode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mode:CM})});
-}
-function applyMode() {
-  var h = CM === 'human';
-  $('tt').className = 'tt' + (h ? ' h' : '');
-  $('tk').className = 'tk' + (h ? ' h' : '');
-  $('lbl-a').className = 'ml' + (h ? '' : ' on');
-  $('lbl-h').className = 'ml' + (h ? ' on' : '');
-  var ss = $('stepsel');
-  if (ss) ss.style.display = h ? 'block' : 'none';
-  // Show Process All only in auto mode
-  var pab = $('proc-all-btn');
-  if (pab) pab.style.display = h ? 'none' : 'inline-block';
-  if (h) {
-    $('stoparea').className = 'stoparea';
-    stopAutoPolling();
-  } else {
-    loadStopState();
-    startAutoPolling();
-  }
+  // System is always in unified auto-watch mode — no toggle needed.
+  // Keep this call for compatibility; it simply ensures polling is running.
+  CM = 'auto';
+  // Always start polling and show stop button
+  loadStopState();
+  startAutoPolling();
 }
 
 // ── AUTO MODE POLLING + SSE NOTIFY ──
@@ -454,7 +424,7 @@ function openNotifyStream() {
     // Refresh scans panel immediately
     loadStatus().then(function(){ loadScans(); loadWaiting(); });
     // If in auto mode and not already processing, trigger auto-run after scans refresh
-    if (CM === 'auto' && !AUTO_PROCESSING && !STOPPED) {
+    if (!AUTO_PROCESSING && !STOPPED) {
       setTimeout(function(){
         // Re-check after short delay to let loadScans finish
         if (!AUTO_PROCESSING && !STOPPED && window.SCAN_FILES && window.SCAN_FILES.length > 0) {
@@ -497,7 +467,7 @@ async function seedAutoKnownIds() {
 
 async function autoPollScans() {
   // Don't poll while already processing or stopped
-  if (AUTO_PROCESSING || STOPPED || CM !== 'auto') return;
+  if (AUTO_PROCESSING || STOPPED) return;
 
   var d = await api('/api/scan-files');
   if (!d || !d.success || !d.files) return;
@@ -556,7 +526,7 @@ async function autoRunFile(f) {
   $('nosel').style.display = 'none';
   $('seldet').style.display = 'block';
   $('selname').textContent = f.name;
-  $('selmeta').textContent = fsize(f.size) + ' \u00b7 ' + fdate(f.createdAt) + ' \u2022 Auto';
+  $('selmeta').textContent = fsize(f.size) + ' \u00b7 ' + fdate(f.createdAt) + ' \u2022 Auto-detected';
   var ss = $('stepsel');
   if (ss) ss.style.display = 'none';
   var btn = $('runbtn');
@@ -619,11 +589,11 @@ async function loadStopState() {
   updateStopBtn();
 }
 function updateStopBtn() {
-  if (CM !== 'auto') { $('stoparea').className = 'stoparea'; return; }
+  // Always visible — system is always in auto-watch mode
   $('stoparea').className = 'stoparea show';
   var btn = $('stopbtn');
   if (STOPPED) { btn.className='stopbtn resuming'; btn.innerHTML='&#9654; Resume Processing'; }
-  else { btn.className='stopbtn stopping'; btn.innerHTML='&#9632; Stop Processing'; }
+  else { btn.className='stopbtn stopping'; btn.innerHTML='&#9646;&#9646; Pause Processing'; }
 }
 async function doStop() {
   var action = STOPPED ? 'resume' : 'stop';
@@ -657,7 +627,7 @@ async function loadWaiting() {
   else { bn.style.display='none'; }
   var nl = $('nlist');
   if (!files.length) {
-    nl.innerHTML = '<div style="font-size:11px;color:var(--mu);text-align:center;padding:8px">None waiting</div>';
+    nl.innerHTML = '<div style="font-size:11px;color:var(--mu);text-align:center;padding:8px">Queue empty</div>';
   } else {
     nl.innerHTML = files.map(function(f){
       return '<div style="display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:6px;background:var(--s2);border:1px solid #d9770033;margin-bottom:4px;cursor:pointer" data-wfid="' + esc(f.fileId) + '" onclick="selWait(this.dataset.wfid)">'
@@ -744,7 +714,7 @@ function clickScan(el) {
   $('selname').textContent = f.name;
   $('selmeta').textContent = fsize(f.size) + ' \u00b7 ' + fdate(f.createdAt);
   var ss = $('stepsel');
-  if (ss) ss.style.display = CM==='human' ? 'block' : 'none';
+  if (ss) ss.style.display = 'none'; // Step selector hidden — unified mode
   var btn = $('runbtn');
   btn.className = 'runbtn go';
   btn.disabled = false;
@@ -1007,19 +977,7 @@ function finErr(step, msg) {
 }
 
 // ── PROCESS ALL ──
-async function processAll() {
-  var btn = $('proc-all-btn');
-  var orig = btn.innerHTML;
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span>';
-  var d = await api('/api/scan-now', { method: 'POST' });
-  btn.disabled = false;
-  btn.innerHTML = orig;
-  if (d && d.status === 'scanning') {
-    // Refresh status cache then file list
-    setTimeout(function(){ loadStatus().then(loadScans); }, 3000);
-  }
-}
+// processAll removed — system auto-processes all detected files
 
 // ── GOOGLE DRIVE RETRY ──
 async function retryGoogleDrive() {
@@ -1251,6 +1209,6 @@ openNotifyStream();
 // Refresh status cache every 60 seconds
 setInterval(loadStatus, 60000);
 setInterval(loadWaiting, 30000);
-setInterval(function(){ if(CM==='auto') loadStopState(); }, 15000);
+setInterval(loadStopState, 15000); // Always refresh stop state — unified mode
 </script>
 </body></html>`;
