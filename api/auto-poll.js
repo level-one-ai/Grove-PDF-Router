@@ -66,12 +66,7 @@ async function pollLoop() {
         break;
       }
 
-      // Check if we should still be polling
-      const mode = await db.getMode();
-      if (mode !== 'auto') {
-        console.log('[auto-poll] Mode changed to human — stopping');
-        break;
-      }
+      // Check if we should still be polling (stop flag only — no mode check, always watching)
 
       const stopped = await db.isAutoStopped();
       if (stopped) {
@@ -106,7 +101,7 @@ async function pollLoop() {
               console.log('[auto-poll] No active processing — triggering scan-now');
               await triggerScanNow();
             } else {
-              console.log('[auto-poll] A file is currently processing — scan-now will be triggered automatically when it completes');
+              console.log('[auto-poll] A file is currently processing — new file queued, scan-now will pick it up when current file completes');
             }
           }
           // Also add any new IDs we see (even if already processed)
