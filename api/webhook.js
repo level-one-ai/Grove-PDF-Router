@@ -1,3 +1,4 @@
+const { logRead } = require('../lib/logRead');
 /**
  * /api/webhook
  *
@@ -89,15 +90,19 @@ async function scanAndProcess() {
     }
 
     // Already processing, waiting, or errored — skip
-    if (existing && !['reset', null, undefined].includes(existing.status)) {
+    // 'detected' is NOT skipped — it means we saw it before but scan-now may not
+    // have triggered yet. Allow webhook to re-trigger processing for it.
+    if (existing && !['reset', 'detected', null, undefined].includes(existing.status)) {
       console.log(`[webhook] Skipping "${file.name}" — status: ${existing.status}`);
       continue;
     }
 
-    // This is a new file — record it
-    console.log(`[webhook] New file detected: "${file.name}"`);
+    // This is a new or re-detected file — record it
+    console.log(`[webhook] New file detected: "${file.name}" (status: ${existing?.status || 'none'})`);
     newFilesDetected.push(file);
   }
+
+  logRead('webhook per-file checks', pdfFiles.length);
 
   if (newFilesDetected.length === 0) {
     console.log('[webhook] No new files to process');
