@@ -225,15 +225,12 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages) {
       console.error('[file-page] Failed to mark complete:', completeErr.message);
     }
 
-    // In auto mode, trigger scan-now to pick up the next file
-    const mode = await db.getMode().catch(() => 'auto');
-    if (mode === 'auto') {
-      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-      axios.post(`${baseUrl}/api/scan-now`, {}, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 5000,
-      }).catch(err => console.warn('[file-page] scan-now trigger warning:', err.message));
-    }
+    // Always trigger scan-now to pick up the next file
+    const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+    axios.post(`${baseUrl}/api/scan-now`, {}, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 5000,
+    }).catch(err => console.warn('[file-page] scan-now trigger warning:', err.message));
   }
 }
 
@@ -349,8 +346,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     // Before dispatching the next page of this (potentially old) file, check whether
     // a new higher-priority file has arrived. If so, pause here and let scan-now
     // pick up the new file first. We resume this file once new files are done.
-    const autoMode = await db.getMode().catch(() => 'auto');
-    if (autoMode === 'auto') {
+    {
       const isOld = await db.isOldFile(fileId);
       if (isOld) {
         const newFileArrived = await checkForNewPriorityFile(fileId);
@@ -411,8 +407,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   console.log(`[file-page] ${T()} ✅ Complete — all ${totalPages} pages filed`);
 
   // In auto mode, trigger scan-now to pick up the next file in the queue
-  const mode = await db.getMode().catch(() => 'auto');
-  if (mode === 'auto') {
+  { // Always auto — no mode check needed
     const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
     axios.post(`${baseUrl}/api/scan-now`, {}, {
       headers: { 'Content-Type': 'application/json' },
@@ -429,7 +424,7 @@ async function waitForTempPage(fileId, pageNumber, timeoutMs) {
     const ps = record?.pageStore || {};
     const td = ps[pageNumber] || ps[String(pageNumber)];
     if (td?.tempItemId) return td;
-    await sleep(2000);
+    await sleep(5000); // 5s poll — reduces Firestore reads during page waiting
   }
   return null;
 }
