@@ -109,7 +109,8 @@ module.exports = async function handler(req, res) {
       const result = await createSubscription(notificationUrl);
       await saveSubscription(result.id, result.expirationDateTime, `${notificationUrl}/api/webhook`);
       console.log(`[cron] ✅ Created. Expires: ${result.expirationDateTime}`);
-      return res.status(200).json({ action: 'created', expiresAt: result.expirationDateTime });
+      await ensureAutoPollAlive();
+      return res.status(200).json({ action: 'created', expiresAt: result.expirationDateTime, autoPollChecked: true });
     }
 
     // ── Case 2: Subscription expired — recreate ──
@@ -120,7 +121,8 @@ module.exports = async function handler(req, res) {
       const result = await createSubscription(notificationUrl);
       await saveSubscription(result.id, result.expirationDateTime, `${notificationUrl}/api/webhook`);
       console.log(`[cron] ✅ Recreated. Expires: ${result.expirationDateTime}`);
-      return res.status(200).json({ action: 'recreated', expiresAt: result.expirationDateTime });
+      await ensureAutoPollAlive();
+      return res.status(200).json({ action: 'recreated', expiresAt: result.expirationDateTime, autoPollChecked: true });
     }
 
     // ── Case 3: Not yet time to renew — skip ──
@@ -157,7 +159,8 @@ module.exports = async function handler(req, res) {
       const result = await createSubscription(notificationUrl);
       await saveSubscription(result.id, result.expirationDateTime, `${notificationUrl}/api/webhook`);
       console.log(`[cron] ✅ Recovered — new subscription created`);
-      return res.status(200).json({ action: 'recovered', expiresAt: result.expirationDateTime });
+      await ensureAutoPollAlive();
+      return res.status(200).json({ action: 'recovered', expiresAt: result.expirationDateTime, autoPollChecked: true });
     } catch (recoveryErr) {
       console.error('[cron] Recovery also failed:', recoveryErr.message);
       return res.status(500).json({ error: err.message, recoveryError: recoveryErr.message });
