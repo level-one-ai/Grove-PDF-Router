@@ -388,7 +388,7 @@ async function loadMode() {
 function startAutoPolling() {
   stopAutoPolling();
   // Keep the polling interval as a safety net (catches files if SSE misses anything)
-  AUTO_POLL_INTERVAL = setInterval(autoPollScans, 8000);
+  AUTO_POLL_INTERVAL = setInterval(autoPollScans, 60000); // 60s — SSE handles instant updates, this is fallback only
   // Seed known IDs immediately so first poll detects only NEW files added after this point
   seedAutoKnownIds();
 }
@@ -1211,8 +1211,8 @@ loadSub();
 // Open SSE notify stream for instant new-file detection
 openNotifyStream();
 // Refresh status cache every 60 seconds
-setInterval(loadStatus, 60000);
-setInterval(loadWaiting, 30000);
+setInterval(loadStatus, 300000); // 5 mins — status cache refreshed on demand by SSE events
+setInterval(loadWaiting, 120000); // 2 mins — queue rarely changes without a notify event
 // Stop state cleared on load — no need to poll it
 </script>
 </body></html>`;
