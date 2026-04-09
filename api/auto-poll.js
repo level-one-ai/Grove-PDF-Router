@@ -187,7 +187,7 @@ async function chainNewInstance() {
 // Uses a Firestore document to prevent duplicate poll loops.
 // The lock has a heartbeat timestamp — if it's stale (>60s old), another instance can take over.
 
-const LOCK_STALE_MS = 60000; // 60 seconds — if heartbeat is older than this, lock is stale
+const LOCK_STALE_MS = 90000; // 90 seconds — heartbeats every ~62s (60s sleep + scan time), 90s gives safe margin
 
 async function acquirePollLock() {
   try {
