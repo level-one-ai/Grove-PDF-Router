@@ -157,50 +157,47 @@ module.exports = async function handler(req, res) {
 
     const result = await pollForCompletion(fileId, totalPages, (event) => {
       if (event.type === 'dispatched') {
-        // Next page sent to Make.com
-        progress(4, `Sending page ${event.page}/${totalPages} to Make.com...`, 'running');
+        // Vercel sent next page to Make.com
+        progress(4, `Page ${event.page}/${totalPages} sent to Make.com ✓`, 'running');
+        progress(5, `Waiting for Claude to extract page ${event.page}/${totalPages}...`, 'running');
+
       } else if (event.type === 'extraction') {
-        // AI extraction received for this page — update step 4 label to show which page
-        if (event.page < totalPages) {
-          progress(4, `Page ${event.page}/${totalPages} sent to Make.com ✓`, 'running');
-        } else {
+        // Claude returned extracted data for this page
+        progress(5, `Page ${event.page}/${totalPages} extracted by Claude ✓`, 'running');
+        if (event.page >= totalPages) {
           progress(4, `All ${totalPages} page(s) sent to Make.com ✓`, 'done');
         }
-        // Update step 5 to show extraction in progress
-        if (event.page >= totalPages) {
-          progress(5, `AI extraction complete — all ${totalPages} page(s) ✓`, 'done');
-        } else {
-          progress(5, `AI extracting page ${event.page}/${totalPages}...`, 'running');
-        }
+
       } else if (event.type === 'filing') {
-        // Filing started — mark step 5 done, start step 6
-        progress(5, `AI extraction complete ✓`, 'done');
+        // Filing started for this page
+        progress(5, `Page ${event.page}/${totalPages} extracted by Claude ✓`, 'running');
+        const docType = (event.pageData && event.pageData.docType)
+          ? event.pageData.docType.replace(/_/g, ' ')
+          : null;
         if (event.skipped) {
-          // Non-order document — stored in Non-Order Documents folder, not Google Drive
-          const docType = (event.pageData && event.pageData.docType)
-            ? event.pageData.docType.replace(/_/g, ' ')
-            : 'non-order document';
-          progress(6, `Page ${event.page}/${totalPages} — ${docType} stored in Non-Order Documents...`, 'running');
+          progress(6, `Page ${event.page}/${totalPages} — ${docType || 'non-order document'} — filing to Non-Order Documents...`, 'running');
         } else {
-          progress(6, `Filing page ${event.page}/${totalPages} to OneDrive & Google Drive...`, 'running');
+          progress(6, `Page ${event.page}/${totalPages} — filing to OneDrive & Google Drive...`, 'running');
         }
+
       } else if (event.type === 'filed') {
-        // Page fully filed or skipped
+        // Page fully filed
+        const docType = (event.pageData && event.pageData.docType)
+          ? event.pageData.docType.replace(/_/g, ' ')
+          : null;
         if (event.skipped) {
-          // Non-order document — mark step 6 done with appropriate message
-          const docType = (event.pageData && event.pageData.docType)
-            ? event.pageData.docType.replace(/_/g, ' ')
-            : 'non-order document';
           if (event.page >= totalPages) {
+            progress(5, `All ${totalPages} page(s) extracted by Claude ✓`, 'done');
             progress(6, `All ${totalPages} page(s) processed ✓`, 'done');
           } else {
-            progress(6, `Page ${event.page}/${totalPages} — ${docType} filed ✓ — waiting for next page...`, 'running');
+            progress(6, `Page ${event.page}/${totalPages} — ${docType || 'non-order'} filed ✓ — waiting for page ${event.page + 1}...`, 'running');
           }
         } else {
           if (event.page >= totalPages) {
+            progress(5, `All ${totalPages} page(s) extracted by Claude ✓`, 'done');
             progress(6, `All ${totalPages} page(s) filed to OneDrive & Google Drive ✓`, 'done');
           } else {
-            progress(6, `Page ${event.page}/${totalPages} filed ✓ — waiting for next page...`, 'running');
+            progress(6, `Page ${event.page}/${totalPages} filed to OneDrive & Google Drive ✓ — sending page ${event.page + 1} to Make.com...`, 'running');
           }
         }
       }
@@ -211,10 +208,11 @@ module.exports = async function handler(req, res) {
       return fail(5, `Processing error: ${result.error}`);
     }
 
-    // Make sure both steps show done
+    // Ensure all steps show done on completion
     clearInterval(keepalive);
-    progress(5, `AI extraction complete — ${totalPages} page(s) ✓`, 'done');
-    progress(6, `Filed to OneDrive & Google Drive ✓`, 'done');
+    progress(4, `All ${totalPages} page(s) sent to Make.com ✓`, 'done');
+    progress(5, `All ${totalPages} page(s) extracted by Claude ✓`, 'done');
+    progress(6, `All ${totalPages} page(s) filed ✓`, 'done');
 
     complete({
       message: 'Test run complete',
@@ -236,80 +234,122 @@ module.exports = async function handler(req, res) {
 };
 
 async function pollForCompletion(fileId, totalPages, onEvent) {
-  // Adaptive timeout: max 3 minutes since last progress, or 15 minutes total
-  const MAX_TOTAL = 15 * 60 * 1000;
-  const MAX_IDLE  =  3 * 60 * 1000; // reset whenever a page progresses
-  const INTERVAL = 3000;
-  const start = Date.now();
-  let lastProgress = Date.now();
-  const reported = { dispatched: new Set(), extraction: new Set(), filing: new Set(), filed: new Set() };
+  // Uses Firestore onSnapshot for instant updates instead of 3-second polling.
+  // This eliminates the race condition where the final page gets stuck orange
+  // because the poll missed the transition to 'completed'.
+  const MAX_TOTAL = 15 * 60 * 1000; // 15 minute hard limit
+  const MAX_IDLE  =  3 * 60 * 1000; // 3 minutes without progress = timeout
 
-  while (Date.now() - start < MAX_TOTAL) {
-    await sleep(INTERVAL);
-    const record = await db.getRecord(fileId);
-    if (!record) continue;
-    if (record.status === 'error') return { status: 'error', error: record.error };
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let lastProgress = Date.now();
+    let resolved = false;
+    const reported = { dispatched: new Set(), extraction: new Set(), filing: new Set(), filed: new Set() };
 
-    const pages = record.pages || {};
-    let anyNew = false;
-
-    // Detect when Vercel dispatches the next page to Make.com
-    const dispatchedPage = record.currentDispatchPage || 1;
-    if (!reported.dispatched.has(dispatchedPage) && dispatchedPage > 1) {
-      reported.dispatched.add(dispatchedPage);
-      onEvent({ type: 'dispatched', page: dispatchedPage });
-      anyNew = true;
-    }
-
-    for (let p = 1; p <= totalPages; p++) {
-      const pageData = pages[p] || pages[String(p)];
-      if (!pageData) continue;
-      const st = pageData.status;
-
-      if (!reported.extraction.has(p) && st && st !== 'pending') {
-        reported.extraction.add(p);
-        onEvent({ type: 'extraction', page: p });
-        anyNew = true;
+    // Hard deadline timer
+    const hardDeadline = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        if (unsubscribe) unsubscribe();
+        resolve({ status: 'error', error: `15 minute limit reached — ${reported.filed.size}/${totalPages} pages filed. File is still processing in background.` });
       }
-      if (!reported.filing.has(p) && (st === 'filing' || st === 'completed' || st === 'skipped')) {
-        reported.filing.add(p);
-        // Pass skipped flag so the event handler can show the right message
-        onEvent({ type: 'filing', page: p, skipped: st === 'skipped', pageData });
-        anyNew = true;
-      }
-      if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
-        reported.filed.add(p);
-        onEvent({ type: 'filed', page: p, skipped: st === 'skipped', pageData });
-        anyNew = true;
-      }
-    }
+    }, MAX_TOTAL);
 
-    // Reset idle timer whenever any page progresses
-    if (anyNew) lastProgress = Date.now();
+    // Idle timeout — checked every 10 seconds
+    const idleCheck = setInterval(() => {
+      if (resolved) { clearInterval(idleCheck); return; }
+      if (Date.now() - lastProgress > MAX_IDLE) {
+        resolved = true;
+        clearInterval(idleCheck);
+        clearTimeout(hardDeadline);
+        if (unsubscribe) unsubscribe();
+        resolve({ status: 'error', error: `No progress for 3 minutes — ${reported.filed.size}/${totalPages} pages filed. File may still be processing in background.` });
+      }
+    }, 10000);
 
-    // Check completed AFTER firing events so the last 'filed' event always reaches
-    // the dashboard before the poll loop returns. Previously the return happened
-    // before the filed event for the final page, leaving step 6 stuck orange.
-    if (record.status === 'completed') {
-      // Fire any unfired filed events for the last page before returning
-      for (let p = 1; p <= totalPages; p++) {
-        const pageData = (record.pages || {})[p] || (record.pages || {})[String(p)];
-        if (!pageData) continue;
-        const st = pageData.status;
-        if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
-          reported.filed.add(p);
-          onEvent({ type: 'filed', page: p, skipped: st === 'skipped', pageData });
+    const admin = require('firebase-admin');
+    const firestore = admin.firestore();
+    let unsubscribe = null;
+
+    unsubscribe = firestore.collection('processedFiles').doc(fileId)
+      .onSnapshot(snap => {
+        if (resolved) return;
+        if (!snap.exists) return;
+        const record = snap.data();
+
+        if (record.status === 'error') {
+          resolved = true;
+          clearInterval(idleCheck);
+          clearTimeout(hardDeadline);
+          unsubscribe();
+          resolve({ status: 'error', error: record.error });
+          return;
         }
-      }
-      return record;
-    }
 
-    // Idle timeout — no progress for 3 minutes
-    if (Date.now() - lastProgress > MAX_IDLE) {
-      return { status: 'error', error: `No progress for 3 minutes — ${reported.filed.size}/${totalPages} pages filed. File may still be processing in background.` };
-    }
-  }
-  return { status: 'error', error: `15 minute limit reached — ${reported.filed.size}/${totalPages} pages filed. File is still processing in background.` };
+        const pages = record.pages || {};
+        let anyNew = false;
+
+        // Detect when Vercel dispatches the next page to Make.com
+        const dispatchedPage = record.currentDispatchPage || 1;
+        if (!reported.dispatched.has(dispatchedPage) && dispatchedPage > 1) {
+          reported.dispatched.add(dispatchedPage);
+          onEvent({ type: 'dispatched', page: dispatchedPage });
+          anyNew = true;
+        }
+
+        for (let p = 1; p <= totalPages; p++) {
+          const pageData = pages[p] || pages[String(p)];
+          if (!pageData) continue;
+          const st = pageData.status;
+
+          if (!reported.extraction.has(p) && st && st !== 'pending') {
+            reported.extraction.add(p);
+            onEvent({ type: 'extraction', page: p });
+            anyNew = true;
+          }
+          if (!reported.filing.has(p) && (st === 'filing' || st === 'completed' || st === 'skipped')) {
+            reported.filing.add(p);
+            onEvent({ type: 'filing', page: p, skipped: st === 'skipped', pageData });
+            anyNew = true;
+          }
+          if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
+            reported.filed.add(p);
+            onEvent({ type: 'filed', page: p, skipped: st === 'skipped', pageData });
+            anyNew = true;
+          }
+        }
+
+        if (anyNew) lastProgress = Date.now();
+
+        // When file is marked completed, fire any remaining filed events then resolve
+        if (record.status === 'completed') {
+          for (let p = 1; p <= totalPages; p++) {
+            const pageData = (record.pages || {})[p] || (record.pages || {})[String(p)];
+            if (!pageData) continue;
+            const st = pageData.status;
+            if (!reported.filed.has(p) && (st === 'completed' || st === 'skipped')) {
+              reported.filed.add(p);
+              onEvent({ type: 'filed', page: p, skipped: st === 'skipped', pageData });
+            }
+          }
+          resolved = true;
+          clearInterval(idleCheck);
+          clearTimeout(hardDeadline);
+          unsubscribe();
+          resolve(record);
+        }
+
+      }, err => {
+        // Snapshot error — fall back to single read and resolve
+        console.warn('[test-run] pollForCompletion snapshot error:', err.message);
+        if (!resolved) {
+          resolved = true;
+          clearInterval(idleCheck);
+          clearTimeout(hardDeadline);
+          db.getRecord(fileId).then(r => resolve(r || { status: 'error', error: 'Snapshot failed' })).catch(() => resolve({ status: 'error', error: 'Snapshot failed' }));
+        }
+      });
+  });
 }
 
 async function uploadRemainingPages(remainingPages, fileId, token, userId, pageStore) {
