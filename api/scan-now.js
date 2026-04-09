@@ -1,3 +1,4 @@
+const { logRead } = require('../lib/logRead');
 /**
  * /api/scan-now
  *
@@ -400,6 +401,7 @@ async function batchGetRecords(fileIds) {
     docs.forEach(doc => {
       result[doc.id] = doc.exists ? doc.data() : null;
     });
+    logRead('scan-now batchGetRecords', fileIds.length);
     return result;
   } catch (err) {
     console.warn('[scan-now] batchGetRecords error, falling back to individual reads:', err.message);
