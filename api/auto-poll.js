@@ -1,3 +1,4 @@
+const { logRead } = require('../lib/logRead');
 /**
  * /api/auto-poll
  *
@@ -199,6 +200,7 @@ async function acquirePollLock() {
       const data = doc.data();
       const heartbeat = data.heartbeat ? new Date(data.heartbeat).getTime() : 0;
       const age = Date.now() - heartbeat;
+      logRead('auto-poll lock check', 1);
       if (age < LOCK_STALE_MS) {
         // Lock is fresh — another instance is alive
         return false;
@@ -264,7 +266,8 @@ function getFirestore() {
 async function isAnyFileProcessing() {
   try {
     const firestore = getFirestore();
-    const snapshot = await firestore.collection('files')
+    // Collection is 'processedFiles' — same as used by firebase.js COLLECTION constant
+    const snapshot = await firestore.collection('processedFiles')
       .where('status', '==', 'processing')
       .limit(1)
       .get();
@@ -292,14 +295,16 @@ async function batchGetRecords(fileIds) {
     docs.forEach(doc => {
       result[doc.id] = doc.exists ? doc.data() : null;
     });
+    // Read counter log — used by dashboard Logs panel to track Firestore usage
+    logRead('auto-poll batchGetRecords', fileIds.length);
     return result;
   } catch (err) {
     console.warn('[auto-poll] batchGetRecords error, falling back to individual reads:', err.message);
-    // Fall back to individual reads on error so the system keeps working
     const result = {};
     for (const id of fileIds) {
       try { result[id] = await db.getRecord(id); } catch (e) { result[id] = null; }
     }
+    logRead('auto-poll fallback reads', fileIds.length);
     return result;
   }
 }
