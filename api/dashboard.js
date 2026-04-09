@@ -236,6 +236,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">—</div></div>
       <div style="display:flex;gap:5px">
         <button class="rfbtn diagbtn" id="diag-btn" onclick="toggleDiag()" title="Run system diagnostics">&#128295; Diag</button>
+        <button class="rfbtn diagbtn" id="logs-btn" onclick="toggleLogs()" title="View Firestore read logs">&#128220; Logs</button>
         <button class="rfbtn" onclick="loadStatus().then(loadScans)">&#8635;</button>
       </div>
     </div>
@@ -247,6 +248,18 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       </div>
       <div class="diagbody" id="diagbody">
         <div class="diagrow loading"><div class="diag-ic"><span class="spin"></span></div><div class="diag-label">Running checks...</div></div>
+      </div>
+    </div>
+    <div class="diagpanel" id="logspanel">
+      <div class="diagph">
+        <div class="diagph-title">&#128220; Firestore Read Log</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="rfbtn" onclick="refreshLogs()" style="font-size:10px;padding:2px 7px">&#8635; Refresh</button>
+          <button class="diagph-close" onclick="toggleLogs()" title="Close">&#10005;</button>
+        </div>
+      </div>
+      <div class="diagbody" id="logsbody">
+        <div style="font-size:11px;color:var(--mu);text-align:center;padding:12px">Click refresh to load recent logs</div>
       </div>
     </div>
     <div class="flist" id="scan-list">
@@ -1143,6 +1156,64 @@ async function sendToGDrive(btn) {
         btn.style.color = 'var(--gn)';
       }, 8000);
     }
+  }
+}
+
+// ── LOGS PANEL ──
+var LOGS_OPEN = false;
+
+function toggleLogs() {
+  var panel = $('logspanel');
+  var btn = $('logs-btn');
+  LOGS_OPEN = !LOGS_OPEN;
+  if (LOGS_OPEN) {
+    panel.className = 'diagpanel open';
+    btn.className = 'rfbtn diagbtn active';
+    refreshLogs();
+  } else {
+    panel.className = 'diagpanel';
+    btn.className = 'rfbtn diagbtn';
+  }
+}
+
+async function refreshLogs() {
+  var body = $('logsbody');
+  body.innerHTML = '<div style="font-size:11px;color:var(--mu);text-align:center;padding:8px"><span class="spin"></span> Loading...</div>';
+  try {
+    var r = await fetch('/api/logs');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var d = await r.json();
+    if (!d.entries || !d.entries.length) {
+      body.innerHTML = '<div style="font-size:11px;color:var(--mu);text-align:center;padding:12px">No read logs found yet. Deploy and run the system for a few minutes then refresh.</div>';
+      return;
+    }
+    // Group by source
+    var grouped = {};
+    d.entries.forEach(function(e) {
+      if (!grouped[e.source]) grouped[e.source] = { source: e.source, total: 0, count: 0 };
+      grouped[e.source].total += e.reads;
+      grouped[e.source].count++;
+    });
+    var sorted = Object.values(grouped).sort(function(a, b) { return b.total - a.total; });
+    var rows = sorted.map(function(g) {
+      var pct = d.totalReads ? Math.round((g.total / d.totalReads) * 100) : 0;
+      var bar = '<div style="height:4px;background:var(--bo);border-radius:2px;margin-top:3px"><div style="height:4px;background:var(--or);border-radius:2px;width:' + pct + '%"></div></div>';
+      return '<div class="diagrow" style="flex-direction:column;gap:2px">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center">'
+        + '<div class="diag-label" style="font-size:11px">' + esc(g.source) + '</div>'
+        + '<div style="font-size:11px;color:var(--or);font-weight:600">' + g.total + ' reads (' + pct + '%)</div>'
+        + '</div>'
+        + bar
+        + '<div style="font-size:10px;color:var(--mu)">' + g.count + ' invocation(s) logged</div>'
+        + '</div>';
+    }).join('');
+    var summary = '<div class="diagrow" style="margin-top:6px;border-color:var(--or)33">'
+      + '<div class="diag-label" style="font-size:11px;color:var(--or)">Total reads logged</div>'
+      + '<div class="diag-detail" style="color:var(--or);font-weight:600">' + d.totalReads + ' across ' + d.entries.length + ' log entries (last ' + (d.windowMins || 60) + ' mins)</div>'
+      + '</div>';
+    body.innerHTML = rows + summary;
+  } catch (err) {
+    body.innerHTML = '<div class="diagrow fail"><div class="diag-ic">&#10060;</div><div class="diag-label">Failed to load</div><div class="diag-detail">' + esc(err.message) + '</div></div>';
   }
 }
 
