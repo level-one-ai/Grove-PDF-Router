@@ -418,15 +418,55 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
 }
 
 async function waitForTempPage(fileId, pageNumber, timeoutMs) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const record = await db.getRecord(fileId);
-    const ps = record?.pageStore || {};
-    const td = ps[pageNumber] || ps[String(pageNumber)];
-    if (td?.tempItemId) return td;
-    await sleep(5000); // 5s poll — reduces Firestore reads during page waiting
-  }
-  return null;
+  // Use a Firestore onSnapshot listener instead of polling.
+  // Fires the instant scan-now writes the page's tempItemId — zero polling reads.
+  // Falls back to a single direct read first in case the page is already there.
+  const admin = require('firebase-admin');
+  const firestore = admin.firestore();
+  const COLLECTION = 'processedFiles';
+
+  return new Promise((resolve) => {
+    let resolved = false;
+    const deadline = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        if (unsubscribe) unsubscribe();
+        console.warn(`[file-page] waitForTempPage timed out for page ${pageNumber}`);
+        resolve(null);
+      }
+    }, timeoutMs);
+
+    let unsubscribe = null;
+
+    unsubscribe = firestore.collection(COLLECTION).doc(fileId)
+      .onSnapshot(snap => {
+        if (resolved) return;
+        if (!snap.exists) return;
+        const data = snap.data();
+        const ps = data?.pageStore || {};
+        const td = ps[pageNumber] || ps[String(pageNumber)];
+        if (td?.tempItemId) {
+          resolved = true;
+          clearTimeout(deadline);
+          unsubscribe();
+          resolve(td);
+        }
+      }, err => {
+        // Snapshot error — fall back to single read
+        console.warn(`[file-page] waitForTempPage snapshot error, falling back to poll:`, err.message);
+        if (!resolved) {
+          db.getRecord(fileId).then(record => {
+            const ps = record?.pageStore || {};
+            const td = ps[pageNumber] || ps[String(pageNumber)];
+            if (td?.tempItemId && !resolved) {
+              resolved = true;
+              clearTimeout(deadline);
+              resolve(td);
+            }
+          }).catch(() => {});
+        }
+      });
+  });
 }
 
 async function downloadTempPage(tempItemId) {
