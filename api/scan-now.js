@@ -74,8 +74,12 @@ async function scanAndProcess() {
   const newFiles = [];
   const oldFiles = [];
 
+  // Batch read all file records in a single Firestore call instead of one per file.
+  // Reduces reads from N (one per PDF) to 1 regardless of how many files are in Scans.
+  const records = await batchGetRecords(allPdfs.map(f => f.id));
+
   for (const file of allPdfs) {
-    const existing = await db.getRecord(file.id);
+    const existing = records[file.id];
 
     // Already completed — clean up from Scans
     if (existing && existing.status === 'completed') {
@@ -377,6 +381,33 @@ async function deleteFromScans(itemId, fileName, userId, token) {
     } else {
       console.warn(`[scan-now] Could not delete "${fileName}":`, err.message);
     }
+  }
+}
+
+/**
+ * Fetch multiple Firestore records in a single batch call.
+ * Returns a map of { fileId: recordData | null }.
+ */
+async function batchGetRecords(fileIds) {
+  if (!fileIds.length) return {};
+  try {
+    const admin = require('firebase-admin');
+    const firestore = admin.firestore();
+    const COLLECTION = 'processedFiles';
+    const refs = fileIds.map(id => firestore.collection(COLLECTION).doc(id));
+    const docs = await firestore.getAll(...refs);
+    const result = {};
+    docs.forEach(doc => {
+      result[doc.id] = doc.exists ? doc.data() : null;
+    });
+    return result;
+  } catch (err) {
+    console.warn('[scan-now] batchGetRecords error, falling back to individual reads:', err.message);
+    const result = {};
+    for (const id of fileIds) {
+      try { result[id] = await db.getRecord(id); } catch (e) { result[id] = null; }
+    }
+    return result;
   }
 }
 
