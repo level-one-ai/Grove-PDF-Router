@@ -879,9 +879,10 @@ function handleEvt(ev, d) {
     }
   }
   else if (ev==='complete') {
-    // Use a generic completion message — individual page steps already showed
-    // the correct message (filed to GD, or stored in Non-Order Documents)
-    updStep(6, 'All ' + (d.totalPages || '') + ' page(s) processed \u2713', 'done');
+    // Ensure all steps show green on completion
+    updStep(4, 'All ' + (d.totalPages || '') + ' page(s) sent to Make.com \u2713', 'done');
+    updStep(5, 'All ' + (d.totalPages || '') + ' page(s) extracted by Claude \u2713', 'done');
+    updStep(6, 'All ' + (d.totalPages || '') + ' page(s) filed \u2713', 'done');
     showRes(d);
     finRun(true);
   }
