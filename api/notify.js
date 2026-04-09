@@ -48,13 +48,28 @@ module.exports = async function handler(req, res) {
     try {
       const admin = require('firebase-admin');
       const firestore = getFirestore();
-      await firestore.collection('notifications').add({
+      const docRef = await firestore.collection('notifications').add({
         event,
         data,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         createdAtMs: Date.now(),
       });
       console.log(`[notify] Broadcast "${event}" event`);
+
+      // Clean up notifications older than 30 seconds to keep the collection tiny
+      // This prevents the snapshot listener from reading stale documents on reconnect
+      const cutoffClean = Date.now() - 30000;
+      firestore.collection('notifications')
+        .where('createdAtMs', '<', cutoffClean)
+        .limit(20)
+        .get()
+        .then(snap => {
+          const batch = firestore.batch();
+          snap.docs.forEach(d => batch.delete(d.ref));
+          return batch.commit();
+        })
+        .catch(() => {}); // non-fatal
+
       return res.status(200).json({ ok: true });
     } catch (err) {
       console.error('[notify] Broadcast error:', err.message);
@@ -76,7 +91,6 @@ module.exports = async function handler(req, res) {
 
   const connectedAt = Date.now();
   const MAX_DURATION = 55000; // reconnect before Vercel's 60s limit
-  const POLL_INTERVAL = 2000; // check Firestore every 2 seconds
 
   function send(event, data) {
     try {
@@ -90,49 +104,62 @@ module.exports = async function handler(req, res) {
 
   const seen = new Set();
   let running = true;
+  let unsubscribe = null;
 
   // Clean up when client disconnects
-  req.on('close', () => { running = false; });
+  req.on('close', () => {
+    running = false;
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  });
 
-  // Poll Firestore for new notification documents
-  const interval = setInterval(async () => {
-    if (!running) { clearInterval(interval); return; }
+  // Auto-reconnect signal before Vercel's 60s function limit
+  const reconnectTimer = setTimeout(() => {
+    if (!running) return;
+    send('reconnect', { reason: 'keepalive' });
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    running = false;
+    res.end();
+  }, MAX_DURATION);
 
-    // Time to reconnect — send signal so dashboard re-establishes
-    if (Date.now() - connectedAt > MAX_DURATION) {
-      send('reconnect', { reason: 'keepalive' });
-      clearInterval(interval);
-      res.end();
-      return;
-    }
+  // Use Firestore real-time listener instead of polling.
+  // onSnapshot fires instantly when a document is written — zero polling reads.
+  try {
+    const firestore = getFirestore();
+    const cutoff = Date.now() - 5000; // only care about very recent docs
 
-    try {
-      const firestore = getFirestore();
-      // Fetch notifications created in the last 10 seconds
-      const cutoff = Date.now() - 10000;
-      const snap = await firestore.collection('notifications')
-        .where('createdAtMs', '>', cutoff)
-        .orderBy('createdAtMs', 'asc')
-        .limit(10)
-        .get();
-
-      snap.forEach(doc => {
-        if (seen.has(doc.id)) return;
-        seen.add(doc.id);
-        const { event, data } = doc.data();
-        send(event || 'new-file', data || {});
-        console.log(`[notify] Pushed "${event}" to dashboard`);
+    unsubscribe = firestore.collection('notifications')
+      .where('createdAtMs', '>', cutoff)
+      .orderBy('createdAtMs', 'asc')
+      .onSnapshot(snapshot => {
+        if (!running) return;
+        snapshot.docChanges().forEach(change => {
+          if (change.type !== 'added') return;
+          const doc = change.doc;
+          if (seen.has(doc.id)) return;
+          seen.add(doc.id);
+          const { event, data } = doc.data();
+          send(event || 'new-file', data || {});
+          console.log(`[notify] Pushed "${event}" to dashboard via snapshot`);
+        });
+      }, err => {
+        // Listener error — fall back gracefully
+        console.warn('[notify] Snapshot listener error:', err.message);
       });
-    } catch (err) {
-      // Non-fatal — just skip this poll cycle
-    }
-  }, POLL_INTERVAL);
+  } catch (err) {
+    console.warn('[notify] Could not set up snapshot listener:', err.message);
+  }
 
-  // Keep connection alive with periodic pings
+  // Keep SSE connection alive with periodic pings (no Firestore reads)
   const keepalive = setInterval(() => {
     if (!running) { clearInterval(keepalive); return; }
     try { res.write(': ping\n\n'); } catch (e) { clearInterval(keepalive); }
   }, 15000);
+
+  // Clean up keepalive and reconnect timer when done
+  req.on('close', () => {
+    clearInterval(keepalive);
+    clearTimeout(reconnectTimer);
+  });
 };
 
 function getFirestore() {
