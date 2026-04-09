@@ -44,11 +44,6 @@ module.exports = async function handler(req, res) {
 };
 
 async function scanAndProcess() {
-  const mode = await db.getMode();
-  if (mode !== 'auto') {
-    console.log('[scan-now] Not in auto mode — skipping');
-    return;
-  }
 
   // No stop flag check — system always processes
 
