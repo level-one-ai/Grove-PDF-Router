@@ -137,10 +137,14 @@ async function checkForNewFiles(knownIds) {
   const allIds = {};
   allPdfs.forEach(f => { allIds[f.id] = true; });
 
+  // Batch read all file records in a single Firestore call instead of one per file.
+  // Reduces reads from N (one per PDF) to 1 regardless of how many files are in Scans.
+  const records = await batchGetRecords(allPdfs.map(f => f.id));
+
   // Filter out already-completed and actively-processing files
   const unprocessed = [];
   for (const pdf of allPdfs) {
-    const record = await db.getRecord(pdf.id);
+    const record = records[pdf.id];
     if (record && record.status === 'completed') continue;
     if (record && record.status === 'processing') continue;
     // detected and waiting are valid unprocessed states — include them
@@ -268,6 +272,35 @@ async function isAnyFileProcessing() {
   } catch (err) {
     console.warn('[auto-poll] isAnyFileProcessing check error (non-fatal):', err.message);
     return false; // fail safe — don't block scan-now if check fails
+  }
+}
+
+/**
+ * Fetch multiple Firestore records in a single batch call.
+ * Returns a map of { fileId: recordData | null }.
+ * Far cheaper than N individual getRecord() calls.
+ */
+async function batchGetRecords(fileIds) {
+  if (!fileIds.length) return {};
+  try {
+    const admin = require('firebase-admin');
+    const firestore = admin.firestore();
+    const COLLECTION = 'processedFiles';
+    const refs = fileIds.map(id => firestore.collection(COLLECTION).doc(id));
+    const docs = await firestore.getAll(...refs);
+    const result = {};
+    docs.forEach(doc => {
+      result[doc.id] = doc.exists ? doc.data() : null;
+    });
+    return result;
+  } catch (err) {
+    console.warn('[auto-poll] batchGetRecords error, falling back to individual reads:', err.message);
+    // Fall back to individual reads on error so the system keeps working
+    const result = {};
+    for (const id of fileIds) {
+      try { result[id] = await db.getRecord(id); } catch (e) { result[id] = null; }
+    }
+    return result;
   }
 }
 
