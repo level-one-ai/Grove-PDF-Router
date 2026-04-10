@@ -20,7 +20,7 @@ const db = require('../lib/firebase');
 const { graphRequest } = require('../lib/graph');
 const axios = require('axios');
 
-const POLL_INTERVAL_MS = 60000; // 60 seconds — webhook handles instant detection, this is safety net only
+const POLL_INTERVAL_MS = 30000; // 30 seconds — safety net between webhook and cron
 const MAX_RUNTIME_MS = 270000;  // 4.5 minutes — stay under Vercel's 300s limit
 
 module.exports.config = {
