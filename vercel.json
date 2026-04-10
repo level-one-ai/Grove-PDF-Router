@@ -8,6 +8,7 @@
     "api/auto-poll.js": { "maxDuration": 300 },
     "api/gdrive.js": { "maxDuration": 300 },
     "api/cron.js": { "maxDuration": 60 },
+    "api/scan-cron.js": { "maxDuration": 60 },
     "api/logs.js": { "maxDuration": 10 },
     "api/callback.js": { "maxDuration": 60 },
     "api/*.js": { "maxDuration": 60 }
@@ -16,6 +17,10 @@
     {
       "path": "/api/cron",
       "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/scan-cron",
+      "schedule": "*/5 * * * *"
     }
   ],
   "routes": [
