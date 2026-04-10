@@ -79,6 +79,31 @@ async function ensureAutoPollAlive() {
         // auto-poll responds 200 immediately so timeout is expected — treat as success
         console.log('[cron] ✅ auto-poll restart triggered (timeout expected)');
       }
+
+      // Also trigger scan-now immediately to process any files already waiting in Scans.
+      // auto-poll on first run seeds existing files — scan-now catches them right away.
+      try {
+        await axios.post(`${baseUrl}/api/scan-now`, {}, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 10000,
+        });
+        console.log('[cron] ✅ scan-now triggered to catch any waiting files');
+      } catch (err) {
+        console.log('[cron] scan-now trigger warning (non-fatal):', err.message);
+      }
+    } else {
+      // Even when auto-poll is alive, trigger scan-now once per cron run
+      // as an additional safety net to catch any files that slipped through.
+      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+      try {
+        await axios.post(`${baseUrl}/api/scan-now`, {}, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 10000,
+        });
+        console.log('[cron] ✅ scan-now triggered as hourly safety net');
+      } catch (err) {
+        console.log('[cron] scan-now safety net warning (non-fatal):', err.message);
+      }
     }
   } catch (err) {
     console.warn('[cron] auto-poll health check failed (non-fatal):', err.message);
