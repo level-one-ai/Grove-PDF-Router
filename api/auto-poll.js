@@ -79,9 +79,32 @@ async function pollLoop() {
         const newFiles = await checkForNewFiles(knownIds);
 
         if (knownIds === null) {
-          // First scan — seed the known IDs set
-          knownIds = newFiles.allIds;
-          console.log(`[auto-poll] Seeded with ${Object.keys(knownIds).length} known file(s)`);
+          // First scan — seed knownIds with ONLY completed/processing files.
+          // Unprocessed files (null status, reset, detected, waiting) are NOT seeded
+          // so they are treated as new arrivals and trigger scan-now immediately.
+          // This fixes the bug where files already in Scans when auto-poll chains
+          // were silently skipped because they got seeded as "already known".
+          knownIds = {};
+          const allIds = newFiles.allIds;
+          const unprocessedIds = {};
+          newFiles.unprocessed.forEach(f => { unprocessedIds[f.id] = true; });
+          // Seed only files that are NOT in the unprocessed list (i.e. completed/processing)
+          Object.keys(allIds).forEach(id => {
+            if (!unprocessedIds[id]) knownIds[id] = true;
+          });
+          console.log(`[auto-poll] Seeded ${Object.keys(knownIds).length} completed/processing file(s). ${newFiles.unprocessed.length} unprocessed file(s) will be treated as new.`);
+
+          // Immediately trigger scan-now for any unprocessed files found on first scan
+          if (newFiles.unprocessed.length > 0) {
+            newFiles.unprocessed.forEach(f => { knownIds[f.id] = true; });
+            const activelyProcessing = await isAnyFileProcessing();
+            if (!activelyProcessing) {
+              console.log(`[auto-poll] ${newFiles.unprocessed.length} unprocessed file(s) found on startup — triggering scan-now`);
+              await triggerScanNow();
+            } else {
+              console.log(`[auto-poll] ${newFiles.unprocessed.length} unprocessed file(s) found but a file is already processing — will be picked up after current file completes`);
+            }
+          }
         } else {
           // Subsequent scans — detect new arrivals
           const arrivals = newFiles.unprocessed.filter(f => !knownIds[f.id]);
