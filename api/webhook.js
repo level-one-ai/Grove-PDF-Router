@@ -57,6 +57,9 @@ module.exports = async function handler(req, res) {
 };
 
 async function scanAndProcess() {
+  // Ensure auto-poll is running — starts it if dead (e.g. fresh deployment)
+  ensureAutoPollRunning().catch(() => {}); // fire-and-forget, non-fatal
+
   const userId = process.env.ONEDRIVE_USER_ID;
   const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
 
@@ -79,8 +82,12 @@ async function scanAndProcess() {
   const token = await getToken();
   let newFilesDetected = [];
 
+  // Batch read all records in one Firestore call instead of one per file
+  const records = await batchGetRecords(pdfFiles.map(f => f.id));
+  logRead('webhook batch check', pdfFiles.length);
+
   for (const file of pdfFiles) {
-    const existing = await db.getRecord(file.id);
+    const existing = records[file.id];
 
     // Already completed — clean up
     if (existing && existing.status === 'completed') {
@@ -101,8 +108,6 @@ async function scanAndProcess() {
     console.log(`[webhook] New file detected: "${file.name}" (status: ${existing?.status || 'none'})`);
     newFilesDetected.push(file);
   }
-
-  logRead('webhook per-file checks', pdfFiles.length);
 
   if (newFilesDetected.length === 0) {
     console.log('[webhook] No new files to process');
@@ -175,6 +180,60 @@ async function deleteFromScans(itemId, fileName, userId, token) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * Batch read multiple Firestore records in one call.
+ * Returns { fileId: data | null }
+ */
+async function batchGetRecords(fileIds) {
+  if (!fileIds.length) return {};
+  try {
+    const admin = require('firebase-admin');
+    const firestore = admin.firestore();
+    const refs = fileIds.map(id => firestore.collection('processedFiles').doc(id));
+    const docs = await firestore.getAll(...refs);
+    const result = {};
+    docs.forEach(doc => { result[doc.id] = doc.exists ? doc.data() : null; });
+    return result;
+  } catch (err) {
+    console.warn('[webhook] batchGetRecords error, falling back:', err.message);
+    const result = {};
+    for (const id of fileIds) {
+      try { result[id] = await db.getRecord(id); } catch (e) { result[id] = null; }
+    }
+    return result;
+  }
+}
+
+/**
+ * Ensure auto-poll is running when webhook fires.
+ * auto-poll may not be running on fresh deployments until cron runs.
+ * Checking heartbeat here means any incoming file also restarts the safety net.
+ */
+async function ensureAutoPollRunning() {
+  try {
+    const admin = require('firebase-admin');
+    const firestore = admin.firestore();
+    const lockDoc = await firestore.collection('settings').doc('autoPollLock').get();
+    const STALE_MS = 2 * 60 * 1000; // 2 minutes
+    let needsStart = true;
+    if (lockDoc.exists) {
+      const heartbeat = lockDoc.data().heartbeat
+        ? new Date(lockDoc.data().heartbeat).getTime() : 0;
+      if (Date.now() - heartbeat < STALE_MS) needsStart = false;
+    }
+    if (needsStart) {
+      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+      axios.post(`${baseUrl}/api/auto-poll`, {}, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 5000,
+      }).catch(() => {});
+      console.log('[webhook] auto-poll was not running — started it');
+    }
+  } catch (err) {
+    // Non-fatal
+  }
+}
 
 async function getToken() {
   const url = `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`;
