@@ -88,14 +88,22 @@ module.exports = async function handler(req, res) {
       // Check if an active subscription already exists
       const existing = await getSubscription();
       if (existing && isActive(existing) && !req.query.force) {
-        const summary = getStatusSummary(existing);
-        return res.status(200).json({
-          success: true,
-          alreadyActive: true,
-          message: `Subscription already active. ${summary.message}. Add ?force=true to create a new one anyway.`,
-          subscriptionId: existing.subscriptionId,
-          expiresAt: existing.expiresAt,
-        });
+        // Check if the subscription was created before the changeType fix
+        // (old subscriptions only watched 'updated', missing file creation events)
+        // Force recreation if changeType field is missing or doesn't include 'created'
+        const hasCorrectChangeType = existing.changeType &&
+          existing.changeType.includes('created');
+        if (hasCorrectChangeType) {
+          const summary = getStatusSummary(existing);
+          return res.status(200).json({
+            success: true,
+            alreadyActive: true,
+            message: `Subscription already active. ${summary.message}. Add ?force=true to create a new one anyway.`,
+            subscriptionId: existing.subscriptionId,
+            expiresAt: existing.expiresAt,
+          });
+        }
+        console.log('[subscribe] Existing subscription missing created changeType — recreating');
       }
 
       const notificationUrl = process.env.WEBHOOK_NOTIFICATION_URL;
@@ -105,7 +113,8 @@ module.exports = async function handler(req, res) {
       await saveSubscription(
         subscription.id,
         subscription.expirationDateTime,
-        `${notificationUrl}/api/webhook`
+        `${notificationUrl}/api/webhook`,
+        'created,updated'
       );
 
       console.log('[subscribe] Subscription created and saved:', subscription.id);
