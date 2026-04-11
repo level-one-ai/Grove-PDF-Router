@@ -48,6 +48,9 @@ async function scanAndProcess() {
 
   // No stop flag check — system always processes
 
+  // Ensure auto-poll is running — fire-and-forget, never blocks processing
+  ensureAutoPollRunning().catch(() => {});
+
   const userId = process.env.ONEDRIVE_USER_ID;
   const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
   const token = await getToken();
@@ -410,6 +413,36 @@ async function batchGetRecords(fileIds) {
       try { result[id] = await db.getRecord(id); } catch (e) { result[id] = null; }
     }
     return result;
+  }
+}
+
+/**
+ * Ensure auto-poll is alive — starts it if the heartbeat is stale or missing.
+ * Called at the start of every scan-now invocation so the safety net
+ * is always running regardless of how scan-now was triggered.
+ */
+async function ensureAutoPollRunning() {
+  try {
+    const admin = require('firebase-admin');
+    const firestore = admin.firestore();
+    const lockDoc = await firestore.collection('settings').doc('autoPollLock').get();
+    const STALE_MS = 2 * 60 * 1000;
+    let needsStart = true;
+    if (lockDoc.exists) {
+      const heartbeat = lockDoc.data().heartbeat
+        ? new Date(lockDoc.data().heartbeat).getTime() : 0;
+      if (Date.now() - heartbeat < STALE_MS) needsStart = false;
+    }
+    if (needsStart) {
+      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+      axios.post(`${baseUrl}/api/auto-poll`, {}, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 5000,
+      }).catch(() => {});
+      console.log('[scan-now] auto-poll was not running — started it');
+    }
+  } catch (err) {
+    // Non-fatal
   }
 }
 
