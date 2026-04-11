@@ -20,7 +20,7 @@
     },
     {
       "path": "/api/scan-cron",
-      "schedule": "*/5 * * * *"
+      "schedule": "* * * * *"
     }
   ],
   "routes": [
