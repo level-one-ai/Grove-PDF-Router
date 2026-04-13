@@ -1,4 +1,3 @@
-const { logRead } = require('../lib/logRead');
 /**
  * /api/webhook
  *
@@ -84,7 +83,6 @@ async function scanAndProcess() {
 
   // Batch read all records in one Firestore call instead of one per file
   const records = await batchGetRecords(pdfFiles.map(f => f.id));
-  logRead('webhook batch check', pdfFiles.length);
 
   for (const file of pdfFiles) {
     const existing = records[file.id];
