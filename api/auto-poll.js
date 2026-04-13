@@ -1,4 +1,3 @@
-const { logRead } = require('../lib/logRead');
 /**
  * /api/auto-poll
  *
@@ -223,7 +222,6 @@ async function acquirePollLock() {
       const data = doc.data();
       const heartbeat = data.heartbeat ? new Date(data.heartbeat).getTime() : 0;
       const age = Date.now() - heartbeat;
-      logRead('auto-poll lock check', 1);
       if (age < LOCK_STALE_MS) {
         // Lock is fresh — another instance is alive
         return false;
@@ -319,7 +317,6 @@ async function batchGetRecords(fileIds) {
       result[doc.id] = doc.exists ? doc.data() : null;
     });
     // Read counter log — used by dashboard Logs panel to track Firestore usage
-    logRead('auto-poll batchGetRecords', fileIds.length);
     return result;
   } catch (err) {
     console.warn('[auto-poll] batchGetRecords error, falling back to individual reads:', err.message);
@@ -327,7 +324,6 @@ async function batchGetRecords(fileIds) {
     for (const id of fileIds) {
       try { result[id] = await db.getRecord(id); } catch (e) { result[id] = null; }
     }
-    logRead('auto-poll fallback reads', fileIds.length);
     return result;
   }
 }
