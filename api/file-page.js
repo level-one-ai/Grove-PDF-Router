@@ -1,4 +1,3 @@
-const { logRead } = require('../lib/logRead');
 /**
  * /api/file-page
  *
@@ -247,7 +246,6 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   console.log(`[file-page] ${T()} Saved to Firestore`);
 
   // Get pageStore from Firestore
-  logRead('file-page processAndFile', 1);
   const record = await db.getRecord(fileId);
   const pageStore = record?.pageStore || {};
   const tempData = pageStore[pageNumber] || pageStore[String(pageNumber)];
