@@ -108,9 +108,25 @@ async function scanAndProcess() {
       continue;
     }
 
-    // Already actively processing — leave it alone
+    // Already actively processing — but check if it's been stuck too long
     if (existing && existing.status === 'processing') {
-      console.log(`[scan-now] "${file.name}" already processing — skipping`);
+      // If a file has been 'processing' for more than 10 minutes something went wrong
+      // (normal processing takes 1-5 minutes). Reset it so it gets picked up again.
+      const STUCK_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+      const updatedAt = existing.updatedAt?.toMillis?.() || existing.updatedAt?._seconds * 1000 || 0;
+      const createdAt = existing.createdAt?.toMillis?.() || existing.createdAt?._seconds * 1000 || 0;
+      const lastActivity = Math.max(updatedAt, createdAt);
+      const stuckFor = Date.now() - lastActivity;
+      if (lastActivity > 0 && stuckFor > STUCK_THRESHOLD_MS) {
+        console.log(`[scan-now] "${file.name}" stuck in processing for ${Math.round(stuckFor / 60000)}min — resetting`);
+        await db.updateRecord(file.id, {
+          status: 'reset',
+          error: `Auto-reset after being stuck in processing for ${Math.round(stuckFor / 60000)} minutes`,
+        });
+        newFiles.push({ file, existing: { ...existing, status: 'reset' }, paused: false });
+      } else {
+        console.log(`[scan-now] "${file.name}" already processing — skipping`);
+      }
       continue;
     }
 
