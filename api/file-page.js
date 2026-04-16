@@ -151,7 +151,7 @@ module.exports = async function handler(req, res) {
     } catch(e) { /* non-fatal */ }
 
     // Dispatch next page or mark complete — non-order pages must NOT stop the chain
-    await dispatchNextOrComplete(fileId, pageNumber, totalPages, typeSlug);
+    await dispatchNextOrComplete(fileId, pageNumber, totalPages, record?.originalFileName);
 
     // Respond 200 AFTER all work — Make.com expects 200
     return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason, nonOrderFileName });
@@ -190,7 +190,7 @@ module.exports = async function handler(req, res) {
  * Dispatch the next page to Make.com, or mark the file as complete if this was the last page.
  * Used after non-order skips and errors to keep the chain alive.
  */
-async function dispatchNextOrComplete(fileId, pageNumber, totalPages) {
+async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName) {
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
     console.log(`[file-page] Dispatching next page ${nextPage} after page ${pageNumber}`);
@@ -370,9 +370,13 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     console.log(`[file-page] ${T()} Waiting for page ${nextPage} in Temp (onSnapshot — 0 poll reads)...`);
     const nextTempData = await waitForTempPage(fileId, nextPage, 120000);
     if (nextTempData) {
-      const rec = await db.getRecord(fileId);
+      // If originalFileName not passed by caller, read from Firestore once
+      if (!originalFileName) {
+        const r = await db.getRecord(fileId);
+        originalFileName = r?.originalFileName;
+      }
       await Promise.all([
-        dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId),
+        dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, originalFileName, totalPages, nextTempData.tempItemId),
         db.updateRecord(fileId, { currentDispatchPage: nextPage }),
       ]);
       console.log(`[file-page] ${T()} Dispatched page ${nextPage}/${totalPages}`);
