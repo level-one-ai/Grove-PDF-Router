@@ -162,6 +162,18 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 .gd-send-btn{background:none;border:1px solid #22c55e44;color:var(--gn);border-radius:5px;padding:3px 8px;font-size:10px;cursor:pointer;font-weight:600}
 .gd-send-btn:hover{background:#1a2f1a}
 .gd-send-btn:disabled{opacity:0.5;cursor:not-allowed}
+/* RECENTLY PROCESSED HISTORY */
+.hist-panel{border-top:1px solid var(--bo);flex-shrink:0;max-height:220px;overflow-y:auto}
+.hist-panel::-webkit-scrollbar{width:4px}.hist-panel::-webkit-scrollbar-thumb{background:var(--bo);border-radius:2px}
+.hist-head{padding:6px 10px 4px;font-size:11px;font-weight:600;color:var(--mu);letter-spacing:.04em;display:flex;justify-content:space-between;align-items:center}
+.hist-head span{color:var(--gn);font-size:10px}
+.histitem{display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid var(--bo)10;cursor:default}
+.histitem:last-child{border-bottom:none}
+.hist-ic{font-size:13px;flex-shrink:0;color:#4ade80}
+.hist-name{font-size:11px;font-weight:600;color:var(--tx);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist-meta{font-size:10px;color:var(--mu);white-space:nowrap}
+.hist-pages{font-size:10px;color:#4ade8066;margin-left:2px}
+
 /* PROCESSED ITEM DROPDOWN */
 .proc-drop{display:none;margin-top:7px;padding-top:7px;border-top:1px solid var(--bo)}
 .proc-drop.open{display:block}
@@ -265,6 +277,10 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
     <div class="flist" id="scan-list">
       <div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading...</div></div>
     </div>
+    <div class="hist-panel" id="hist-panel" style="display:none">
+      <div class="hist-head">&#9989; Recently Processed <span id="hist-count"></span></div>
+      <div id="hist-list"></div>
+    </div>
   </div>
 
   <!-- PROCESSED COLUMN -->
@@ -358,6 +374,10 @@ async function loadStatus() {
     STATUS_CACHE = d.records;
     STATUS_LOADED = true;
     console.log('[dashboard] Status cache loaded:', STATUS_CACHE.length, 'records');
+    loadHistory();
+    // If a file is currently showing in-progress steps but Firestore says it's
+    // completed (autonomous processing finished), force all steps to green
+    checkForAutonomousCompletion();
   }
   return STATUS_CACHE;
 }
@@ -970,7 +990,7 @@ function finRun(success) {
     // Hold result visible for 5s then fully reset in both auto and human mode
     setTimeout(function(){
       if (SF && AUTO_KNOWN_IDS) delete AUTO_KNOWN_IDS[SF.id];
-      loadStatus().then(function(){ loadScans(); loadProcessed(); });
+      loadStatus().then(function(){ loadScans(); loadProcessed(); loadHistory(); });
       document.querySelectorAll('.fi').forEach(function(x){ x.classList.remove('sel'); });
       SF = null;
       $('seldet').style.display = 'none';
@@ -1159,6 +1179,67 @@ async function sendToGDrive(btn) {
   }
 }
 
+// ── RECENTLY PROCESSED HISTORY ──
+function loadHistory() {
+  if (!STATUS_LOADED || !STATUS_CACHE.length) return;
+  var completed = STATUS_CACHE
+    .filter(function(r){ return r.status === 'completed' && r.completedAt; })
+    .sort(function(a,b){ return new Date(b.completedAt) - new Date(a.completedAt); })
+    .slice(0, 20); // show last 20
+
+  var panel = $('hist-panel');
+  var list = $('hist-list');
+  var countEl = $('hist-count');
+
+  if (!completed.length) {
+    panel.style.display = 'none';
+    return;
+  }
+
+  panel.style.display = '';
+  countEl.textContent = completed.length + ' file' + (completed.length===1?'':'s');
+
+  var now = new Date();
+  list.innerHTML = completed.map(function(r) {
+    var name = esc(r.originalFileName || r.fileId || 'Unknown');
+    var customer = r.customerName ? esc(r.customerName) + (r.ref ? ' / ' + esc(r.ref) : '') : '';
+    var pages = r.totalPages ? r.totalPages + 'p' : '';
+    var when = '';
+    if (r.completedAt) {
+      var d = new Date(r.completedAt);
+      var diffMs = now - d;
+      var diffMins = Math.floor(diffMs / 60000);
+      var diffHours = Math.floor(diffMs / 3600000);
+      if (diffMins < 1) when = 'just now';
+      else if (diffMins < 60) when = diffMins + 'm ago';
+      else if (diffHours < 24) when = diffHours + 'h ago';
+      else when = d.toLocaleDateString('en-GB', {day:'numeric',month:'short'});
+    }
+    return '<div class="histitem">'
+      + '<div class="hist-ic">\u2705</div>'
+      + '<div class="hist-name" title="' + name + '">' + name + '</div>'
+      + (customer ? '<div class="hist-meta" title="' + customer + '">' + customer + '</div>' : '')
+      + (pages ? '<div class="hist-pages">' + pages + '</div>' : '')
+      + '<div class="hist-meta" style="margin-left:4px">' + when + '</div>'
+      + '</div>';
+  }).join('');
+}
+
+// Detects when a file was completed autonomously (without dashboard test-run SSE stream)
+// and forces the progress steps to green so they don't stay stuck on orange.
+function checkForAutonomousCompletion() {
+  if (!SF || !IR) return; // No file selected or not in a run
+  var rec = STATUS_CACHE.find(function(r){ return r.fileId === SF.id && r.status === 'completed'; });
+  if (!rec) return;
+  // File is completed in Firestore but steps are still showing — force green
+  console.log('[dashboard] Autonomous completion detected for', SF.id);
+  var pages = rec.totalPages || '?';
+  updStep(4, 'All ' + pages + ' page(s) sent to Make.com \u2713', 'done');
+  updStep(5, 'All ' + pages + ' page(s) extracted by Claude \u2713', 'done');
+  updStep(6, 'All ' + pages + ' page(s) filed \u2713', 'done');
+  finRun(true);
+}
+
 // ── LOGS PANEL ──
 var LOGS_OPEN = false;
 
@@ -1284,6 +1365,8 @@ loadSub();
 openNotifyStream();
 // Refresh status cache every 60 seconds
 setInterval(loadStatus, 300000); // 5 mins — status cache refreshed on demand by SSE events
+// When a file is being processed, poll status every 30s to catch autonomous completion
+setInterval(function(){ if (IR) loadStatus(); }, 30000);
 setInterval(loadWaiting, 120000); // 2 mins — queue rarely changes without a notify event
 // Stop state cleared on load — no need to poll it
 </script>
