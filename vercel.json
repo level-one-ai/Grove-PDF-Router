@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "fluid": true,
   "functions": {
     "api/test-run.js": { "maxDuration": 300 },
     "api/file-page.js": { "maxDuration": 300 },
@@ -19,7 +20,7 @@
       "schedule": "0 * * * *"
     },
     {
-      "path": "/api/scan-cron",
+      "path": "/api/scan-now",
       "schedule": "* * * * *"
     }
   ],
