@@ -119,8 +119,9 @@ module.exports = async function handler(req, res) {
 
     // Download the page from Temp and store in Non-Order Documents with new name
     let nonOrderFileName = null;
+    let record = null; // hoisted so it's accessible after the try block
     try {
-      const record = await db.getRecord(fileId);
+      record = await db.getRecord(fileId);
       const ps = record?.pageStore || {};
       const td = ps[pageNumber] || ps[String(pageNumber)];
       if (td?.tempItemId) {
