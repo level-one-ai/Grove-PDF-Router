@@ -49,12 +49,16 @@ module.exports.config = {
 };
 
 module.exports = async function handler(req, res) {
-  if (req.method !== 'POST') {
+  // Accept both GET (from Vercel cron) and POST (from webhook, auto-poll, file-page)
+  if (req.method !== 'POST' && req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Return immediately — processing happens async
-  res.status(200).json({ status: 'scanning', message: 'Scan started — check Vercel logs for progress' });
+  // Respond immediately so the caller is not blocked.
+  // With Fluid Compute enabled (fluid: true in vercel.json), Vercel guarantees
+  // that code after res.send() continues running until completion or maxDuration.
+  // Without Fluid Compute this would be unreliable — hence the vercel.json change.
+  res.status(200).json({ status: 'scanning', message: 'Scan started' });
 
   try {
     await scanAndProcess();
