@@ -751,109 +751,82 @@ async function loadProcessed() {
   $('proc-list').innerHTML = '<div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading...</div></div>';
   $('proc-count').textContent = '—';
 
-  // Use cached status data — Firestore records are the source of truth for GD display
   if (!STATUS_LOADED) await loadStatus();
 
-  // Fetch OneDrive Processed files in parallel for OD links
-  var odPromise = api('/api/scan-files?folder=Processed');
-
-  // Get all completed records from STATUS_CACHE (includes GD URLs)
+  // Build per-page list from STATUS_CACHE
+  // Each completed record contributes one row per page (pageFiles array from status.js)
   var completed = STATUS_CACHE
     .filter(function(r){ return r.status === 'completed'; })
     .sort(function(a,b){ return new Date(b.completedAt||0) - new Date(a.completedAt||0); });
 
-  // Also fetch OneDrive files for OD web links
-  var odData = await odPromise;
-  var odByName = {};
-  if (odData && odData.files) {
-    odData.files.forEach(function(f){
-      odByName[f.name] = f;
-      // also index by base name stripped of page suffix
-      var base = f.name.replace(/[-_]\d+\.pdf$/i,'').replace(/\.pdf$/i,'').toLowerCase();
-      if (!odByName[base]) odByName[base] = f;
-    });
+  if (!completed.length) {
+    $('proc-count').textContent = '0 files';
+    $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128100;</div><div class="ti">No files yet</div></div>';
+    return;
   }
 
-  // Show completed Firestore records — these always have GD info if GD succeeded
-  // Fall back to OD file list if no Firestore records yet
-  var items = completed;
-  if (!items.length) {
-    // No Firestore records — show raw OD files
-    if (!odData || !odData.files || !odData.files.length) {
-      $('proc-count').textContent = '0 files';
-      $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128100;</div><div class="ti">No files yet</div></div>';
-      return;
+  // Flatten: one row per page file across all completed records
+  var rows = [];
+  completed.forEach(function(rec) {
+    var pages = rec.pageFiles && rec.pageFiles.length ? rec.pageFiles : null;
+    if (pages) {
+      pages.forEach(function(pg) {
+        rows.push({ rec: rec, pg: pg });
+      });
+    } else {
+      // Fallback: no pageFiles yet — show one row per renamedFile or original name
+      var names = rec.renamedFiles && rec.renamedFiles.length ? rec.renamedFiles : [rec.originalFileName || rec.fileId];
+      names.forEach(function(name) {
+        rows.push({ rec: rec, pg: { finalFileName: name, customerName: rec.customerName, ref: rec.ref, supplier: rec.supplier, googleDriveUrl: rec.googleDriveFolderUrl } });
+      });
     }
-    items = odData.files.map(function(f){ return { _odFile: f, originalFileName: f.name }; });
-  }
+  });
 
-  $('proc-count').textContent = items.length + ' file' + (items.length===1?'':'s');
-  $('proc-list').innerHTML = items.map(function(rec, idx) {
-    // If this is a raw OD file (no Firestore record), wrap it
-    var f = rec._odFile || null;
-    if (!f) {
-      // Find matching OD file for the web link
-      (rec.renamedFiles || []).forEach(function(fname){ if (!f && odByName[fname]) f = odByName[fname]; });
-      if (!f) {
-        var base = (rec.originalFileName||'').toLowerCase();
-        if (odByName[base]) f = odByName[base];
-      }
-    }
-    var customer = rec.customerName || '';
-    var ref = rec.ref || '';
-    var supplier = rec.supplier || '';
-    var gdUrl = rec.googleDriveFolderUrl || '';
-    var odUrl = (f && f.webUrl) || '';
+  $('proc-count').textContent = rows.length + ' page' + (rows.length===1?'':'s');
+
+  $('proc-list').innerHTML = rows.map(function(row, idx) {
+    var rec = row.rec;
+    var pg = row.pg;
+    var displayName = pg.finalFileName || pg.nonOrderFileName || 'Unknown';
+    var customer = pg.customerName || rec.customerName || '';
+    var ref = pg.ref || rec.ref || '';
+    var supplier = pg.supplier || rec.supplier || '';
+    var gdUrl = pg.googleDriveUrl || rec.googleDriveFolderUrl || '';
     var folderLabel = customer ? (customer + (ref ? ' / ' + ref : '')) : '';
 
-    // Folder tags
+    // Tags
     var tags = '';
-    if (gdUrl) {
-      tags += '<span class="folder-tag gd">&#128230; Google Drive</span> ';
-    } else if (rec.fileId) {
-      // Has Firestore record but no GD URL — show pending
-      tags += '<span class="folder-tag" style="background:#1a1a00;color:#eab308;border:1px solid #eab30833">&#9203; GD Pending</span> ';
+    if (pg.skipped) {
+      tags += '<span class="folder-tag" style="background:#1a001a;color:#a855f7;border:1px solid #a855f733">&#128193; Non-Order</span>';
+    } else if (gdUrl) {
+      tags += '<span class="folder-tag gd">&#128230; GD</span>';
+    } else {
+      tags += '<span class="folder-tag" style="background:#1a1a00;color:#eab308;border:1px solid #eab30833">&#9203; GD Pending</span>';
     }
-    if (odUrl) tags += '<span class="folder-tag od">&#9729;&#65039; OneDrive</span>';
 
-    // Dropdown content
+    // Dropdown
     var dropId = 'pdrop-' + idx;
     var dropHtml = '<div class="proc-drop" id="' + dropId + '">';
     if (supplier) dropHtml += '<div class="pd-row"><div class="pd-lbl">Supplier</div><div class="pd-val">' + esc(supplier) + '</div></div>';
-    if (folderLabel) dropHtml += '<div class="pd-row"><div class="pd-lbl">Folder</div><div class="pd-val" title="' + esc(folderLabel) + '">' + esc(folderLabel) + '</div></div>';
+    if (folderLabel) dropHtml += '<div class="pd-row"><div class="pd-lbl">Folder</div><div class="pd-val">' + esc(folderLabel) + '</div></div>';
     if (gdUrl) {
       dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><a class="pd-link" href="' + esc(gdUrl) + '" target="_blank" onclick="event.stopPropagation()">Open folder &#8599;</a></div>';
-    } else if (rec) {
+    } else if (!pg.skipped && rec.fileId) {
       var sendBtnId = 'gdsend-' + idx;
-      var sendFname = rec.originalFileName || (f && f.name) || '';
       dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
         + '<button class="gd-send-btn" id="' + sendBtnId + '" '
-        + 'data-fname="' + esc(sendFname) + '" data-fid="' + esc(rec.fileId || '') + '" '
-        + 'onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
-    } else if (f) {
-      // OD file only — no Firestore record
-      var sendBtnId2 = 'gdsend-' + idx;
-      dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
-        + '<button class="gd-send-btn" id="' + sendBtnId2 + '" '
-        + 'data-fname="' + esc(f.name || '') + '" data-fid="" '
+        + 'data-fname="' + esc(rec.originalFileName || '') + '" data-fid="' + esc(rec.fileId || '') + '" '
         + 'onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
     }
-    if (odUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
-    if (rec.totalPages) dropHtml += '<div class="pd-row"><div class="pd-lbl">Pages</div><div class="pd-val">' + rec.totalPages + '</div></div>';
+    dropHtml += '<div class="pd-row"><div class="pd-lbl">Original scan</div><div class="pd-val" style="font-size:10px;opacity:.7">' + esc(rec.originalFileName || '') + '</div></div>';
     if (rec.completedAt) dropHtml += '<div class="pd-row"><div class="pd-lbl">Processed</div><div class="pd-val">' + fdate(rec.completedAt) + '</div></div>';
-
     dropHtml += '</div>';
-
-    // Display name: Firestore originalFileName or OD file name
-    var displayName = rec.originalFileName || (f && f.name) || 'Unknown';
-    var metaStr = (f && f.size) ? fsize(f.size) + (rec.totalPages ? ' \u00b7 ' + rec.totalPages + 'p' : '')
-                                 : (rec.totalPages ? rec.totalPages + ' page(s)' : '');
 
     return '<div class="fi done-f" data-dropid="' + dropId + '" onclick="toggleProcDrop(this.dataset.dropid,this)" style="flex-direction:column;align-items:stretch;cursor:pointer">'
       + '<div style="display:flex;align-items:center;gap:8px">'
-      + '<div class="fic">&#128196;</div>'
-      + '<div class="fin"><div class="fnm">' + esc(displayName) + '</div>'
-      + (metaStr ? '<div class="fmeta">' + metaStr + '</div>' : '')
+      + '<div class="fic" style="font-size:13px">&#128196;</div>'
+      + '<div class="fin"><div class="fnm" style="font-size:12px">' + esc(displayName) + '</div>'
+      + (folderLabel ? '<div class="fmeta">' + esc(folderLabel) + '</div>' : '')
       + '</div>'
       + '<div class="fac" style="flex-direction:column;align-items:flex-end;gap:2px">' + tags + '</div>'
       + '</div>'

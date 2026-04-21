@@ -204,33 +204,12 @@ async function batchGetRecords(fileIds) {
 }
 
 /**
- * Ensure auto-poll is running when webhook fires.
- * auto-poll may not be running on fresh deployments until cron runs.
- * Checking heartbeat here means any incoming file also restarts the safety net.
+ * ensureAutoPollRunning — RETIRED (no-op stub)
+ * auto-poll has been retired. Detection is handled by Make.com Watch Files.
+ * This stub prevents errors from any call sites that still reference this function.
  */
 async function ensureAutoPollRunning() {
-  try {
-    const admin = require('firebase-admin');
-    const firestore = admin.firestore();
-    const lockDoc = await firestore.collection('settings').doc('autoPollLock').get();
-    const STALE_MS = 2 * 60 * 1000; // 2 minutes
-    let needsStart = true;
-    if (lockDoc.exists) {
-      const heartbeat = lockDoc.data().heartbeat
-        ? new Date(lockDoc.data().heartbeat).getTime() : 0;
-      if (Date.now() - heartbeat < STALE_MS) needsStart = false;
-    }
-    if (needsStart) {
-      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-      axios.post(`${baseUrl}/api/auto-poll`, {}, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 5000,
-      }).catch(() => {});
-      console.log('[webhook] auto-poll was not running — started it');
-    }
-  } catch (err) {
-    // Non-fatal
-  }
+  // no-op — auto-poll retired, Make.com handles detection
 }
 
 async function getToken() {

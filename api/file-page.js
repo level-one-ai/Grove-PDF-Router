@@ -152,7 +152,7 @@ module.exports = async function handler(req, res) {
     } catch(e) { /* non-fatal */ }
 
     // Dispatch next page or mark complete — non-order pages must NOT stop the chain
-    await dispatchNextOrComplete(fileId, pageNumber, totalPages, record?.originalFileName);
+    await dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName);
 
     // Respond 200 AFTER all work — Make.com expects 200
     return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason, nonOrderFileName });
@@ -198,9 +198,13 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
     try {
       const nextTempData = await waitForTempPage(fileId, nextPage, 120000);
       if (nextTempData) {
-        const rec = await db.getRecord(fileId);
+        // originalFileName passed by caller — no Firestore read needed here
+        if (!originalFileName) {
+          const r = await db.getRecord(fileId);
+          originalFileName = r?.originalFileName;
+        }
         await Promise.all([
-          dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, rec.originalFileName, totalPages, nextTempData.tempItemId),
+          dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, originalFileName, totalPages, nextTempData.tempItemId),
           db.updateRecord(fileId, { currentDispatchPage: nextPage }),
         ]);
         console.log(`[file-page] Dispatched page ${nextPage}/${totalPages}`);
@@ -246,8 +250,9 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   });
   console.log(`[file-page] ${T()} Saved to Firestore`);
 
-  // Get pageStore from Firestore
+  // Get pageStore from Firestore — single read, extract everything we need from it
   const record = await db.getRecord(fileId);
+  const originalFileName = record?.originalFileName || fileId;
   const pageStore = record?.pageStore || {};
   const tempData = pageStore[pageNumber] || pageStore[String(pageNumber)];
   console.log(`[file-page] ${T()} pageStore keys: [${Object.keys(pageStore).join(',')}]`);
@@ -353,9 +358,9 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
         const newFileArrived = await checkForNewPriorityFile(fileId);
         if (newFileArrived) {
           console.log(`[file-page] ${T()} NEW FILE DETECTED — pausing old file after page ${pageNumber}, will resume from page ${nextPage}`);
-          const rec = await db.getRecord(fileId);
+          // originalFileName already available from processAndFile scope — no extra read needed
           await Promise.all([
-            db.setPausedFile(fileId, nextPage, totalPages, rec.originalFileName),
+            db.setPausedFile(fileId, nextPage, totalPages, originalFileName),
             db.updateRecord(fileId, { status: 'paused', pausedAtPage: pageNumber }),
           ]);
           // Trigger scan-now to pick up the new file immediately
