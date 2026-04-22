@@ -246,18 +246,106 @@ async function handleFile(req, res) {
 
   try {
     const token = await getToken();
-    const fileBuffer = await downloadFromProcessed(fileName, token);
-    if (!fileBuffer) {
-      return res.status(404).json({ error: `File "${fileName}" not found in OneDrive Processed` });
+
+    // Load the Firestore record — we need claudeJson and the renamed page filenames.
+    // The dashboard sends the ORIGINAL scan name as fileName, but the files in
+    // OneDrive Processed are the RENAMED files (e.g. "Graeme Markham-2026-04-22_01.pdf").
+    let record = null;
+    if (fileId) {
+      record = await db.getRecord(fileId).catch(() => null);
     }
 
-    let claudeJson = null;
-    if (fileId) {
-      const record = await db.getRecord(fileId).catch(() => null);
-      if (record?.pages) {
-        const pageData = Object.values(record.pages).find(p => p.claudeJson);
-        if (pageData) claudeJson = pageData.claudeJson;
+    // Build the list of pages to file from the Firestore record
+    const pageEntries = record?.pages
+      ? Object.entries(record.pages)
+          .sort((a, b) => parseInt(a[0]) - parseInt(b[0]))
+          .filter(([, pd]) => pd.finalFileName && pd.claudeJson && !pd.googleDrive?.folderUrl)
+      : [];
+
+    // If we have page records with renamed filenames, use those
+    if (pageEntries.length > 0) {
+      let topGdResult = null;
+      let uploadedFileUrl = null;
+
+      for (const [pageNum, pageData] of pageEntries) {
+        const pageBuffer = await downloadFromProcessed(pageData.finalFileName, token);
+        if (!pageBuffer) {
+          console.warn(`[gdrive] Could not download "${pageData.finalFileName}" from Processed`);
+          continue;
+        }
+
+        const customerFolderName = getCustomerFolderName(pageData.claudeJson);
+        const refFolderName = getRefFolder(pageData.claudeJson);
+        const folderIsCompany = isCompanyName(pageData.claudeJson);
+
+        console.log(`[gdrive] Filing page ${pageNum}: "${pageData.finalFileName}" → "${customerFolderName}/${refFolderName}"`);
+
+        const gdResult = await fileDocuments(
+          customerFolderName, refFolderName,
+          [{ pageNumber: parseInt(pageNum), finalFileName: pageData.finalFileName, buffer: pageBuffer }],
+          folderIsCompany
+        );
+
+        topGdResult = gdResult;
+        const uploadedFile = gdResult.uploadedFiles?.[0];
+        if (uploadedFile?.webViewLink) uploadedFileUrl = uploadedFile.webViewLink;
+
+        // Update per-page Google Drive result in Firestore
+        await db.updateRecord(fileId, {
+          [`pages.${pageNum}.googleDrive`]: {
+            folderId: gdResult.refFolderId,
+            folderUrl: gdResult.refFolderUrl,
+            fileUrl: uploadedFile?.webViewLink || null,
+          },
+        }).catch(e => console.warn('[gdrive] Page Firestore update failed:', e.message));
       }
+
+      if (!topGdResult) {
+        return res.status(404).json({ error: `Could not download any renamed files from OneDrive Processed for "${fileName}"` });
+      }
+
+      // Update top-level record
+      await db.updateRecord(fileId, {
+        googleDriveFolderUrl: topGdResult.refFolderUrl,
+        googleDriveFolderId: topGdResult.refFolderId,
+        googleDriveCustomerFolderUrl: topGdResult.customerFolderUrl || null,
+      }).catch(e => console.warn('[gdrive] Firestore update failed:', e.message));
+
+      console.log(`[gdrive] ✅ Filed "${fileName}" (${pageEntries.length} page(s))`);
+      return res.status(200).json({
+        success: true,
+        gdFolderUrl: topGdResult.refFolderUrl,
+        gdFileUrl: uploadedFileUrl || null,
+        folder: topGdResult.refFolderUrl,
+        fileName,
+      });
+    }
+
+    // Fallback: no Firestore page records — try downloading the fileName directly
+    // (handles edge cases where record is missing but file was manually renamed)
+    const tryNames = [
+      fileName,
+      fileName.endsWith('.pdf') ? fileName : fileName + '.pdf',
+    ];
+
+    let fileBuffer = null;
+    let usedName = fileName;
+    for (const name of tryNames) {
+      fileBuffer = await downloadFromProcessed(name, token);
+      if (fileBuffer) { usedName = name; break; }
+    }
+
+    if (!fileBuffer) {
+      return res.status(404).json({
+        error: `File "${fileName}" not found in OneDrive Processed. The dashboard sends the original scan name — ensure the file has been processed and renamed first, or check the Processed folder for the correct filename.`,
+      });
+    }
+
+    // No claudeJson available — parse folder/ref from filename
+    let claudeJson = null;
+    if (record?.pages) {
+      const pageData = Object.values(record.pages).find(p => p.claudeJson);
+      if (pageData) claudeJson = pageData.claudeJson;
     }
 
     let customerFolderName, refFolderName, folderIsCompany;
@@ -266,21 +354,21 @@ async function handleFile(req, res) {
       refFolderName = getRefFolder(claudeJson);
       folderIsCompany = isCompanyName(claudeJson);
     } else {
-      const nameNoExt = fileName.replace(/\.pdf$/i, '').replace(/_\d+$/, '');
+      const nameNoExt = usedName.replace(/\.pdf$/i, '').replace(/_\d+$/, '');
       const dashIdx = nameNoExt.lastIndexOf('-');
       customerFolderName = dashIdx > 0 ? nameNoExt.slice(0, dashIdx).trim() : nameNoExt;
       refFolderName = dashIdx > 0 ? nameNoExt.slice(dashIdx + 1).trim() : 'unknown-ref';
       folderIsCompany = !customerFolderName.includes(' ') || customerFolderName === customerFolderName.toUpperCase();
     }
 
-    const pageMatch = fileName.match(/_(\d+)\.pdf$/i);
+    const pageMatch = usedName.match(/_(\d+)\.pdf$/i);
     const pageNumber = pageMatch ? parseInt(pageMatch[1]) : 1;
 
-    console.log(`[gdrive] Filing "${fileName}" → "${customerFolderName}/${refFolderName}"`);
+    console.log(`[gdrive] Filing "${usedName}" → "${customerFolderName}/${refFolderName}"`);
 
     const gdResult = await fileDocuments(
       customerFolderName, refFolderName,
-      [{ pageNumber, finalFileName: fileName, buffer: fileBuffer }],
+      [{ pageNumber, finalFileName: usedName, buffer: fileBuffer }],
       folderIsCompany
     );
 
@@ -294,13 +382,13 @@ async function handleFile(req, res) {
       }).catch(e => console.warn('[gdrive] Firestore update failed:', e.message));
     }
 
-    console.log(`[gdrive] ✅ Filed "${fileName}"`);
+    console.log(`[gdrive] ✅ Filed "${usedName}"`);
     return res.status(200).json({
       success: true,
       gdFolderUrl: gdResult.refFolderUrl,
       gdFileUrl: uploadedFile?.webViewLink || null,
       folder: `${customerFolderName}/${refFolderName}`,
-      fileName,
+      fileName: usedName,
     });
 
   } catch (err) {
