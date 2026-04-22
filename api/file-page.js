@@ -26,16 +26,94 @@ const axios = require('axios');
 const TEMP_FOLDER = 'Grove Group Scotland/Grove Bedding/Scans/Temp';
 
 module.exports.config = {
-  api: { bodyParser: { sizeLimit: '10mb' } },
+  api: { bodyParser: false, sizeLimit: '10mb' },
   maxDuration: 300,
 };
+
+// Resilient raw body parser — handles malformed JSON from Make.com.
+// Make.com's HTTP module embeds product_selection (a JSON array) as a raw string
+// value inside the outer JSON body. If product_selection items contain literal
+// newlines (from OCR text), the outer JSON becomes invalid and Vercel's built-in
+// body parser rejects the entire request before our code runs.
+// By parsing the body ourselves we can sanitise it first.
+async function parseBody(req) {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.on('data', chunk => { raw += chunk.toString(); });
+    req.on('end', () => {
+      // First try: parse as-is
+      try {
+        resolve(JSON.parse(raw));
+        return;
+      } catch (_) {}
+      // Second try: strip literal control characters (newlines, tabs etc.) that
+      // are invalid inside JSON string values, then retry
+      try {
+        const cleaned = raw.replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, ' ')
+                           .replace(/\n/g, ' ')
+                           .replace(/\r/g, ' ');
+        resolve(JSON.parse(cleaned));
+        return;
+      } catch (_) {}
+      // Third try: remove the product_selection field entirely (it's not used
+      // by file-page — buildFromFlatFields sets product_selection: [] anyway)
+      try {
+        const stripped = raw.replace(/"product_selection"\s*:\s*"[^"\\]*(?:\\.[^"\\]*)*"\s*,?\s*/g, '');
+        const cleaned2 = stripped.replace(/[\x00-\x1F\x7F]/g, ' ');
+        resolve(JSON.parse(cleaned2));
+        return;
+      } catch (_) {}
+      // Final fallback: extract key fields with regex so we can still process
+      console.warn('[file-page] JSON body unparseable — using regex field extraction');
+      const get = (key) => {
+        const m = raw.match(new RegExp(`"${key}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"`));
+        return m ? m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').trim() : '';
+      };
+      // product_selection may be a quoted JSON string — extract it and pass as-is
+      // buildFromFlatFields will parse it safely
+      const getProdSelection = () => {
+        const m = raw.match(/"product_selection"\s*:\s*"([\s\S]*?)(?<!\\)"\s*[,}]/);
+        if (!m) return '';
+        return m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').replace(/[\x00-\x1F\x7F]/g, ' ').trim();
+      };
+      resolve({
+        fileId: get('fileId'),
+        pageNumber: get('pageNumber'),
+        totalPages: get('totalPages'),
+        secret: get('secret'),
+        document_type: get('document_type'),
+        title: get('title'),
+        etd: get('etd'),
+        ref: get('ref'),
+        inv_no: get('inv_no'),
+        customer_po_no: get('customer_po_no'),
+        company_name: get('company_name'),
+        customer_name: get('customer_name'),
+        street: get('street'),
+        city: get('city'),
+        region: get('region'),
+        postcode: get('postcode'),
+        country: get('country'),
+        phone: get('phone'),
+        mobile: get('mobile'),
+        ship_to_name: get('ship_to_name'),
+        ship_to_street: get('ship_to_street'),
+        ship_to_city: get('ship_to_city'),
+        ship_to_postcode: get('ship_to_postcode'),
+        handwritten_notes: get('handwritten_notes'),
+        product_selection: getProdSelection(),
+      });
+    });
+    req.on('error', () => resolve({}));
+  });
+}
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const body = req.body || {};
+  const body = await parseBody(req);
   console.log('[file-page] Received keys:', Object.keys(body));
   console.log('[file-page] fileId:', body.fileId, '| page:', body.pageNumber, '| total:', body.totalPages);
 
@@ -598,6 +676,39 @@ function buildFromFlatFields(body) {
     handwritten = { notes: s(body.handwritten_notes) };
   }
 
+  // Parse product_selection — Make.com sends this as a toString() of the JSON array.
+  // After the extractor fix, items no longer contain newlines, so the string is
+  // valid JSON. Handle all the formats Make.com may produce:
+  //   - Already an array (if body parser succeeded): use directly
+  //   - A JSON string of a single object: wrap in array then parse
+  //   - A JSON string of an array: parse directly
+  //   - Anything else: return empty array
+  let product_selection = [];
+  const rawProds = body.product_selection;
+  if (Array.isArray(rawProds)) {
+    // Already parsed as array by body parser
+    product_selection = rawProds.map(p => ({
+      item: s(p.item || ''),
+      options: s(p.options || ''),
+      qty: s(p.qty || ''),
+    }));
+  } else if (typeof rawProds === 'string' && rawProds.trim()) {
+    try {
+      // Strip any remaining control chars then parse
+      const cleaned = rawProds.replace(/[\x00-\x1F\x7F]/g, ' ');
+      let parsed = JSON.parse(cleaned);
+      if (!Array.isArray(parsed)) parsed = [parsed];
+      product_selection = parsed.map(p => ({
+        item: s(p.item || ''),
+        options: s(p.options || ''),
+        qty: s(p.qty || ''),
+      }));
+    } catch (_) {
+      // Could not parse — log and leave as empty array
+      console.warn('[file-page] Could not parse product_selection:', rawProds.slice(0, 100));
+    }
+  }
+
   return {
     document: {
       header: {
@@ -625,7 +736,7 @@ function buildFromFlatFields(body) {
         address: { street: '', city: '', region: '', postcode: '', country: '' },
       },
       handwritten,
-      product_selection: [],
+      product_selection,
     }
   };
 }
