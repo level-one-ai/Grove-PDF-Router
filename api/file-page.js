@@ -196,20 +196,36 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
   if (nextPage <= totalPages) {
     console.log(`[file-page] Dispatching next page ${nextPage} after page ${pageNumber}`);
     try {
-      const nextTempData = await waitForTempPage(fileId, nextPage, 120000);
-      if (nextTempData) {
-        // originalFileName passed by caller — no Firestore read needed here
-        if (!originalFileName) {
-          const r = await db.getRecord(fileId);
-          originalFileName = r?.originalFileName;
-        }
+      // Check Firestore immediately first — page may already be uploaded
+      if (!originalFileName) {
+        const r = await db.getRecord(fileId);
+        originalFileName = r?.originalFileName;
+        const ps = r?.pageStore || {};
+        var quickCheck = ps[nextPage] || ps[String(nextPage)] || null;
+      } else {
+        var quickCheck = null;
+      }
+
+      let nextTempData = quickCheck;
+      if (!nextTempData?.tempItemId) {
+        nextTempData = await waitForTempPage(fileId, nextPage, 180000);
+      }
+      if (!nextTempData?.tempItemId) {
+        // Final direct read fallback
+        const latestRecord = await db.getRecord(fileId);
+        if (!originalFileName) originalFileName = latestRecord?.originalFileName;
+        const latestPs = latestRecord?.pageStore || {};
+        nextTempData = latestPs[nextPage] || latestPs[String(nextPage)] || null;
+      }
+
+      if (nextTempData?.tempItemId) {
         await Promise.all([
           dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, originalFileName, totalPages, nextTempData.tempItemId),
           db.updateRecord(fileId, { currentDispatchPage: nextPage }),
         ]);
         console.log(`[file-page] Dispatched page ${nextPage}/${totalPages}`);
       } else {
-        console.error(`[file-page] Timed out waiting for page ${nextPage} in Temp`);
+        console.error(`[file-page] Timed out waiting for page ${nextPage} in Temp — chain may be broken`);
       }
     } catch (dispatchErr) {
       console.error(`[file-page] Failed to dispatch page ${nextPage}:`, dispatchErr.message);
@@ -252,7 +268,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
 
   // Get pageStore from Firestore — single read, extract everything we need from it
   const record = await db.getRecord(fileId);
-  const originalFileName = record?.originalFileName || fileId;
+  let originalFileName = record?.originalFileName || fileId;
   const pageStore = record?.pageStore || {};
   const tempData = pageStore[pageNumber] || pageStore[String(pageNumber)];
   console.log(`[file-page] ${T()} pageStore keys: [${Object.keys(pageStore).join(',')}]`);
@@ -307,8 +323,8 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
       ? Promise.resolve({ fileName: finalFileName, oneDriveId: null, oneDriveUrl: null, skipped: true, skipReason: odDupResult.reason })
       : uploadToOneDrive(processedPath, finalFileName, pageBuffer)
           .then(uploaded => {
-            console.log(`[file-page] ${T()} OneDrive OK: "${finalFileName}"`);
-            return { fileName: finalFileName, oneDriveId: uploaded.id, oneDriveUrl: uploaded.webUrl };
+            console.log(`[file-page] ${T()} OneDrive OK: "${finalFileName}" | webUrl: ${uploaded.webUrl}`);
+            return { fileName: finalFileName, oneDriveId: uploaded.id, oneDriveUrl: uploaded.webUrl || null };
           })
           .catch(err => {
             console.error(`[file-page] ${T()} OneDrive FAILED:`, err.message);
@@ -339,9 +355,9 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     googleDrive: googleDriveResult ? {
       folderId: googleDriveResult.refFolderId,
       folderUrl: googleDriveResult.refFolderUrl,
+      fileUrl: googleDriveResult.uploadedFiles?.[0]?.webViewLink || null,
       uploadedFile: googleDriveResult.uploadedFiles?.[0] || null,
     } : null,
-    // googleDriveFolderUrl already saved inline above if GD succeeded
   });
   console.log(`[file-page] ${T()} Firestore updated`);
 
@@ -373,21 +389,39 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
       }
     }
 
-    console.log(`[file-page] ${T()} Waiting for page ${nextPage} in Temp (onSnapshot — 0 poll reads)...`);
-    const nextTempData = await waitForTempPage(fileId, nextPage, 120000);
-    if (nextTempData) {
-      // If originalFileName not passed by caller, read from Firestore once
-      if (!originalFileName) {
-        const r = await db.getRecord(fileId);
-        originalFileName = r?.originalFileName;
-      }
+    console.log(`[file-page] ${T()} Dispatching page ${nextPage}/${totalPages}...`);
+
+    // Check pageStore immediately — page may already be uploaded to Temp
+    let nextTempData = pageStore[nextPage] || pageStore[String(nextPage)] || null;
+
+    if (!nextTempData?.tempItemId) {
+      // Not in pageStore yet — wait for scan-now/test-run to finish uploading it
+      console.log(`[file-page] ${T()} Page ${nextPage} not in pageStore yet — waiting (max 3 min)...`);
+      nextTempData = await waitForTempPage(fileId, nextPage, 180000);
+    }
+
+    if (!nextTempData?.tempItemId) {
+      // Still not there after 3 minutes — do one final direct Firestore read as last resort
+      console.warn(`[file-page] ${T()} waitForTempPage timed out for page ${nextPage} — doing final direct read`);
+      const latestRecord = await db.getRecord(fileId);
+      const latestPs = latestRecord?.pageStore || {};
+      nextTempData = latestPs[nextPage] || latestPs[String(nextPage)] || null;
+    }
+
+    if (nextTempData?.tempItemId) {
       await Promise.all([
         dispatchToMake(nextPage, nextTempData.zeroPadded, fileId, originalFileName, totalPages, nextTempData.tempItemId),
         db.updateRecord(fileId, { currentDispatchPage: nextPage }),
       ]);
       console.log(`[file-page] ${T()} Dispatched page ${nextPage}/${totalPages}`);
     } else {
-      throw new Error(`Timed out waiting for page ${nextPage} to appear in Temp`);
+      // Page never appeared — log and mark error so chain doesn't silently die
+      const errMsg = `Page ${nextPage} temp file never appeared in Firestore after 3+ minutes — chain broken`;
+      console.error(`[file-page] ${T()} ${errMsg}`);
+      await db.updateRecord(fileId, {
+        [`pages.${nextPage}`]: { status: 'error', error: errMsg },
+        error: errMsg,
+      });
     }
     return;
   }
