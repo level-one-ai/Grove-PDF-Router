@@ -41,36 +41,52 @@ async function parseBody(req) {
     let raw = '';
     req.on('data', chunk => { raw += chunk.toString(); });
     req.on('end', () => {
-      // First try: parse as-is
+
+      // Helper: strip all control characters from every string value in a parsed object
+      function sanitiseObj(obj) {
+        if (typeof obj === 'string') return obj.replace(/[\x00-\x1F\x7F]/g, ' ').trim();
+        if (Array.isArray(obj)) return obj.map(sanitiseObj);
+        if (obj && typeof obj === 'object') {
+          const out = {};
+          for (const [k, v] of Object.entries(obj)) out[k] = sanitiseObj(v);
+          return out;
+        }
+        return obj;
+      }
+
+      // First try: parse as-is, then sanitise all string values
       try {
-        resolve(JSON.parse(raw));
+        resolve(sanitiseObj(JSON.parse(raw)));
         return;
       } catch (_) {}
-      // Second try: strip literal control characters (newlines, tabs etc.) that
-      // are invalid inside JSON string values, then retry
+
+      // Second try: strip control chars from the raw JSON text then parse
       try {
-        const cleaned = raw.replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, ' ')
-                           .replace(/\n/g, ' ')
-                           .replace(/\r/g, ' ');
-        resolve(JSON.parse(cleaned));
+        const cleaned = raw
+          .replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, ' ')
+          .replace(/\n/g, ' ')
+          .replace(/\r/g, ' ');
+        resolve(sanitiseObj(JSON.parse(cleaned)));
         return;
       } catch (_) {}
-      // Third try: remove the product_selection field entirely (it's not used
-      // by file-page — buildFromFlatFields sets product_selection: [] anyway)
+
+      // Third try: strip product_selection and handwritten_notes (both optional)
+      // then strip remaining control chars
       try {
-        const stripped = raw.replace(/"product_selection"\s*:\s*"[^"\\]*(?:\\.[^"\\]*)*"\s*,?\s*/g, '');
-        const cleaned2 = stripped.replace(/[\x00-\x1F\x7F]/g, ' ');
-        resolve(JSON.parse(cleaned2));
+        let stripped = raw
+          .replace(/"product_selection"\s*:\s*"[^"\\]*(?:\\.[^"\\]*)*"\s*,?\s*/g, '')
+          .replace(/"handwritten_notes"\s*:\s*"[^"\\]*(?:\\.[^"\\]*)*"\s*,?\s*/g, '');
+        stripped = stripped.replace(/[\x00-\x1F\x7F]/g, ' ');
+        resolve(sanitiseObj(JSON.parse(stripped)));
         return;
       } catch (_) {}
-      // Final fallback: extract key fields with regex so we can still process
+
+      // Final fallback: extract key fields with regex
       console.warn('[file-page] JSON body unparseable — using regex field extraction');
       const get = (key) => {
         const m = raw.match(new RegExp(`"${key}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"`));
-        return m ? m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').trim() : '';
+        return m ? m[1].replace(/\\n/g, ' ').replace(/\\t/g, ' ').replace(/\\"/g, '"').replace(/[\x00-\x1F\x7F]/g, ' ').trim() : '';
       };
-      // product_selection may be a quoted JSON string — extract it and pass as-is
-      // buildFromFlatFields will parse it safely
       const getProdSelection = () => {
         const m = raw.match(/"product_selection"\s*:\s*"([\s\S]*?)(?<!\\)"\s*[,}]/);
         if (!m) return '';
@@ -100,7 +116,8 @@ async function parseBody(req) {
         ship_to_street: get('ship_to_street'),
         ship_to_city: get('ship_to_city'),
         ship_to_postcode: get('ship_to_postcode'),
-        handwritten_notes: get('handwritten_notes'),
+        // handwritten_notes and product_selection are optional — omit if not present
+        handwritten_notes: get('handwritten_notes') || '',
         product_selection: getProdSelection(),
       });
     });
