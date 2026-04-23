@@ -2,71 +2,28 @@
  * /api/dashboard
  * Grove PDF Router — monitoring dashboard.
  *
- * Server fetches both OneDrive folders and injects raw JSON into the page.
- * Client JS renders everything. No server/client HTML mixing.
- * Zero Firestore reads.
+ * Serves the HTML shell immediately (fast).
+ * Client JS fetches OneDrive data via /api/scan-files after page load.
+ * This avoids server-side blocking on OneDrive calls.
+ *
+ * Flow:
+ *   1. Page loads instantly with empty columns + loading state
+ *   2. Client fetches Scans + Processed from /api/scan-files
+ *   3. SSE notify stream kept open — fires when Make.com triggers scan-now
+ *   4. On new-file SSE: refresh Scans + auto-start processing
+ *   5. Manual: click file → Run button → startWatching → test-run SSE
  */
 
-module.exports.config = { maxDuration: 30 };
-
-async function fetchFolder(graphRequest, userId, folderPath) {
-  const path = `/users/${userId}/drive/root:/${folderPath}:/children` +
-    `?$select=id,name,size,createdDateTime,webUrl,file&$top=500`;
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('OneDrive timeout')), 20000));
-  const result = await Promise.race([graphRequest('GET', path), timeout]);
-  return (result?.value || [])
-    .filter(f => {
-      const n = (f.name || '').toLowerCase();
-      return (n.endsWith('.pdf') || (f.file?.mimeType || '').includes('pdf')) && !n.startsWith('~');
-    })
-    .map(f => ({ id: f.id, name: f.name, size: f.size, createdAt: f.createdDateTime, webUrl: f.webUrl }))
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-}
+module.exports.config = { maxDuration: 10 };
 
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
+  res.status(200).send(HTML);
+};
 
-  let scanFiles = [], procFiles = [], scanError = null, procError = null;
-
-  try {
-    const { graphRequest } = require('../lib/graph');
-    const userId = process.env.ONEDRIVE_USER_ID;
-    if (!userId) throw new Error('ONEDRIVE_USER_ID not set');
-
-    const [sr, pr] = await Promise.allSettled([
-      fetchFolder(graphRequest, userId, 'Grove Group Scotland/Grove Bedding/Scans'),
-      fetchFolder(graphRequest, userId, 'Grove Group Scotland/Grove Bedding/Scans/Processed'),
-    ]);
-
-    if (sr.status === 'fulfilled') {
-      scanFiles = sr.value;
-      console.log(`[dashboard] Scans: ${scanFiles.length} files`);
-    } else {
-      scanError = sr.reason?.graphMessage || sr.reason?.message || 'OneDrive error';
-      console.error('[dashboard] Scans failed:', scanError);
-    }
-    if (pr.status === 'fulfilled') {
-      procFiles = pr.value;
-      console.log(`[dashboard] Processed: ${procFiles.length} files`);
-    } else {
-      procError = pr.reason?.graphMessage || pr.reason?.message || 'OneDrive error';
-      console.error('[dashboard] Processed failed:', procError);
-    }
-  } catch (err) {
-    const msg = err.graphMessage || err.message;
-    console.error('[dashboard] Fatal:', msg);
-    scanError = msg; procError = msg;
-  }
-
-  // Safely inject JSON — replace </script> to prevent early tag closure
-  function safeJson(v) {
-    return JSON.stringify(v).replace(/<\/script>/gi, '<\\/script>');
-  }
-
-  res.status(200).send(`<!DOCTYPE html>
+const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -194,11 +151,13 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 <div class="main">
   <div class="fcol">
     <div class="fhead">
-      <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count"></div></div>
+      <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">Loading...</div></div>
       <button class="rfbtn" id="scan-refresh">&#8635;</button>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; <span>Scans</span></div>
-    <div class="flist" id="scan-list"></div>
+    <div class="flist" id="scan-list">
+      <div class="stmsg"><div class="ic"><span class="spin" style="width:20px;height:20px;border-width:3px"></span></div><div class="ti">Loading files...</div></div>
+    </div>
     <div class="run-panel" id="run-panel">
       <div class="run-fname" id="run-fname"></div>
       <div class="run-fmeta" id="run-fmeta"></div>
@@ -207,7 +166,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
   </div>
   <div class="fcol">
     <div class="fhead">
-      <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count"></div></div>
+      <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count">Loading...</div></div>
       <div style="display:flex;gap:5px">
         <button class="rfbtn" id="gd-retry-btn" style="border-color:#22c55e44;color:var(--gn)">&#128230; GD</button>
         <button class="rfbtn" id="proc-refresh">&#8635;</button>
@@ -221,7 +180,9 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       </div>
       <div class="gdpbody" id="gdp-body"></div>
     </div>
-    <div class="flist" id="proc-list"></div>
+    <div class="flist" id="proc-list">
+      <div class="stmsg"><div class="ic"><span class="spin" style="width:20px;height:20px;border-width:3px"></span></div><div class="ti">Loading files...</div></div>
+    </div>
   </div>
   <div class="right">
     <div class="act-hdr">
@@ -244,17 +205,13 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 (function() {
 'use strict';
 
-// ── Data injected by server ───────────────────────────────────────────────────
-var SCAN_DATA  = ${safeJson(scanFiles)};
-var PROC_DATA  = ${safeJson(procFiles)};
-var SCAN_ERROR = ${safeJson(scanError)};
-var PROC_ERROR = ${safeJson(procError)};
-
 // ── State ─────────────────────────────────────────────────────────────────────
-var PROCESSING    = false;
-var SELECTED      = null;   // currently selected scan file object
-var CURRENT       = null;   // file currently being processed
-var NOTIFY_ES     = null;
+var SCAN_DATA  = [];
+var PROC_DATA  = [];
+var PROCESSING = false;
+var SELECTED   = null;   // currently selected scan file object
+var CURRENT    = null;   // file currently being processed
+var NOTIFY_ES  = null;
 
 var STEPS = [
   {id:1, l:'Initialise record'},
@@ -297,14 +254,13 @@ function renderScans(files, error) {
   }
   list.innerHTML = '';
   files.forEach(function(f) {
-    var isActive  = CURRENT   && CURRENT.id   === f.id;
-    var isSelected = SELECTED && SELECTED.id  === f.id && !isActive;
+    var isActive   = CURRENT   && CURRENT.id  === f.id;
+    var isSelected = SELECTED  && SELECTED.id === f.id && !isActive;
 
     var row = document.createElement('div');
     row.className = 'fi' + (isActive ? ' active' : isSelected ? ' sel' : '');
     row.id = 'sf-' + f.id;
 
-    // rstbtn — separate element, stop propagation
     var rst = document.createElement('button');
     rst.className = 'rstbtn';
     rst.title = 'Reset file';
@@ -321,12 +277,7 @@ function renderScans(files, error) {
       + (isActive ? ' &middot; <span style="color:var(--or)">Processing\u2026</span>' : '') + '</div></div>';
 
     row.appendChild(rst);
-
-    // Click handler on the row itself — NOT via onclick attribute
-    row.addEventListener('click', function() {
-      selectFile(f);
-    });
-
+    row.addEventListener('click', function() { selectFile(f); });
     list.appendChild(row);
   });
 }
@@ -334,13 +285,9 @@ function renderScans(files, error) {
 function selectFile(f) {
   if (PROCESSING) return;
   SELECTED = f;
-
-  // Update visual selection
   document.querySelectorAll('#scan-list .fi.sel').forEach(function(e) { e.classList.remove('sel'); });
   var row = el('sf-' + f.id);
   if (row) row.classList.add('sel');
-
-  // Show run panel
   el('run-fname').textContent = f.name;
   el('run-fmeta').textContent = fmtSize(f.size) + ' \u00b7 ' + fmtDate(f.createdAt);
   el('run-panel').className = 'run-panel show';
@@ -356,11 +303,15 @@ function hideRunPanel() {
 }
 
 async function refreshScans() {
-  el('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading\u2026</div></div>';
+  el('scan-list').innerHTML = '<div class="stmsg"><div class="ic"><span class="spin" style="width:16px;height:16px;border-width:2px"></span></div><div class="ti">Loading\u2026</div></div>';
   el('scan-count').textContent = '\u2014';
   var d = await apiCall('/api/scan-files');
-  SCAN_DATA = (d && d.success) ? (d.files || []) : [];
-  renderScans(SCAN_DATA, (d && d.success) ? null : (d && d.error ? d.error : 'Could not reach OneDrive'));
+  if (d && d.success) {
+    SCAN_DATA = d.files || [];
+    renderScans(SCAN_DATA, null);
+  } else {
+    renderScans([], d && d.error ? d.error : 'Could not reach OneDrive');
+  }
 }
 
 // ── Processed column ──────────────────────────────────────────────────────────
@@ -380,26 +331,22 @@ function renderProcessed(files, error) {
   list.innerHTML = '';
   files.forEach(function(f, idx) {
     var odUrl = f.webUrl || '';
-
-    // Outer row — click toggles dropdown
     var row = document.createElement('div');
     row.className = 'fi done';
     row.style.flexDirection = 'column';
     row.style.alignItems = 'stretch';
 
-    // Top part
     var top = document.createElement('div');
     top.style.display = 'flex';
     top.style.alignItems = 'center';
     top.style.gap = '8px';
-    top.style.pointerEvents = 'none';  // let row handle click
+    top.style.pointerEvents = 'none';
     top.innerHTML =
       '<div class="fic">&#128196;</div>'
       + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div>'
       + '<div class="fmeta">' + fmtSize(f.size) + ' &middot; ' + fmtDate(f.createdAt) + '</div></div>'
       + '<div class="fac"><span class="folder-tag od">&#128196; OD</span></div>';
 
-    // Dropdown
     var drop = document.createElement('div');
     drop.className = 'proc-drop';
     drop.id = 'pd-' + idx;
@@ -410,20 +357,18 @@ function renderProcessed(files, error) {
     if (odUrl) {
       dropHtml += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank">Open in OneDrive &#8599;</a></div>';
     }
-    dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><button class="gd-btn" id="gdb-' + idx + '">&#128230; Send to GD</button></div>';
+    dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><button class="gd-btn">&#128230; Send to GD</button></div>';
     drop.innerHTML = dropHtml;
 
     row.appendChild(top);
     row.appendChild(drop);
 
-    // Click handler
     row.addEventListener('click', function() {
       var isOpen = drop.classList.contains('open');
       document.querySelectorAll('.proc-drop.open').forEach(function(d) { d.classList.remove('open'); });
       if (!isOpen) drop.classList.add('open');
     });
 
-    // GD button — must add after row is in DOM would cause issue, so use closure
     var gdBtn = drop.querySelector('.gd-btn');
     if (gdBtn) {
       gdBtn.addEventListener('click', function(e) {
@@ -437,14 +382,18 @@ function renderProcessed(files, error) {
 }
 
 async function refreshProcessed() {
-  el('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading\u2026</div></div>';
+  el('proc-list').innerHTML = '<div class="stmsg"><div class="ic"><span class="spin" style="width:16px;height:16px;border-width:2px"></span></div><div class="ti">Loading\u2026</div></div>';
   el('proc-count').textContent = '\u2014';
   var d = await apiCall('/api/scan-files?folder=Processed');
-  PROC_DATA = (d && d.success) ? (d.files || []) : [];
-  renderProcessed(PROC_DATA, (d && d.success) ? null : (d && d.error ? d.error : 'Could not reach OneDrive'));
+  if (d && d.success) {
+    PROC_DATA = d.files || [];
+    renderProcessed(PROC_DATA, null);
+  } else {
+    renderProcessed([], d && d.error ? d.error : 'Could not reach OneDrive');
+  }
 }
 
-// ── File run ──────────────────────────────────────────────────────────────────
+// ── Reset ─────────────────────────────────────────────────────────────────────
 async function doReset(fid) {
   if (!confirm('Reset this file so it can be reprocessed?')) return;
   var d = await apiCall('/api/admin?action=reset', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileId:fid}) });
@@ -593,9 +542,17 @@ async function startWatching(file) {
   el('steplist').innerHTML = STEPS.map(function(s){ return mkStep(s.id,s.l,'','pending'); }).join('');
   el('rescard').innerHTML = '';
   var row = el('sf-' + file.id);
-  if (row) { row.className = 'fi active'; row.querySelector('.fic').innerHTML = '<span class="spin" style="color:var(--or)"></span>'; }
+  if (row) {
+    row.className = 'fi active';
+    var fic = row.querySelector('.fic');
+    if (fic) fic.innerHTML = '<span class="spin" style="color:var(--or)"></span>';
+  }
   try {
-    var resp = await fetch('/api/test-run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileId:file.id, fileName:file.name, runMode:'auto', runStep:1}) });
+    var resp = await fetch('/api/test-run', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({fileId:file.id, fileName:file.name, runMode:'auto', runStep:1})
+    });
     if (!resp.ok) { showError('Server error ' + resp.status); onErr(); return; }
     var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '', evt = null;
     while (true) {
@@ -608,6 +565,7 @@ async function startWatching(file) {
         else if (line === '') evt = null;
       });
     }
+    // Stream ended — do one final status check
     if (PROCESSING) {
       var rec = await apiCall('/api/status?fileId=' + encodeURIComponent(file.id));
       if (rec && rec.record && rec.record.status === 'completed') {
@@ -620,17 +578,21 @@ async function startWatching(file) {
   } catch(err) { showError(err.message); onErr(); }
 }
 
-// ── SSE Notify ────────────────────────────────────────────────────────────────
+// ── SSE Notify — dashboard listens for new files from Make.com ────────────────
 function openNotifyStream() {
   if (NOTIFY_ES) { NOTIFY_ES.close(); NOTIFY_ES = null; }
   var es = new EventSource('/api/notify');
   NOTIFY_ES = es;
   es.addEventListener('connected', function(){ console.log('[dashboard] notify connected'); });
-  es.addEventListener('new-file', async function(e) {
+  es.addEventListener('new-file', async function() {
     try {
+      // Refresh scans list to show the new file
       await refreshScans();
-      if (!PROCESSING && SCAN_DATA.length > 0) startWatching(SCAN_DATA[0]);
-    } catch(ex) {}
+      // Auto-start processing if not already running
+      if (!PROCESSING && SCAN_DATA.length > 0) {
+        startWatching(SCAN_DATA[0]);
+      }
+    } catch(ex) { console.warn('[dashboard] new-file handler:', ex.message); }
   });
   es.addEventListener('reconnect', function(){ es.close(); NOTIFY_ES=null; setTimeout(openNotifyStream,1000); });
   es.onerror = function(){ es.close(); NOTIFY_ES=null; setTimeout(openNotifyStream,5000); };
@@ -650,12 +612,12 @@ el('proc-refresh').addEventListener('click', refreshProcessed);
 el('gd-retry-btn').addEventListener('click', retryGD);
 el('gdp-close').addEventListener('click', function(){ el('gdpanel').classList.remove('open'); });
 
-// ── Init ──────────────────────────────────────────────────────────────────────
-renderScans(SCAN_DATA, SCAN_ERROR);
-renderProcessed(PROC_DATA, PROC_ERROR);
+// ── Init — load data immediately after page renders ───────────────────────────
+// Both fetches run in parallel. Page loads instantly, data appears within 1-3s.
+refreshScans();
+refreshProcessed();
 openNotifyStream();
 
 })(); // end IIFE
 </script>
-</body></html>`);
-};
+</body></html>`;

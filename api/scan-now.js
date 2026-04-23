@@ -49,7 +49,7 @@ async function scanAndProcess() {
   const result = await graphRequest(
     'GET',
     `/users/${userId}/drive/root:/${folderPath}:/children` +
-    `?$select=id,name,file,createdDateTime&$top=200`
+    `?$select=id,name,file,size,createdDateTime&$top=200`
   );
 
   const allPdfs = (result?.value || [])
@@ -60,6 +60,12 @@ async function scanAndProcess() {
     });
 
   console.log(`[scan-now] ${allPdfs.length} PDF(s) in Scans`);
+
+  // Notify the dashboard immediately so Scans column refreshes
+  // This fires whether triggered by Make.com or file-page.js
+  if (allPdfs.length > 0) {
+    notifyDashboard(allPdfs).catch(() => {}); // fire-and-forget, non-fatal
+  }
 
   if (!allPdfs.length) {
     console.log('[scan-now] No PDFs found — nothing to do');
@@ -382,4 +388,29 @@ async function getToken() {
     { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
   );
   return r.data.access_token;
+}
+
+async function notifyDashboard(files) {
+  const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+  try {
+    await axios.post(`${baseUrl}/api/notify`, {
+      secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
+      event: 'new-file',
+      data: {
+        count: files.length,
+        files: files.map(f => ({
+          id: f.id,
+          name: f.name,
+          size: f.size || 0,
+          createdAt: f.createdDateTime,
+        })),
+      },
+    }, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 5000,
+    });
+    console.log(`[scan-now] Dashboard notified — ${files.length} file(s) in Scans`);
+  } catch (err) {
+    console.warn('[scan-now] Dashboard notify (non-fatal):', err.message);
+  }
 }
