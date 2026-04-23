@@ -39,9 +39,96 @@ function toPdfList(items) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
+// Escape HTML special characters for safe injection into HTML
+function h(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '';
+  const k = 1024, sizes = ['B','KB','MB','GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
+function formatDate(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+      + ' ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  } catch (e) { return iso; }
+}
+
+// Generate HTML for the Scans file list — runs on the server
+function buildScanList(files, error) {
+  if (error) {
+    return '<div class="stmsg"><div class="ic">&#10060;</div>'
+      + '<div class="ti">Failed to load Scans</div>'
+      + '<div class="de" style="font-size:10px;word-break:break-all">' + h(error) + '</div></div>';
+  }
+  if (!files.length) {
+    return '<div class="stmsg"><div class="ic">&#10003;</div>'
+      + '<div class="ti">Scans folder is empty</div>'
+      + '<div class="de">Files appear here when dropped into OneDrive Scans</div></div>';
+  }
+  return files.map((f, idx) =>
+    '<div class="fi" id="sf-' + h(f.id) + '" onclick="selectFile(' + JSON.stringify(f.id) + ')">'
+    + '<div class="fic">&#128196;</div>'
+    + '<div class="fin">'
+    + '<div class="fnm">' + h(f.name) + '</div>'
+    + '<div class="fmeta">' + h(formatBytes(f.size)) + ' &middot; ' + h(formatDate(f.createdAt)) + '</div>'
+    + '</div>'
+    + '<button class="rstbtn" title="Reset file" onclick="event.stopPropagation();doReset(' + JSON.stringify(f.id) + ')">&#8635;</button>'
+    + '</div>'
+  ).join('');
+}
+
+// Generate HTML for the Processed file list — runs on the server
+function buildProcList(files, error) {
+  if (error) {
+    return '<div class="stmsg"><div class="ic">&#10060;</div>'
+      + '<div class="ti">Failed to load Processed</div>'
+      + '<div class="de" style="font-size:10px;word-break:break-all">' + h(error) + '</div></div>';
+  }
+  if (!files.length) {
+    return '<div class="stmsg"><div class="ic">&#128100;</div>'
+      + '<div class="ti">No files yet</div>'
+      + '<div class="de">Processed files appear here after the automation runs</div></div>';
+  }
+  return files.map((f, idx) => {
+    const did = 'pdrop-' + idx;
+    const odUrl = f.webUrl || '';
+    let drop = '<div class="proc-drop" id="' + did + '">';
+    drop += '<div class="pd-row"><div class="pd-lbl">Size</div><div class="pd-val">' + h(formatBytes(f.size)) + '</div></div>';
+    drop += '<div class="pd-row"><div class="pd-lbl">Filed</div><div class="pd-val">' + h(formatDate(f.createdAt)) + '</div></div>';
+    if (odUrl) drop += '<div class="pd-row"><div class="pd-lbl">OneDrive</div>'
+      + '<a class="pd-link" href="' + h(odUrl) + '" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
+    drop += '<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
+      + '<button class="gd-send-btn" data-fname="' + h(f.name) + '" data-fid="' + h(f.id) + '" '
+      + 'onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
+    drop += '</div>';
+    return '<div class="fi done-f" data-dropid="' + did + '" '
+      + 'onclick="toggleDrop(this.dataset.dropid)" style="flex-direction:column;align-items:stretch">'
+      + '<div style="display:flex;align-items:center;gap:8px">'
+      + '<div class="fic">&#128196;</div>'
+      + '<div class="fin">'
+      + '<div class="fnm">' + h(f.name) + '</div>'
+      + '<div class="fmeta">' + h(formatBytes(f.size)) + ' &middot; ' + h(formatDate(f.createdAt)) + '</div>'
+      + '</div>'
+      + '<div class="fac"><span class="folder-tag od">&#128196; OD</span></div>'
+      + '</div>' + drop + '</div>';
+  }).join('');
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  // Never cache — the page contains live data (file lists from OneDrive)
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
 
@@ -50,24 +137,19 @@ module.exports = async function handler(req, res) {
   try {
     const { graphRequest } = require('../lib/graph');
     const userId = process.env.ONEDRIVE_USER_ID;
-
     if (!userId) throw new Error('ONEDRIVE_USER_ID not configured in Vercel env vars');
 
-    const SCANS = 'Grove Group Scotland/Grove Bedding/Scans';
-    const PROCESSED = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
-
-    // Fetch both folders in parallel — each has its own 20s timeout
     const [scanRes, procRes] = await Promise.allSettled([
-      fetchFolder(graphRequest, userId, SCANS),
-      fetchFolder(graphRequest, userId, PROCESSED),
+      fetchFolder(graphRequest, userId, 'Grove Group Scotland/Grove Bedding/Scans'),
+      fetchFolder(graphRequest, userId, 'Grove Group Scotland/Grove Bedding/Scans/Processed'),
     ]);
 
     if (scanRes.status === 'fulfilled') {
       scanFiles = toPdfList(scanRes.value);
-      console.log(`[dashboard] Scans: ${scanFiles.length} PDF(s)`);
+      console.log(`[dashboard] Scans: ${scanFiles.length} PDF(s) (${scanRes.value.length} total items including subfolders)`);
     } else {
       scanError = scanRes.reason?.graphMessage || scanRes.reason?.message || 'OneDrive error';
-      console.error('[dashboard] Scans fetch failed:', scanRes.reason?.message, scanRes.reason?.graphMessage);
+      console.error('[dashboard] Scans failed:', scanError);
     }
 
     if (procRes.status === 'fulfilled') {
@@ -75,21 +157,29 @@ module.exports = async function handler(req, res) {
       console.log(`[dashboard] Processed: ${procFiles.length} PDF(s)`);
     } else {
       procError = procRes.reason?.graphMessage || procRes.reason?.message || 'OneDrive error';
-      console.error('[dashboard] Processed fetch failed:', procRes.reason?.message, procRes.reason?.graphMessage);
+      console.error('[dashboard] Processed failed:', procError);
     }
 
   } catch (err) {
     const msg = err.graphMessage || err.message;
-    console.error('[dashboard] Fatal error:', msg);
-    scanError = msg;
-    procError = msg;
+    console.error('[dashboard] Fatal:', msg);
+    scanError = msg; procError = msg;
   }
 
-  const data = JSON.stringify({ scanFiles, procFiles, scanError, procError });
-  res.status(200).send(buildHTML(data));
+  // Build file list HTML server-side — no client-side JS rendering needed
+  const scanHtml  = buildScanList(scanFiles, scanError);
+  const procHtml  = buildProcList(procFiles, procError);
+  const scanCount = scanError  ? 'Error' : scanFiles.length  + ' file' + (scanFiles.length  === 1 ? '' : 's');
+  const procCount = procError  ? 'Error' : procFiles.length  + ' file' + (procFiles.length  === 1 ? '' : 's');
+
+  // Pass scan files as JSON for JS interactivity (selectFile, doReset)
+  // Only need id, name, size, createdAt — no webUrl needed for JS side
+  const scanJson = JSON.stringify(scanFiles.map(f => ({ id: f.id, name: f.name, size: f.size, createdAt: f.createdAt })));
+
+  res.status(200).send(buildHTML(scanHtml, procHtml, scanCount, procCount, scanJson));
 };
 
-function buildHTML(serverData) {
+function buildHTML(scanHtml, procHtml, scanCount, procCount, scanJson) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -224,11 +314,11 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
   <!-- SCANS -->
   <div class="fcol">
     <div class="fhead">
-      <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">—</div></div>
+      <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">${scanCount}</div></div>
       <button class="rfbtn" onclick="refreshScans()">&#8635;</button>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; <span>Scans</span></div>
-    <div class="flist" id="scan-list"></div>
+    <div class="flist" id="scan-list">${scanHtml}</div>
     <div class="run-area" id="run-area">
       <div class="run-fname" id="run-fname"></div>
       <div class="run-fmeta" id="run-fmeta"></div>
@@ -239,7 +329,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
   <!-- PROCESSED -->
   <div class="fcol">
     <div class="fhead">
-      <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count">—</div></div>
+      <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count">${procCount}</div></div>
       <div style="display:flex;gap:5px">
         <button class="rfbtn" id="gd-retry-btn" onclick="retryGD()" style="border-color:#22c55e44;color:var(--gn)" title="Re-file anything missing Google Drive">&#128230; GD</button>
         <button class="rfbtn" onclick="refreshProcessed()">&#8635;</button>
@@ -253,7 +343,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       </div>
       <div class="gdpbody" id="gdp-body"></div>
     </div>
-    <div class="flist" id="proc-list"></div>
+    <div class="flist" id="proc-list">${procHtml}</div>
   </div>
 
   <!-- ACTIVITY -->
@@ -280,11 +370,9 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 
 <script>
 // ── Server-injected data (fetched at page-serve time, no client round-trip) ───
-var SERVER_DATA = ${serverData};
-var SCAN_FILES  = SERVER_DATA.scanFiles  || [];
-var PROC_FILES  = SERVER_DATA.procFiles  || [];
-var SCAN_ERROR  = SERVER_DATA.scanError  || null;
-var PROC_ERROR  = SERVER_DATA.procError  || null;
+// Scan files as JSON for JS interactivity (file selection, run, reset)
+// File list HTML is already rendered server-side — no JS rendering needed for initial load
+var SCAN_FILES = ${scanJson};
 
 // ── State ─────────────────────────────────────────────────────────────────────
 var PROCESSING    = false;
@@ -613,9 +701,8 @@ function openNotifyStream(){
   es.onerror=function(){es.close();NOTIFY_ES=null;setTimeout(openNotifyStream,5000);};
 }
 
-// ── Init — data already loaded server-side, render immediately ────────────────
-renderScans(SCAN_FILES, SCAN_ERROR);
-renderProcessed(PROC_FILES, PROC_ERROR);
+// ── Init — file lists already rendered server-side, just open the notify stream ──
+// renderScans and renderProcessed are only called by the refresh buttons
 openNotifyStream();
 // NO setInterval — completely passive when idle
 </script>
