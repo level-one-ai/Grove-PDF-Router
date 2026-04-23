@@ -2,22 +2,71 @@
  * /api/dashboard
  * Grove PDF Router — monitoring dashboard.
  *
- * Serves the HTML shell immediately (no blocking OneDrive calls at serve time).
- * Client JS fetches file data via /api/scan-files after page load.
- * SSE notify stream auto-refreshes Scans and triggers processing when
- * Make.com calls /api/scan-now.
+ * Server fetches both OneDrive folders and injects raw JSON into the page.
+ * Client JS renders everything. No server/client HTML mixing.
+ * Zero Firestore reads.
  */
 
-module.exports.config = { maxDuration: 10 };
+module.exports.config = { maxDuration: 30 };
+
+async function fetchFolder(graphRequest, userId, folderPath) {
+  const path = `/users/${userId}/drive/root:/${folderPath}:/children` +
+    `?$select=id,name,size,createdDateTime,webUrl,file&$top=500`;
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('OneDrive timeout')), 20000));
+  const result = await Promise.race([graphRequest('GET', path), timeout]);
+  return (result?.value || [])
+    .filter(f => {
+      const n = (f.name || '').toLowerCase();
+      return (n.endsWith('.pdf') || (f.file?.mimeType || '').includes('pdf')) && !n.startsWith('~');
+    })
+    .map(f => ({ id: f.id, name: f.name, size: f.size, createdAt: f.createdDateTime, webUrl: f.webUrl }))
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
-  res.status(200).send(HTML);
-};
 
-const HTML = `<!DOCTYPE html>
+  let scanFiles = [], procFiles = [], scanError = null, procError = null;
+
+  try {
+    const { graphRequest } = require('../lib/graph');
+    const userId = process.env.ONEDRIVE_USER_ID;
+    if (!userId) throw new Error('ONEDRIVE_USER_ID not set');
+
+    const [sr, pr] = await Promise.allSettled([
+      fetchFolder(graphRequest, userId, 'Grove Group Scotland/Grove Bedding/Scans'),
+      fetchFolder(graphRequest, userId, 'Grove Group Scotland/Grove Bedding/Scans/Processed'),
+    ]);
+
+    if (sr.status === 'fulfilled') {
+      scanFiles = sr.value;
+      console.log(`[dashboard] Scans: ${scanFiles.length} files`);
+    } else {
+      scanError = sr.reason?.graphMessage || sr.reason?.message || 'OneDrive error';
+      console.error('[dashboard] Scans failed:', scanError);
+    }
+    if (pr.status === 'fulfilled') {
+      procFiles = pr.value;
+      console.log(`[dashboard] Processed: ${procFiles.length} files`);
+    } else {
+      procError = pr.reason?.graphMessage || pr.reason?.message || 'OneDrive error';
+      console.error('[dashboard] Processed failed:', procError);
+    }
+  } catch (err) {
+    const msg = err.graphMessage || err.message;
+    console.error('[dashboard] Fatal:', msg);
+    scanError = msg; procError = msg;
+  }
+
+  // Safely inject JSON — replace </script> to prevent early tag closure
+  function safeJson(v) {
+    return JSON.stringify(v).replace(/<\/script>/gi, '<\\/script>');
+  }
+
+  res.status(200).send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -145,11 +194,11 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 <div class="main">
   <div class="fcol">
     <div class="fhead">
-      <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count">Loading...</div></div>
+      <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count"></div></div>
       <button class="rfbtn" id="scan-refresh">&#8635;</button>
     </div>
     <div class="pathbar">&#128193; Grove Bedding &rsaquo; <span>Scans</span></div>
-    <div class="flist" id="scan-list"><div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading&#8230;</div></div></div>
+    <div class="flist" id="scan-list"></div>
     <div class="run-panel" id="run-panel">
       <div class="run-fname" id="run-fname"></div>
       <div class="run-fmeta" id="run-fmeta"></div>
@@ -158,7 +207,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
   </div>
   <div class="fcol">
     <div class="fhead">
-      <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count">Loading...</div></div>
+      <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count"></div></div>
       <div style="display:flex;gap:5px">
         <button class="rfbtn" id="gd-retry-btn" style="border-color:#22c55e44;color:var(--gn)">&#128230; GD</button>
         <button class="rfbtn" id="proc-refresh">&#8635;</button>
@@ -172,7 +221,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
       </div>
       <div class="gdpbody" id="gdp-body"></div>
     </div>
-    <div class="flist" id="proc-list"><div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading&#8230;</div></div></div>
+    <div class="flist" id="proc-list"></div>
   </div>
   <div class="right">
     <div class="act-hdr">
@@ -195,13 +244,17 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 (function() {
 'use strict';
 
+// ── Data injected by server ───────────────────────────────────────────────────
+var SCAN_DATA  = ${safeJson(scanFiles)};
+var PROC_DATA  = ${safeJson(procFiles)};
+var SCAN_ERROR = ${safeJson(scanError)};
+var PROC_ERROR = ${safeJson(procError)};
+
 // ── State ─────────────────────────────────────────────────────────────────────
-var SCAN_DATA  = [];
-var PROC_DATA  = [];
-var PROCESSING = false;
-var SELECTED   = null;
-var CURRENT    = null;
-var NOTIFY_ES  = null;
+var PROCESSING    = false;
+var SELECTED      = null;   // currently selected scan file object
+var CURRENT       = null;   // file currently being processed
+var NOTIFY_ES     = null;
 
 var STEPS = [
   {id:1, l:'Initialise record'},
@@ -221,19 +274,11 @@ function el(id){ return document.getElementById(id); }
 async function apiCall(url, opts) {
   try {
     var c = new AbortController();
-    var t = setTimeout(function(){ c.abort(); }, 25000);
+    var t = setTimeout(function(){ c.abort(); }, 20000);
     var r = await fetch(url, Object.assign({ signal: c.signal }, opts || {}));
     clearTimeout(t);
-    if (!r.ok) {
-      console.error('[dashboard] apiCall', url, 'HTTP', r.status);
-      var errBody = await r.json().catch(function(){ return {error: 'HTTP ' + r.status}; });
-      return errBody;
-    }
     return await r.json().catch(function(){ return null; });
-  } catch(e) {
-    console.error('[dashboard] apiCall', url, 'failed:', e.message);
-    return null;
-  }
+  } catch(e) { return null; }
 }
 
 // ── Scans column ──────────────────────────────────────────────────────────────
@@ -242,7 +287,7 @@ function renderScans(files, error) {
   var count = el('scan-count');
   if (error) {
     count.textContent = 'Error';
-    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Scans</div><div class="de">'+esc(error)+'</div><div class="de" style="margin-top:6px"><a href="/api/diag" target="_blank" style="color:var(--or);text-decoration:none">&#128269; Run diagnostics &#8599;</a></div></div>';
+    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Scans</div><div class="de">'+esc(error)+'</div></div>';
     return;
   }
   count.textContent = files.length + ' file' + (files.length === 1 ? '' : 's');
@@ -252,23 +297,36 @@ function renderScans(files, error) {
   }
   list.innerHTML = '';
   files.forEach(function(f) {
-    var isActive   = CURRENT  && CURRENT.id  === f.id;
-    var isSelected = SELECTED && SELECTED.id === f.id && !isActive;
+    var isActive  = CURRENT   && CURRENT.id   === f.id;
+    var isSelected = SELECTED && SELECTED.id  === f.id && !isActive;
+
     var row = document.createElement('div');
     row.className = 'fi' + (isActive ? ' active' : isSelected ? ' sel' : '');
     row.id = 'sf-' + f.id;
+
+    // rstbtn — separate element, stop propagation
     var rst = document.createElement('button');
     rst.className = 'rstbtn';
     rst.title = 'Reset file';
     rst.innerHTML = '&#8635;';
-    rst.addEventListener('click', function(e) { e.stopPropagation(); doReset(f.id); });
+    rst.addEventListener('click', function(e) {
+      e.stopPropagation();
+      doReset(f.id);
+    });
+
     row.innerHTML =
       '<div class="fic">' + (isActive ? '<span class="spin" style="color:var(--or)"></span>' : '&#128196;') + '</div>'
       + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div>'
       + '<div class="fmeta">' + fmtSize(f.size) + ' &middot; ' + fmtDate(f.createdAt)
       + (isActive ? ' &middot; <span style="color:var(--or)">Processing\u2026</span>' : '') + '</div></div>';
+
     row.appendChild(rst);
-    row.addEventListener('click', function() { selectFile(f); });
+
+    // Click handler on the row itself — NOT via onclick attribute
+    row.addEventListener('click', function() {
+      selectFile(f);
+    });
+
     list.appendChild(row);
   });
 }
@@ -276,9 +334,13 @@ function renderScans(files, error) {
 function selectFile(f) {
   if (PROCESSING) return;
   SELECTED = f;
+
+  // Update visual selection
   document.querySelectorAll('#scan-list .fi.sel').forEach(function(e) { e.classList.remove('sel'); });
   var row = el('sf-' + f.id);
   if (row) row.classList.add('sel');
+
+  // Show run panel
   el('run-fname').textContent = f.name;
   el('run-fmeta').textContent = fmtSize(f.size) + ' \u00b7 ' + fmtDate(f.createdAt);
   el('run-panel').className = 'run-panel show';
@@ -297,18 +359,8 @@ async function refreshScans() {
   el('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading\u2026</div></div>';
   el('scan-count').textContent = '\u2014';
   var d = await apiCall('/api/scan-files');
-  if (!d || !d.success) {
-    // Auto-retry once after 4 seconds (handles cold start delays)
-    await new Promise(function(r){ setTimeout(r, 4000); });
-    d = await apiCall('/api/scan-files');
-  }
-  if (d && d.success) {
-    SCAN_DATA = d.files || [];
-    renderScans(SCAN_DATA, null);
-  } else {
-    var errMsg = (d && d.error) ? d.error : 'Could not reach OneDrive — check Vercel logs';
-    renderScans([], errMsg);
-  }
+  SCAN_DATA = (d && d.success) ? (d.files || []) : [];
+  renderScans(SCAN_DATA, (d && d.success) ? null : (d && d.error ? d.error : 'Could not reach OneDrive'));
 }
 
 // ── Processed column ──────────────────────────────────────────────────────────
@@ -317,7 +369,7 @@ function renderProcessed(files, error) {
   var count = el('proc-count');
   if (error) {
     count.textContent = 'Error';
-    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Processed</div><div class="de">'+esc(error)+'</div><div class="de" style="margin-top:6px"><a href="/api/diag" target="_blank" style="color:var(--or);text-decoration:none">&#128269; Run diagnostics &#8599;</a></div></div>';
+    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Processed</div><div class="de">'+esc(error)+'</div></div>';
     return;
   }
   count.textContent = files.length + ' file' + (files.length === 1 ? '' : 's');
@@ -328,35 +380,58 @@ function renderProcessed(files, error) {
   list.innerHTML = '';
   files.forEach(function(f, idx) {
     var odUrl = f.webUrl || '';
+
+    // Outer row — click toggles dropdown
     var row = document.createElement('div');
     row.className = 'fi done';
     row.style.flexDirection = 'column';
     row.style.alignItems = 'stretch';
+
+    // Top part
     var top = document.createElement('div');
-    top.style.cssText = 'display:flex;align-items:center;gap:8px;pointer-events:none';
+    top.style.display = 'flex';
+    top.style.alignItems = 'center';
+    top.style.gap = '8px';
+    top.style.pointerEvents = 'none';  // let row handle click
     top.innerHTML =
       '<div class="fic">&#128196;</div>'
       + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div>'
       + '<div class="fmeta">' + fmtSize(f.size) + ' &middot; ' + fmtDate(f.createdAt) + '</div></div>'
       + '<div class="fac"><span class="folder-tag od">&#128196; OD</span></div>';
+
+    // Dropdown
     var drop = document.createElement('div');
     drop.className = 'proc-drop';
     drop.id = 'pd-' + idx;
+
     var dropHtml =
       '<div class="pd-row"><div class="pd-lbl">Size</div><div class="pd-val">' + esc(fmtSize(f.size)) + '</div></div>'
       + '<div class="pd-row"><div class="pd-lbl">Filed</div><div class="pd-val">' + esc(fmtDate(f.createdAt)) + '</div></div>';
-    if (odUrl) dropHtml += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank">Open in OneDrive &#8599;</a></div>';
-    dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><button class="gd-btn">&#128230; Send to GD</button></div>';
+    if (odUrl) {
+      dropHtml += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank">Open in OneDrive &#8599;</a></div>';
+    }
+    dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><button class="gd-btn" id="gdb-' + idx + '">&#128230; Send to GD</button></div>';
     drop.innerHTML = dropHtml;
+
     row.appendChild(top);
     row.appendChild(drop);
+
+    // Click handler
     row.addEventListener('click', function() {
       var isOpen = drop.classList.contains('open');
       document.querySelectorAll('.proc-drop.open').forEach(function(d) { d.classList.remove('open'); });
       if (!isOpen) drop.classList.add('open');
     });
+
+    // GD button — must add after row is in DOM would cause issue, so use closure
     var gdBtn = drop.querySelector('.gd-btn');
-    if (gdBtn) gdBtn.addEventListener('click', function(e) { e.stopPropagation(); sendToGDrive(gdBtn, f.name, f.id); });
+    if (gdBtn) {
+      gdBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        sendToGDrive(gdBtn, f.name, f.id);
+      });
+    }
+
     list.appendChild(row);
   });
 }
@@ -365,21 +440,11 @@ async function refreshProcessed() {
   el('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading\u2026</div></div>';
   el('proc-count').textContent = '\u2014';
   var d = await apiCall('/api/scan-files?folder=Processed');
-  if (!d || !d.success) {
-    // Auto-retry once after 4 seconds (handles cold start delays)
-    await new Promise(function(r){ setTimeout(r, 4000); });
-    d = await apiCall('/api/scan-files?folder=Processed');
-  }
-  if (d && d.success) {
-    PROC_DATA = d.files || [];
-    renderProcessed(PROC_DATA, null);
-  } else {
-    var errMsg = (d && d.error) ? d.error : 'Could not reach OneDrive — check Vercel logs';
-    renderProcessed([], errMsg);
-  }
+  PROC_DATA = (d && d.success) ? (d.files || []) : [];
+  renderProcessed(PROC_DATA, (d && d.success) ? null : (d && d.error ? d.error : 'Could not reach OneDrive'));
 }
 
-// ── Reset ─────────────────────────────────────────────────────────────────────
+// ── File run ──────────────────────────────────────────────────────────────────
 async function doReset(fid) {
   if (!confirm('Reset this file so it can be reprocessed?')) return;
   var d = await apiCall('/api/admin?action=reset', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileId:fid}) });
@@ -393,7 +458,8 @@ async function sendToGDrive(btn, fname, fid) {
   var d = await apiCall('/api/gdrive?action=file', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileName:fname, fileId:fid}) });
   if (d && d.success) {
     var url = d.gdFileUrl || d.gdFolderUrl || '';
-    btn.parentElement.innerHTML = '<div class="pd-lbl">Google Drive</div>' + (url ? '<a class="pd-link" href="' + esc(url) + '" target="_blank">Open &#8599;</a>' : 'Filed &#10003;');
+    btn.parentElement.innerHTML = '<div class="pd-lbl">Google Drive</div>'
+      + (url ? '<a class="pd-link" href="' + esc(url) + '" target="_blank">Open &#8599;</a>' : 'Filed &#10003;');
   } else {
     btn.disabled = false; btn.innerHTML = '&#10007; Retry'; btn.style.color = 'var(--rd)';
     setTimeout(function(){ btn.innerHTML = '&#128230; Send to GD'; btn.style.color = ''; }, 6000);
@@ -451,10 +517,12 @@ function setLive(on, label) {
   el('stxt').textContent = label || (on ? 'Processing\u2026' : 'Watching for files\u2026');
   el('sdot').className = 'dot' + (on ? ' g' : '');
 }
+
 function setActivityName(name) {
   el('act-sub').textContent = name ? 'Currently processing:' : 'Waiting for automation\u2026';
   var n = el('act-name'); n.textContent = name || ''; n.style.display = name ? '' : 'none';
 }
+
 function mkStep(id, label, msg, st) {
   var ico = st==='running' ? '<span class="spin"></span>' : st==='done' ? '\u2713' : st==='error' ? '\u2715' : String(id);
   return '<div class="step '+st+'" id="st-'+id+'" data-st="'+st+'">'
@@ -462,6 +530,7 @@ function mkStep(id, label, msg, st) {
     +'<div style="flex:1;min-width:0"><div class="steplabel">'+esc(label)+'</div>'
     +(msg?'<div class="stepmsg">'+esc(msg)+'</div>':'')+'</div></div>';
 }
+
 function updStep(n, msg, st) {
   STEPS.forEach(function(s) {
     if (s.id < n) { var e=el('st-'+s.id); if(e&&(e.dataset.st==='pending'||e.dataset.st==='running'))e.outerHTML=mkStep(s.id,s.l,'','done'); }
@@ -471,6 +540,7 @@ function updStep(n, msg, st) {
   if (ex) ex.outerHTML = mkStep(n, step.l, msg, st);
   else el('steplist').insertAdjacentHTML('beforeend', mkStep(n, step.l, msg, st));
 }
+
 function showResult(d) {
   var files = (d.renamedFiles||[]).map(function(f){ return '<div class="fpill">'+esc(f)+'</div>'; }).join('');
   el('rescard').innerHTML = '<div class="rescard">'
@@ -483,10 +553,12 @@ function showResult(d) {
     +(files?'<div class="resrow" style="flex-direction:column;gap:2px"><div class="reslbl">Files</div>'+files+'</div>':'')
     +'</div>';
 }
+
 function showError(msg) {
   el('rescard').innerHTML = '<div class="rescard err"><div class="restitle">&#10060; Failed</div>'
     +'<div class="resrow"><div class="reslbl">Error</div><div class="resval" style="color:var(--rd)">'+esc(msg)+'</div></div></div>';
 }
+
 function handleEvt(ev, d) {
   if (ev==='progress') {
     if (d.status==='running') requestAnimationFrame(function(){ updStep(d.step,d.message,d.status); });
@@ -498,6 +570,7 @@ function handleEvt(ev, d) {
     showResult(d); onDone();
   } else if (ev==='error') { showError(d.message); onErr(); }
 }
+
 function onDone() {
   PROCESSING = false; CURRENT = null;
   setLive(false); hideRunPanel();
@@ -520,7 +593,7 @@ async function startWatching(file) {
   el('steplist').innerHTML = STEPS.map(function(s){ return mkStep(s.id,s.l,'','pending'); }).join('');
   el('rescard').innerHTML = '';
   var row = el('sf-' + file.id);
-  if (row) { row.className = 'fi active'; var fic = row.querySelector('.fic'); if(fic) fic.innerHTML = '<span class="spin" style="color:var(--or)"></span>'; }
+  if (row) { row.className = 'fi active'; row.querySelector('.fic').innerHTML = '<span class="spin" style="color:var(--or)"></span>'; }
   try {
     var resp = await fetch('/api/test-run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileId:file.id, fileName:file.name, runMode:'auto', runStep:1}) });
     if (!resp.ok) { showError('Server error ' + resp.status); onErr(); return; }
@@ -538,7 +611,9 @@ async function startWatching(file) {
     if (PROCESSING) {
       var rec = await apiCall('/api/status?fileId=' + encodeURIComponent(file.id));
       if (rec && rec.record && rec.record.status === 'completed') {
-        updStep(4,'All page(s) sent \u2713','done'); updStep(5,'All page(s) extracted \u2713','done'); updStep(6,'All page(s) filed \u2713','done');
+        updStep(4,'All page(s) sent \u2713','done');
+        updStep(5,'All page(s) extracted \u2713','done');
+        updStep(6,'All page(s) filed \u2713','done');
         showResult(rec.record); onDone();
       } else if (PROCESSING) onErr();
     }
@@ -551,7 +626,7 @@ function openNotifyStream() {
   var es = new EventSource('/api/notify');
   NOTIFY_ES = es;
   es.addEventListener('connected', function(){ console.log('[dashboard] notify connected'); });
-  es.addEventListener('new-file', async function() {
+  es.addEventListener('new-file', async function(e) {
     try {
       await refreshScans();
       if (!PROCESSING && SCAN_DATA.length > 0) startWatching(SCAN_DATA[0]);
@@ -576,10 +651,11 @@ el('gd-retry-btn').addEventListener('click', retryGD);
 el('gdp-close').addEventListener('click', function(){ el('gdpanel').classList.remove('open'); });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-refreshScans();
-refreshProcessed();
+renderScans(SCAN_DATA, SCAN_ERROR);
+renderProcessed(PROC_DATA, PROC_ERROR);
 openNotifyStream();
 
 })(); // end IIFE
 </script>
-</body></html>`;
+</body></html>`);
+};
