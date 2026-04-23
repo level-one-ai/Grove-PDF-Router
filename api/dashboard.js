@@ -13,58 +13,73 @@
 
 module.exports.config = { maxDuration: 30 };
 
+// Fetch a OneDrive folder listing with explicit timeout
+async function fetchFolder(graphRequest, userId, folderPath) {
+  // Use UNENCODED spaces — axios handles encoding internally.
+  // Pre-encoding with %20 causes axios to double-encode → %2520 → Graph API 404.
+  const path = `/users/${userId}/drive/root:/${folderPath}:/children` +
+    `?$select=id,name,size,createdDateTime,webUrl,file&$top=500`;
+
+  // Race with a 20-second timeout so we never exceed the 30s maxDuration
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`OneDrive timeout fetching: ${folderPath}`)), 20000)
+  );
+
+  const result = await Promise.race([graphRequest('GET', path), timeout]);
+  return result?.value || [];
+}
+
+function toPdfList(items) {
+  return items
+    .filter(f => {
+      const n = (f.name || '').toLowerCase();
+      return (n.endsWith('.pdf') || (f.file?.mimeType || '').includes('pdf')) && !n.startsWith('~');
+    })
+    .map(f => ({ id: f.id, name: f.name, size: f.size, createdAt: f.createdDateTime, webUrl: f.webUrl }))
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
 
-  // Fetch both folders server-side while serving the page
-  let scanFiles = [];
-  let procFiles = [];
-  let scanError = null;
-  let procError = null;
+  let scanFiles = [], procFiles = [], scanError = null, procError = null;
 
   try {
     const { graphRequest } = require('../lib/graph');
     const userId = process.env.ONEDRIVE_USER_ID;
 
-    if (!userId) throw new Error('ONEDRIVE_USER_ID not set');
+    if (!userId) throw new Error('ONEDRIVE_USER_ID not configured in Vercel env vars');
 
-    const base = `/users/${userId}/drive/root:/Grove%20Group%20Scotland/Grove%20Bedding/Scans`;
-    const qs = '?$select=id,name,size,createdDateTime,webUrl,file&$top=500';
+    const SCANS = 'Grove Group Scotland/Grove Bedding/Scans';
+    const PROCESSED = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
 
+    // Fetch both folders in parallel — each has its own 20s timeout
     const [scanRes, procRes] = await Promise.allSettled([
-      graphRequest('GET', `${base}:/children${qs}`),
-      graphRequest('GET', `${base}/Processed:/children${qs}`),
+      fetchFolder(graphRequest, userId, SCANS),
+      fetchFolder(graphRequest, userId, PROCESSED),
     ]);
 
     if (scanRes.status === 'fulfilled') {
-      scanFiles = (scanRes.value?.value || [])
-        .filter(f => {
-          const n = (f.name||'').toLowerCase();
-          return (n.endsWith('.pdf') || (f.file?.mimeType||'').includes('pdf'))
-            && !n.startsWith('~');
-        })
-        .map(f => ({ id:f.id, name:f.name, size:f.size, createdAt:f.createdDateTime, webUrl:f.webUrl }))
-        .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+      scanFiles = toPdfList(scanRes.value);
+      console.log(`[dashboard] Scans: ${scanFiles.length} PDF(s)`);
     } else {
-      scanError = scanRes.reason?.message || 'OneDrive error';
+      scanError = scanRes.reason?.graphMessage || scanRes.reason?.message || 'OneDrive error';
+      console.error('[dashboard] Scans fetch failed:', scanRes.reason?.message, scanRes.reason?.graphMessage);
     }
 
     if (procRes.status === 'fulfilled') {
-      procFiles = (procRes.value?.value || [])
-        .filter(f => {
-          const n = (f.name||'').toLowerCase();
-          return (n.endsWith('.pdf') || (f.file?.mimeType||'').includes('pdf'))
-            && !n.startsWith('~');
-        })
-        .map(f => ({ id:f.id, name:f.name, size:f.size, createdAt:f.createdDateTime, webUrl:f.webUrl }))
-        .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+      procFiles = toPdfList(procRes.value);
+      console.log(`[dashboard] Processed: ${procFiles.length} PDF(s)`);
     } else {
-      procError = procRes.reason?.message || 'OneDrive error';
+      procError = procRes.reason?.graphMessage || procRes.reason?.message || 'OneDrive error';
+      console.error('[dashboard] Processed fetch failed:', procRes.reason?.message, procRes.reason?.graphMessage);
     }
 
   } catch (err) {
-    scanError = err.message;
-    procError = err.message;
+    const msg = err.graphMessage || err.message;
+    console.error('[dashboard] Fatal error:', msg);
+    scanError = msg;
+    procError = msg;
   }
 
   const data = JSON.stringify({ scanFiles, procFiles, scanError, procError });
