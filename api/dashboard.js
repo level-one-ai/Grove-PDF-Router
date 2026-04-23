@@ -154,7 +154,7 @@ module.exports = async function handler(req, res) {
   --sl:#475569;
   --or:#0ea5e9;
 }
-body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
+body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
 /* Header */
 .hdr{background:var(--card);border-bottom:1px solid var(--border);padding:0 20px;height:56px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;box-shadow:0 1px 3px rgba(0,0,0,.04)}
 .hdr-left{display:flex;align-items:center;gap:10px}
