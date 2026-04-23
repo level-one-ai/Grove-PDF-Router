@@ -41,6 +41,9 @@ function toPdfList(items) {
 
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  // Never cache — the page contains live data (file lists from OneDrive)
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
 
   let scanFiles = [], procFiles = [], scanError = null, procError = null;
 

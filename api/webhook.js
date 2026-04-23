@@ -12,7 +12,6 @@
  * - Remaining pages uploaded in background ready for later dispatch
  */
 
-const db = require('../lib/firebase');
 const { graphRequest } = require('../lib/graph');
 const axios = require('axios');
 
@@ -56,78 +55,42 @@ module.exports = async function handler(req, res) {
 };
 
 async function scanAndProcess() {
-  // Ensure auto-poll is running — starts it if dead (e.g. fresh deployment)
-  ensureAutoPollRunning().catch(() => {}); // fire-and-forget, non-fatal
-
   const userId = process.env.ONEDRIVE_USER_ID;
-  const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
-
-  const result = await graphRequest(
-    'GET',
-    `/users/${userId}/drive/root:/${folderPath}:/children` +
-    `?$select=id,name,file,size,createdDateTime&$top=100`
-  );
-
-  const pdfFiles = (result?.value || [])
-    .filter(item => {
-      const name = (item.name || '').toLowerCase();
-      const mime = item.file?.mimeType || '';
-      return name.endsWith('.pdf') || mime.includes('pdf');
-    })
-    .sort((a, b) => new Date(b.createdDateTime) - new Date(a.createdDateTime));
-
-  console.log(`[webhook] ${pdfFiles.length} PDF(s) in Scans`);
-
-  const token = await getToken();
-  let newFilesDetected = [];
-
-  // Batch read all records in one Firestore call instead of one per file
-  const records = await batchGetRecords(pdfFiles.map(f => f.id));
-
-  for (const file of pdfFiles) {
-    const existing = records[file.id];
-
-    // Already completed — clean up
-    if (existing && existing.status === 'completed') {
-      console.log(`[webhook] "${file.name}" already completed — removing from Scans`);
-      await deleteFromScans(file.id, file.name, userId, token);
-      continue;
-    }
-
-    // Already processing, waiting, or errored — skip
-    // 'detected' is NOT skipped — it means we saw it before but scan-now may not
-    // have triggered yet. Allow webhook to re-trigger processing for it.
-    if (existing && !['reset', 'detected', null, undefined].includes(existing.status)) {
-      console.log(`[webhook] Skipping "${file.name}" — status: ${existing.status}`);
-      continue;
-    }
-
-    // This is a new or re-detected file — record it
-    console.log(`[webhook] New file detected: "${file.name}" (status: ${existing?.status || 'none'})`);
-    newFilesDetected.push(file);
-  }
-
-  if (newFilesDetected.length === 0) {
-    console.log('[webhook] No new files to process');
-    return;
-  }
-
-  // ── STEP 1: Notify dashboard immediately so scans panel updates ──
-  // This fires regardless of mode — the dashboard always sees new files instantly.
-  await notifyDashboard(newFilesDetected);
-
-  // ── STEP 2: Always auto-process — system is always watching ──
-  // Wait 3 seconds so dashboard has time to update visually before processing starts
-  await sleep(3000);
-
-  // Trigger scan-now which handles the full processing logic including priority ordering
   const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+
+  // List Scans folder for dashboard notification — best-effort, non-blocking
+  // No Firestore reads here — scan-now handles all the Firestore logic internally
+  let newFiles = [];
+  try {
+    const result = await graphRequest(
+      'GET',
+      `/users/${userId}/drive/root:/Grove Group Scotland/Grove Bedding/Scans:/children` +
+      `?$select=id,name,size,createdDateTime,file&$top=100`
+    );
+    newFiles = (result?.value || [])
+      .filter(item => {
+        const name = (item.name || '').toLowerCase();
+        const mime = item.file?.mimeType || '';
+        return name.endsWith('.pdf') || mime.includes('pdf');
+      })
+      .sort((a, b) => new Date(b.createdDateTime) - new Date(a.createdDateTime));
+    console.log(`[webhook] ${newFiles.length} PDF(s) in Scans`);
+  } catch (err) {
+    console.warn('[webhook] Could not list Scans (non-fatal):', err.message);
+  }
+
+  // Notify dashboard so the Scans panel refreshes immediately
+  if (newFiles.length > 0) {
+    await notifyDashboard(newFiles);
+  }
+
+  // Trigger scan-now — it handles Firestore, priority ordering, and processing
   try {
     await axios.post(`${baseUrl}/api/scan-now`, {}, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 10000,
     });
-    console.log('[webhook] Triggered scan-now after 3s delay');
+    console.log('[webhook] Triggered scan-now');
   } catch (err) {
     console.warn('[webhook] scan-now trigger warning:', err.message);
   }
@@ -155,53 +118,9 @@ async function notifyDashboard(files) {
 }
 
 
-async function deleteFromScans(itemId, fileName, userId, token) {
-  try {
-    // Check if file still exists in Scans first
-    await axios.get(
-      `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${itemId}`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    // File exists — delete it
-    await axios.delete(
-      `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${itemId}`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    console.log(`[webhook] Deleted "${fileName}" from Scans`);
-  } catch (err) {
-    if (err.response?.status === 404) {
-      console.log(`[webhook] "${fileName}" already gone from Scans — skipping delete`);
-    } else {
-      console.warn(`[webhook] Could not delete "${fileName}" from Scans:`, err.message);
-    }
-  }
-}
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-/**
- * Batch read multiple Firestore records in one call.
- * Returns { fileId: data | null }
- */
-async function batchGetRecords(fileIds) {
-  if (!fileIds.length) return {};
-  try {
-    const admin = require('firebase-admin');
-    const firestore = admin.firestore();
-    const refs = fileIds.map(id => firestore.collection('processedFiles').doc(id));
-    const docs = await firestore.getAll(...refs);
-    const result = {};
-    docs.forEach(doc => { result[doc.id] = doc.exists ? doc.data() : null; });
-    return result;
-  } catch (err) {
-    console.warn('[webhook] batchGetRecords error, falling back:', err.message);
-    const result = {};
-    for (const id of fileIds) {
-      try { result[id] = await db.getRecord(id); } catch (e) { result[id] = null; }
-    }
-    return result;
-  }
-}
 
 /**
  * ensureAutoPollRunning — RETIRED (no-op stub)
@@ -212,16 +131,3 @@ async function ensureAutoPollRunning() {
   // no-op — auto-poll retired, Make.com handles detection
 }
 
-async function getToken() {
-  const url = `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`;
-  const params = new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: process.env.MICROSOFT_CLIENT_ID,
-    client_secret: process.env.MICROSOFT_CLIENT_SECRET,
-    scope: 'https://graph.microsoft.com/.default',
-  });
-  const r = await axios.post(url, params.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  });
-  return r.data.access_token;
-}
