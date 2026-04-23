@@ -224,8 +224,16 @@ async function apiCall(url, opts) {
     var t = setTimeout(function(){ c.abort(); }, 25000);
     var r = await fetch(url, Object.assign({ signal: c.signal }, opts || {}));
     clearTimeout(t);
+    if (!r.ok) {
+      console.error('[dashboard] apiCall', url, 'HTTP', r.status);
+      var errBody = await r.json().catch(function(){ return {error: 'HTTP ' + r.status}; });
+      return errBody;
+    }
     return await r.json().catch(function(){ return null; });
-  } catch(e) { return null; }
+  } catch(e) {
+    console.error('[dashboard] apiCall', url, 'failed:', e.message);
+    return null;
+  }
 }
 
 // ── Scans column ──────────────────────────────────────────────────────────────
@@ -234,7 +242,7 @@ function renderScans(files, error) {
   var count = el('scan-count');
   if (error) {
     count.textContent = 'Error';
-    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Scans</div><div class="de">'+esc(error)+'</div></div>';
+    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Scans</div><div class="de">'+esc(error)+'</div><div class="de" style="margin-top:6px"><a href="/api/diag" target="_blank" style="color:var(--or);text-decoration:none">&#128269; Run diagnostics &#8599;</a></div></div>';
     return;
   }
   count.textContent = files.length + ' file' + (files.length === 1 ? '' : 's');
@@ -289,11 +297,17 @@ async function refreshScans() {
   el('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading\u2026</div></div>';
   el('scan-count').textContent = '\u2014';
   var d = await apiCall('/api/scan-files');
+  if (!d || !d.success) {
+    // Auto-retry once after 4 seconds (handles cold start delays)
+    await new Promise(function(r){ setTimeout(r, 4000); });
+    d = await apiCall('/api/scan-files');
+  }
   if (d && d.success) {
     SCAN_DATA = d.files || [];
     renderScans(SCAN_DATA, null);
   } else {
-    renderScans([], d && d.error ? d.error : 'Could not reach OneDrive');
+    var errMsg = (d && d.error) ? d.error : 'Could not reach OneDrive — check Vercel logs';
+    renderScans([], errMsg);
   }
 }
 
@@ -303,7 +317,7 @@ function renderProcessed(files, error) {
   var count = el('proc-count');
   if (error) {
     count.textContent = 'Error';
-    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Processed</div><div class="de">'+esc(error)+'</div></div>';
+    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Processed</div><div class="de">'+esc(error)+'</div><div class="de" style="margin-top:6px"><a href="/api/diag" target="_blank" style="color:var(--or);text-decoration:none">&#128269; Run diagnostics &#8599;</a></div></div>';
     return;
   }
   count.textContent = files.length + ' file' + (files.length === 1 ? '' : 's');
@@ -351,11 +365,17 @@ async function refreshProcessed() {
   el('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading\u2026</div></div>';
   el('proc-count').textContent = '\u2014';
   var d = await apiCall('/api/scan-files?folder=Processed');
+  if (!d || !d.success) {
+    // Auto-retry once after 4 seconds (handles cold start delays)
+    await new Promise(function(r){ setTimeout(r, 4000); });
+    d = await apiCall('/api/scan-files?folder=Processed');
+  }
   if (d && d.success) {
     PROC_DATA = d.files || [];
     renderProcessed(PROC_DATA, null);
   } else {
-    renderProcessed([], d && d.error ? d.error : 'Could not reach OneDrive');
+    var errMsg = (d && d.error) ? d.error : 'Could not reach OneDrive — check Vercel logs';
+    renderProcessed([], errMsg);
   }
 }
 
