@@ -227,8 +227,13 @@ function fsize(b){ if(!b) return ''; var k=1024,i=Math.floor(Math.log(b)/Math.lo
 function $(id){ return document.getElementById(id); }
 
 async function api(url, opts) {
-  try { var r=await fetch(url,opts||{}); return await r.json().catch(function(){return null;}); }
-  catch(e){ return null; }
+  try {
+    var controller = new AbortController();
+    var timer = setTimeout(function(){ controller.abort(); }, 15000);
+    var r = await fetch(url, Object.assign({signal: controller.signal}, opts || {}));
+    clearTimeout(timer);
+    return await r.json().catch(function(){ return null; });
+  } catch(e) { return null; }
 }
 
 // ── Status: 1 Firestore read, with timeout so it never hangs forever ─────────
@@ -250,8 +255,9 @@ async function loadScans() {
   $('scan-count').textContent = '—';
   var d = await api('/api/scan-files');
   if (!d || !d.success || !d.files) {
+    var errMsg = (d && d.error) ? d.error : 'Could not reach OneDrive — check Vercel logs';
     $('scan-count').textContent = 'Error';
-    $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load</div></div>';
+    $('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Scans</div><div class="de" style="font-size:10px;word-break:break-all">' + esc(errMsg) + '</div></div>';
     return;
   }
   var done = {};
@@ -328,8 +334,9 @@ async function loadProcessed() {
   // Fetch the Processed folder from OneDrive — same API, different folder param
   var d = await api('/api/scan-files?folder=Processed');
   if (!d || !d.success) {
+    var errMsg2 = (d && d.error) ? d.error : 'Could not reach OneDrive — check Vercel logs';
     $('proc-count').textContent = 'Error';
-    $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Processed folder</div></div>';
+    $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Processed folder</div><div class="de" style="font-size:10px;word-break:break-all">' + esc(errMsg2) + '</div></div>';
     return;
   }
 

@@ -47,12 +47,14 @@ module.exports = async function handler(req, res) {
       folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
     }
 
-    const apiPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file`;
+    // $top=500 ensures we get up to 500 files in one call
+    // $select limits fields returned to reduce payload size
+    const apiPath = `/users/${userId}/drive/root:/${folderPath}:/children?$select=id,name,size,createdDateTime,webUrl,file&$top=500`;
     console.log('[scan-files] Calling Graph API:', apiPath);
 
-    // Timeout after 8 seconds
+    // 12-second timeout — covers cold starts and slow OneDrive responses
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('OneDrive request timed out after 8 seconds')), 8000)
+      setTimeout(() => reject(new Error('OneDrive request timed out after 12 seconds')), 12000)
     );
     const result = await Promise.race([graphRequest('GET', apiPath), timeoutPromise]);
     const items = result?.value || [];
