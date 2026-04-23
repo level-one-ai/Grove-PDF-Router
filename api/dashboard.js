@@ -189,6 +189,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
   <div class="sub-row">
     <div class="dot" id="sdot"></div>
     <span class="sub-txt" id="stxt">Watching for files...</span>
+    <a href="/api/diag" target="_blank" style="margin-left:8px;font-size:10px;color:var(--mu);text-decoration:none;border:1px solid var(--bo);padding:2px 7px;border-radius:4px">&#128269; Diag</a>
   </div>
 </header>
 <div class="main">
@@ -651,9 +652,19 @@ el('gd-retry-btn').addEventListener('click', retryGD);
 el('gdp-close').addEventListener('click', function(){ el('gdpanel').classList.remove('open'); });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-renderScans(SCAN_DATA, SCAN_ERROR);
-renderProcessed(PROC_DATA, PROC_ERROR);
-openNotifyStream();
+try {
+  renderScans(SCAN_DATA, SCAN_ERROR);
+  renderProcessed(PROC_DATA, PROC_ERROR);
+  openNotifyStream();
+  console.log('[dashboard] Init OK — Scans:', SCAN_DATA.length, 'Processed:', PROC_DATA.length);
+} catch(initErr) {
+  console.error('[dashboard] Init error:', initErr);
+  // Show the error visually on the page
+  var errDiv = document.createElement('div');
+  errDiv.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:#1f0f0f;border:1px solid #ef4444;color:#f87171;padding:12px 20px;border-radius:8px;font-size:12px;z-index:999;max-width:80%';
+  errDiv.textContent = 'Dashboard JS error: ' + initErr.message;
+  document.body.appendChild(errDiv);
+}
 
 })(); // end IIFE
 </script>
