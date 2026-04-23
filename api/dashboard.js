@@ -29,42 +29,8 @@ module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
 
-  let scanFiles = [], procFiles = [], scanError = null, procError = null;
-
-  try {
-    const { graphRequest } = require('../lib/graph');
-    const userId = process.env.ONEDRIVE_USER_ID;
-    if (!userId) throw new Error('ONEDRIVE_USER_ID not set');
-
-    const [sr, pr] = await Promise.allSettled([
-      fetchFolder(graphRequest, userId, 'Grove Group Scotland/Grove Bedding/Scans'),
-      fetchFolder(graphRequest, userId, 'Grove Group Scotland/Grove Bedding/Scans/Processed'),
-    ]);
-
-    if (sr.status === 'fulfilled') {
-      scanFiles = sr.value;
-      console.log(`[dashboard] Scans: ${scanFiles.length} files`);
-    } else {
-      scanError = sr.reason?.graphMessage || sr.reason?.message || 'OneDrive error';
-      console.error('[dashboard] Scans failed:', scanError);
-    }
-    if (pr.status === 'fulfilled') {
-      procFiles = pr.value;
-      console.log(`[dashboard] Processed: ${procFiles.length} files`);
-    } else {
-      procError = pr.reason?.graphMessage || pr.reason?.message || 'OneDrive error';
-      console.error('[dashboard] Processed failed:', procError);
-    }
-  } catch (err) {
-    const msg = err.graphMessage || err.message;
-    console.error('[dashboard] Fatal:', msg);
-    scanError = msg; procError = msg;
-  }
-
-  // Safely inject JSON — replace </script> to prevent early tag closure
-  function safeJson(v) {
-    return JSON.stringify(v).replace(/<\/script>/gi, '<\\/script>');
-  }
+  // Files are loaded client-side via /api/scan-files on page load.
+  // This avoids cold-start timeouts and ensures the dashboard always shows fresh data.
 
   res.status(200).send(`<!DOCTYPE html>
 <html lang="en">
@@ -245,11 +211,11 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 (function() {
 'use strict';
 
-// ── Data injected by server ───────────────────────────────────────────────────
-var SCAN_DATA  = ${safeJson(scanFiles)};
-var PROC_DATA  = ${safeJson(procFiles)};
-var SCAN_ERROR = ${safeJson(scanError)};
-var PROC_ERROR = ${safeJson(procError)};
+// ── Data — populated on load via /api/scan-files ──────────────────────────────
+var SCAN_DATA  = [];
+var PROC_DATA  = [];
+var SCAN_ERROR = null;
+var PROC_ERROR = null;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 var PROCESSING    = false;
@@ -651,15 +617,15 @@ el('proc-refresh').addEventListener('click', refreshProcessed);
 el('gd-retry-btn').addEventListener('click', retryGD);
 el('gdp-close').addEventListener('click', function(){ el('gdpanel').classList.remove('open'); });
 
-// ── Init ──────────────────────────────────────────────────────────────────────
+// ── Init — fetch both columns fresh from OneDrive ─────────────────────────────
 try {
-  renderScans(SCAN_DATA, SCAN_ERROR);
-  renderProcessed(PROC_DATA, PROC_ERROR);
   openNotifyStream();
-  console.log('[dashboard] Init OK — Scans:', SCAN_DATA.length, 'Processed:', PROC_DATA.length);
+  // Always fetch live from /api/scan-files — avoids cold-start race conditions
+  Promise.all([refreshScans(), refreshProcessed()]).then(function() {
+    console.log('[dashboard] Init OK — Scans:', SCAN_DATA.length, 'Processed:', PROC_DATA.length);
+  });
 } catch(initErr) {
   console.error('[dashboard] Init error:', initErr);
-  // Show the error visually on the page
   var errDiv = document.createElement('div');
   errDiv.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:#1f0f0f;border:1px solid #ef4444;color:#f87171;padding:12px 20px;border-radius:8px;font-size:12px;z-index:999;max-width:80%';
   errDiv.textContent = 'Dashboard JS error: ' + initErr.message;
