@@ -231,10 +231,16 @@ async function api(url, opts) {
   catch(e){ return null; }
 }
 
-// ── Status: 1 Firestore read, only called on open or file completion ──────────
+// ── Status: 1 Firestore read, with timeout so it never hangs forever ─────────
 async function loadStatus() {
-  var d = await api('/api/status?limit=200');
-  if (d && d.records) STATUS_CACHE = d.records;
+  try {
+    // 8-second timeout — if Firestore is over quota it hangs, this prevents that
+    var timeout = new Promise(function(_, rej){ setTimeout(function(){ rej(new Error('timeout')); }, 8000); });
+    var d = await Promise.race([api('/api/status?limit=200'), timeout]);
+    if (d && d.records) STATUS_CACHE = d.records;
+  } catch(e) {
+    console.warn('[dashboard] loadStatus failed or timed out:', e.message);
+  }
   return STATUS_CACHE;
 }
 
@@ -312,69 +318,90 @@ async function doReset(fid) {
   else { alert('Reset failed: ' + (d && d.error ? d.error : 'Unknown error')); }
 }
 
-// ── Processed: loads from STATUS_CACHE, no extra Firestore read ───────────────
+// ── Processed: reads from OneDrive Processed folder (zero Firestore cost) ─────
+// Enriches with Firestore metadata (customer, ref, GD links) if available,
+// but works and shows filenames even when Firestore is unavailable.
 async function loadProcessed() {
   $('proc-list').innerHTML = '<div class="stmsg"><div class="ic pulse">&#128194;</div><div class="ti">Loading\u2026</div></div>';
   $('proc-count').textContent = '—';
-  var completed = STATUS_CACHE
-    .filter(function(r){return r.status==='completed';})
-    .sort(function(a,b){return new Date(b.completedAt||0)-new Date(a.completedAt||0);});
-  if (!completed.length) {
-    $('proc-count').textContent = '0 files';
-    $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128100;</div><div class="ti">No files yet</div></div>';
+
+  // Fetch the Processed folder from OneDrive — same API, different folder param
+  var d = await api('/api/scan-files?folder=Processed');
+  if (!d || !d.success) {
+    $('proc-count').textContent = 'Error';
+    $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Processed folder</div></div>';
     return;
   }
-  var rows = [];
-  completed.forEach(function(rec){
-    var pages = rec.pageFiles && rec.pageFiles.length ? rec.pageFiles : null;
-    if (pages) { pages.forEach(function(pg){ rows.push({rec:rec,pg:pg}); }); }
-    else {
-      var names = rec.renamedFiles && rec.renamedFiles.length ? rec.renamedFiles : [rec.originalFileName||rec.fileId];
-      names.forEach(function(name){ rows.push({rec:rec,pg:{finalFileName:name,customerName:rec.customerName,ref:rec.ref,supplier:rec.supplier,googleDriveUrl:rec.googleDriveFolderUrl}}); });
-    }
+
+  var processedFiles = d.files || [];
+  $('proc-count').textContent = processedFiles.length + ' file' + (processedFiles.length===1?'':'s');
+
+  if (!processedFiles.length) {
+    $('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128100;</div><div class="ti">No files yet</div><div class="de">Processed files will appear here</div></div>';
+    return;
+  }
+
+  // Build a lookup from STATUS_CACHE for enrichment (customer, ref, GD links etc)
+  // This works even if STATUS_CACHE is empty (Firestore unavailable)
+  var metaByFileName = {};
+  STATUS_CACHE.forEach(function(rec) {
+    (rec.pageFiles || []).forEach(function(pg) {
+      if (pg.finalFileName) metaByFileName[pg.finalFileName] = { rec: rec, pg: pg };
+    });
+    // Also index by renamed files array
+    (rec.renamedFiles || []).forEach(function(fname) {
+      if (!metaByFileName[fname]) metaByFileName[fname] = { rec: rec, pg: null };
+    });
   });
-  $('proc-count').textContent = rows.length + ' page'+(rows.length===1?'':'s');
-  $('proc-list').innerHTML = rows.map(function(row,idx){
-    var rec=row.rec, pg=row.pg;
-    var name = pg.finalFileName||pg.nonOrderFileName||'Unknown';
-    var customer = pg.customerName||rec.customerName||'';
-    var ref = pg.ref||rec.ref||'';
-    var supplier = pg.supplier||rec.supplier||'';
-    var gdFile = pg.googleDriveFileUrl||'';
-    var gdFolder = pg.googleDriveUrl||rec.googleDriveFolderUrl||'';
-    var odUrl = pg.oneDriveUrl||'';
-    var folder = customer?(customer+(ref?' / '+ref:'')):'';
+
+  $('proc-list').innerHTML = processedFiles.map(function(f, idx) {
+    var meta = metaByFileName[f.name] || null;
+    var rec = meta ? meta.rec : null;
+    var pg = meta ? meta.pg : null;
+    var customer = (pg && pg.customerName) || (rec && rec.customerName) || '';
+    var ref = (pg && pg.ref) || (rec && rec.ref) || '';
+    var supplier = (pg && pg.supplier) || (rec && rec.supplier) || '';
+    var gdFile = (pg && pg.googleDriveFileUrl) || '';
+    var gdFolder = (pg && pg.googleDriveUrl) || (rec && rec.googleDriveFolderUrl) || '';
+    var odUrl = (pg && pg.oneDriveUrl) || f.webUrl || '';
+    var folder = customer ? (customer + (ref ? ' / ' + ref : '')) : '';
+    var completedAt = rec && rec.completedAt ? rec.completedAt : null;
+
+    // Tags
     var tags = '';
-    if (pg.skipped) { tags='<span class="folder-tag" style="background:#1a001a;color:#a855f7;border:1px solid #a855f733">&#128193; Non-Order</span>'; }
-    else {
-      if (gdFolder||gdFile) tags+='<span class="folder-tag gd">&#128230; GD</span>';
-      else tags+='<span class="folder-tag" style="background:#1a1a00;color:#eab308;border:1px solid #eab30833">&#9203; GD Pending</span>';
-      if (odUrl) tags+=' <span class="folder-tag od">&#128196; OD</span>';
-    }
-    var did='pdrop-'+idx;
-    var drop='<div class="proc-drop" id="'+did+'">';
-    if (supplier) drop+='<div class="pd-row"><div class="pd-lbl">Supplier</div><div class="pd-val">'+esc(supplier)+'</div></div>';
-    if (folder) drop+='<div class="pd-row"><div class="pd-lbl">Folder</div><div class="pd-val">'+esc(folder)+'</div></div>';
-    if (odUrl) drop+='<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="'+esc(odUrl)+'" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
+    if (gdFolder || gdFile) tags += '<span class="folder-tag gd">&#128230; GD</span>';
+    if (odUrl) tags += (tags?' ':'') + '<span class="folder-tag od">&#128196; OD</span>';
+
+    // Dropdown
+    var did = 'pdrop-' + idx;
+    var drop = '<div class="proc-drop" id="' + did + '">';
+    if (supplier) drop += '<div class="pd-row"><div class="pd-lbl">Supplier</div><div class="pd-val">' + esc(supplier) + '</div></div>';
+    if (folder)   drop += '<div class="pd-row"><div class="pd-lbl">Folder</div><div class="pd-val">' + esc(folder) + '</div></div>';
+    if (odUrl)    drop += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
     if (gdFile) {
-      drop+='<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
-        +'<a class="pd-link" href="'+esc(gdFile)+'" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a>'
-        +(gdFolder?' &nbsp;<a class="pd-link" style="opacity:.6;font-size:10px" href="'+esc(gdFolder)+'" target="_blank" onclick="event.stopPropagation()">folder &#8599;</a>':'')
-        +'</div>';
+      drop += '<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
+        + '<a class="pd-link" href="' + esc(gdFile) + '" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a>'
+        + (gdFolder ? ' &nbsp;<a class="pd-link" style="opacity:.6;font-size:10px" href="' + esc(gdFolder) + '" target="_blank" onclick="event.stopPropagation()">folder &#8599;</a>' : '')
+        + '</div>';
     } else if (gdFolder) {
-      drop+='<div class="pd-row"><div class="pd-lbl">Google Drive</div><a class="pd-link" href="'+esc(gdFolder)+'" target="_blank" onclick="event.stopPropagation()">Open folder &#8599;</a></div>';
-    } else if (!pg.skipped && rec.fileId) {
-      drop+='<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
-        +'<button class="gd-send-btn" data-fname="'+esc(rec.originalFileName||'')+'" data-fid="'+esc(rec.fileId||'')+'" '
-        +'onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
+      drop += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><a class="pd-link" href="' + esc(gdFolder) + '" target="_blank" onclick="event.stopPropagation()">Open folder &#8599;</a></div>';
+    } else if (rec && rec.fileId) {
+      drop += '<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
+        + '<button class="gd-send-btn" data-fname="' + esc(rec.originalFileName||'') + '" data-fid="' + esc(rec.fileId||'') + '" '
+        + 'onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
     }
-    if (rec.completedAt) drop+='<div class="pd-row"><div class="pd-lbl">Processed</div><div class="pd-val">'+fdate(rec.completedAt)+'</div></div>';
-    drop+='</div>';
-    return '<div class="fi done-f" data-dropid="'+did+'" onclick="toggleDrop(this.dataset.dropid)" style="flex-direction:column;align-items:stretch">'
-      +'<div style="display:flex;align-items:center;gap:8px">'
-      +'<div class="fic">&#128196;</div>'
-      +'<div class="fin"><div class="fnm">'+esc(name)+'</div>'+(folder?'<div class="fmeta">'+esc(folder)+'</div>':'')+'</div>'
-      +'<div class="fac">'+tags+'</div></div>'+drop+'</div>';
+    drop += '<div class="pd-row"><div class="pd-lbl">Size</div><div class="pd-val">' + esc(f.sizeFormatted||'') + '</div></div>';
+    if (completedAt) drop += '<div class="pd-row"><div class="pd-lbl">Processed</div><div class="pd-val">' + fdate(completedAt) + '</div></div>';
+    drop += '</div>';
+
+    return '<div class="fi done-f" data-dropid="' + did + '" onclick="toggleDrop(this.dataset.dropid)" style="flex-direction:column;align-items:stretch">'
+      + '<div style="display:flex;align-items:center;gap:8px">'
+      + '<div class="fic">&#128196;</div>'
+      + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div>'
+      + (folder ? '<div class="fmeta">' + esc(folder) + '</div>' : '<div class="fmeta" style="color:var(--mu)">' + esc(f.sizeFormatted||'') + '</div>')
+      + '</div>'
+      + '<div class="fac">' + tags + '</div>'
+      + '</div>' + drop + '</div>';
   }).join('');
 }
 
@@ -600,9 +627,13 @@ function openNotifyStream(){
 }
 
 // ── Init — runs once, then everything is event-driven ─────────────────────────
-// Total Firestore reads on init: 1
-// Total Firestore reads while idle: 0
-loadStatus().then(function(){
+// loadScans and loadProcessed fire immediately from OneDrive — no Firestore needed
+// loadStatus (Firestore) runs in parallel and enriches the view when it resolves
+// If Firestore is over quota it times out after 8s — columns still show from OneDrive
+loadScans();      // OneDrive — works even when Firestore is unavailable
+loadProcessed();  // OneDrive — works even when Firestore is unavailable
+loadStatus().then(function() {
+  // Re-render with Firestore metadata (customer, ref, GD links) if it loaded
   loadScans();
   loadProcessed();
 });
