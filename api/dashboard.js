@@ -84,58 +84,6 @@ module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
-
-  let scanFiles = [], procFiles = [], fsRecords = {};
-  let scanError = null, procError = null;
-
-  try {
-    const { graphRequest } = require('../lib/graph');
-    const userId = process.env.ONEDRIVE_USER_ID;
-    if (!userId) throw new Error('ONEDRIVE_USER_ID not set');
-
-    // Fetch all three in parallel — OneDrive Scans, OneDrive Processed, Firestore
-    const [sr, pr, fr] = await Promise.allSettled([
-      fetchODFolder(graphRequest, userId, SCANS_PATH),
-      fetchODFolder(graphRequest, userId, PROCESSED_PATH),
-      fetchFirestoreRecords(),
-    ]);
-
-    console.log('[dashboard] OneDrive Scans status:', sr.status);
-    console.log('[dashboard] OneDrive Processed status:', pr.status);
-    if (sr.status === 'fulfilled') {
-      scanFiles = sr.value;
-      console.log(`[dashboard] Scans: ${scanFiles.length} file(s)`);
-    } else {
-      scanError = sr.reason?.graphMessage || sr.reason?.message || 'OneDrive error';
-      console.error('[dashboard] Scans failed:', scanError);
-    }
-    if (pr.status === 'fulfilled') {
-      procFiles = pr.value;
-      console.log(`[dashboard] Processed: ${procFiles.length} file(s)`);
-    } else {
-      procError = pr.reason?.graphMessage || pr.reason?.message || 'OneDrive error';
-      console.error('[dashboard] Processed failed:', procError);
-    }
-    if (fr.status === 'fulfilled') {
-      fsRecords = fr.value;
-    }
-
-    // Enrich processed files with Firestore metadata
-    procFiles = procFiles.map(f => {
-      const meta = fsRecords[f.name.toLowerCase()] || {};
-      return { ...f, customerName: meta.customerName || null, ref: meta.ref || null, gdUrl: meta.gdUrl || null };
-    });
-
-  } catch (err) {
-    const msg = err.graphMessage || err.message;
-    console.error('[dashboard] Fatal:', msg);
-    scanError = msg; procError = msg;
-  }
-
-  function safeJson(v) {
-    return JSON.stringify(v).replace(/<\/script>/gi, '<\\/script>');
-  }
-
   res.status(200).send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -366,10 +314,9 @@ body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-ser
 'use strict';
 
 // ── Server-injected data ──────────────────────────────────────────────────────
-var SCAN_DATA  = ${safeJson(scanFiles)};
-var PROC_DATA  = ${safeJson(procFiles)};
-var SCAN_ERROR = ${safeJson(scanError)};
-var PROC_ERROR = ${safeJson(procError)};
+// Data loaded client-side via /api/scan-files on init
+var SCAN_DATA  = [];
+var PROC_DATA  = [];
 
 // ── State ─────────────────────────────────────────────────────────────────────
 var PROCESSING  = false;
@@ -679,10 +626,29 @@ function renderProcessed(files, error){
 async function refreshProcessed(){
   el('proc-list').innerHTML='<div class="empty"><div class="empty-ic">&#128194;</div><div class="empty-ti">Loading\u2026</div></div>';
   el('proc-count').textContent='\u2014';
-  var d=await api('/api/scan-files?folder=Processed');
-  PROC_DATA=(d&&d.success)?d.files||[]:[];
-  // On refresh we lose the Firestore metadata (GD links) — show what OneDrive has
-  renderProcessed(PROC_DATA,(d&&d.success)?null:(d&&d.error?d.error:'Could not reach OneDrive'));
+  var results=await Promise.all([
+    api('/api/scan-files?folder=Processed'),
+    api('/api/status?limit=300')
+  ]);
+  var d=results[0],s=results[1];
+  if(d&&d.success){
+    var fsMap={};
+    if(s&&s.records){
+      s.records.forEach(function(r){
+        var gdUrl=r.googleDriveFolderUrl||null;
+        (r.renamedFiles||[]).forEach(function(fname){
+          fsMap[fname.toLowerCase()]={gdUrl:gdUrl,customerName:r.customerName||null,ref:r.ref||null};
+        });
+      });
+    }
+    PROC_DATA=(d.files||[]).map(function(f){
+      var meta=fsMap[f.name.toLowerCase()]||{};
+      return Object.assign({},f,{gdUrl:meta.gdUrl||null,customerName:meta.customerName||null,ref:meta.ref||null});
+    });
+    renderProcessed(PROC_DATA,null);
+  }else{
+    renderProcessed([],(d&&d.error)?d.error:'Could not reach OneDrive');
+  }
 }
 
 // ── Reset ─────────────────────────────────────────────────────────────────────
@@ -878,16 +844,12 @@ var _pc=el('panel-close-btn');if(_pc) _pc.addEventListener('click',toggleDiag);
 var _sr=el('scan-refresh-btn');if(_sr) _sr.addEventListener('click',refreshScans);
 var _pr=el('proc-refresh-btn');if(_pr) _pr.addEventListener('click',refreshProcessed);
 
-// ── Init ──────────────────────────────────────────────────────────────────────
+// ── Init — fetch data client-side (no template literal injection risk) ─────────
 buildPipeline();
-try{
-  renderScans(SCAN_DATA,SCAN_ERROR);
-  renderProcessed(PROC_DATA,PROC_ERROR);
-  console.log('[dashboard] Init \u2014 Scans:',SCAN_DATA.length,'Processed:',PROC_DATA.length);
-}catch(err){
-  console.error('[dashboard] Init error:',err);
-}
 openNotifyStream();
+// Fetch both columns in parallel immediately on page load
+refreshScans();
+refreshProcessed();
 
 })();
 </script>
