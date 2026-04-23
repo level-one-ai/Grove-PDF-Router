@@ -18,7 +18,7 @@
  * Zero automatic polling. Zero Firebase reads after initial load.
  */
 
-module.exports.config = { maxDuration: 30 };
+module.exports.config = { maxDuration: 60 };
 
 const SCANS_PATH     = 'Grove Group Scotland/Grove Bedding/Scans';
 const PROCESSED_PATH = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
@@ -54,7 +54,6 @@ async function fetchFirestoreRecords() {
     const snap = await admin.firestore()
       .collection('processedFiles')
       .where('status', '==', 'completed')
-      .orderBy('completedAt', 'desc')
       .limit(300)
       .get();
 
@@ -101,6 +100,8 @@ module.exports = async function handler(req, res) {
       fetchFirestoreRecords(),
     ]);
 
+    console.log('[dashboard] OneDrive Scans status:', sr.status);
+    console.log('[dashboard] OneDrive Processed status:', pr.status);
     if (sr.status === 'fulfilled') {
       scanFiles = sr.value;
       console.log(`[dashboard] Scans: ${scanFiles.length} file(s)`);
