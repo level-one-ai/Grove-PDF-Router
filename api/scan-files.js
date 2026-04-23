@@ -54,7 +54,7 @@ module.exports = async function handler(req, res) {
 
     // 12-second timeout — covers cold starts and slow OneDrive responses
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('OneDrive request timed out after 12 seconds')), 12000)
+      setTimeout(() => reject(new Error('OneDrive request timed out after 25 seconds')), 25000)
     );
     const result = await Promise.race([graphRequest('GET', apiPath), timeoutPromise]);
     const items = result?.value || [];
