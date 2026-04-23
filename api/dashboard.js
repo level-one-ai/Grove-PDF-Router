@@ -78,16 +78,22 @@ function buildScanList(files, error) {
       + '<div class="ti">Scans folder is empty</div>'
       + '<div class="de">Files appear here when dropped into OneDrive Scans</div></div>';
   }
-  return files.map((f, idx) =>
-    '<div class="fi" id="sf-' + h(f.id) + '" onclick="selectFile(\'' + h(f.id) + '\')">'
-    + '<div class="fic">&#128196;</div>'
-    + '<div class="fin">'
-    + '<div class="fnm">' + h(f.name) + '</div>'
-    + '<div class="fmeta">' + h(formatBytes(f.size)) + ' &middot; ' + h(formatDate(f.createdAt)) + '</div>'
-    + '</div>'
-    + '<button class="rstbtn" title="Reset file" onclick="event.stopPropagation();doReset(\'' + h(f.id) + '\')">&#8635;</button>'
-    + '</div>'
-  ).join('');
+  return files.map(function(f) {
+    return '<div class="fi"'
+      + ' id="sf-' + h(f.id) + '"'
+      + ' data-fid="' + h(f.id) + '"'
+      + ' data-fname="' + h(f.name) + '"'
+      + ' data-fsize="' + (f.size || 0) + '"'
+      + ' data-fdate="' + h(f.createdAt || '') + '"'
+      + ' onclick="selectFile(this)">'
+      + '<div class="fic">&#128196;</div>'
+      + '<div class="fin">'
+      + '<div class="fnm">' + h(f.name) + '</div>'
+      + '<div class="fmeta">' + h(formatBytes(f.size)) + ' &middot; ' + h(formatDate(f.createdAt)) + '</div>'
+      + '</div>'
+      + '<button class="rstbtn" title="Reset file" onclick="event.stopPropagation();doReset(this.dataset.fid)" data-fid="' + h(f.id) + '">&#8635;</button>'
+      + '</div>';
+  }).join('');
 }
 
 // Generate HTML for the Processed file list — runs on the server
@@ -418,7 +424,7 @@ function renderScans(files, error) {
   $('scan-list').innerHTML = files.map(function(f){
     var active  = CURRENT_FILE  && CURRENT_FILE.id  === f.id;
     var sel     = SELECTED_FILE && SELECTED_FILE.id === f.id && !active;
-    return '<div class="fi'+(active?' active-f':sel?' sel-f':'')+'" id="sf-'+esc(f.id)+'" onclick="selectFile(\''+esc(f.id)+'\')">'
+    return '<div class="fi'+(active?' active-f':sel?' sel-f':'')+'"'+' id="sf-'+esc(f.id)+'"'+' data-fid="'+esc(f.id)+'"'+' data-fname="'+esc(f.name)+'"'+' data-fsize="'+(f.size||0)+'"'+' data-fdate="'+esc(f.createdAt||'')+'"'+' onclick="selectFile(this)">'
       +'<div class="fic">'+(active?'<span class="spin" style="color:var(--or)"></span>':'&#128196;')+'</div>'
       +'<div class="fin">'
         +'<div class="fnm">'+esc(f.name)+'</div>'
@@ -477,15 +483,23 @@ async function refreshProcessed(){
 }
 
 // ── File selection & run ──────────────────────────────────────────────────────
-function selectFile(fid){
+function selectFile(el){
   if(PROCESSING)return;
-  var f=SCAN_FILES.find(function(x){return x.id===fid;});
-  if(!f)return;
-  SELECTED_FILE=f;
-  document.querySelectorAll('.fi.sel-f').forEach(function(el){el.classList.remove('sel-f');});
-  var el=$('sf-'+fid); if(el)el.classList.add('sel-f');
-  $('run-fname').textContent=f.name;
-  $('run-fmeta').textContent=fsize(f.size)+' \u00b7 '+fdate(f.createdAt);
+  // Read file data directly from element data attributes — no SCAN_FILES lookup needed
+  var fid   = el.dataset.fid;
+  var fname = el.dataset.fname;
+  var fsize_val = parseInt(el.dataset.fsize||'0',10);
+  var fdate_val = el.dataset.fdate||'';
+  if(!fid||!fname)return;
+  SELECTED_FILE = {id:fid, name:fname, size:fsize_val, createdAt:fdate_val};
+  // Update SCAN_FILES too so startWatching has the full object
+  if(!SCAN_FILES.find(function(x){return x.id===fid;})){
+    SCAN_FILES.push(SELECTED_FILE);
+  }
+  document.querySelectorAll('.fi.sel-f').forEach(function(e){e.classList.remove('sel-f');});
+  el.classList.add('sel-f');
+  $('run-fname').textContent=fname;
+  $('run-fmeta').textContent=fsize(fsize_val)+' \u00b7 '+fdate(fdate_val);
   var ra=$('run-area'); ra.classList.add('show');
   var btn=$('runbtn'); btn.className='runbtn go'; btn.disabled=false; btn.innerHTML='&#9654; Run this file';
 }
