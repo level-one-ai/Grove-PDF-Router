@@ -153,7 +153,7 @@ module.exports = async function handler(req, res) {
   --sl:#475569;
   --or:#0ea5e9;
 }
-body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
 /* Header */
 .hdr{background:var(--card);border-bottom:1px solid var(--border);padding:0 20px;height:56px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;box-shadow:0 1px 3px rgba(0,0,0,.04)}
 .hdr-left{display:flex;align-items:center;gap:10px}
@@ -168,8 +168,8 @@ body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-ser
 .status-dot.live{background:var(--em);box-shadow:0 0 0 2px var(--embr)}
 .status-txt{font-size:11px;color:var(--mu);font-weight:500}
 /* Main grid */
-.main{display:grid;grid-template-columns:1fr 1fr;gap:0;flex:1;overflow:hidden}
-.col{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
+.main{display:grid;grid-template-columns:1fr 1fr;gap:0;flex:1;overflow:hidden;min-height:0}
+.col{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border);min-height:0}
 .col:last-child{border-right:none}
 .col-head{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;background:var(--card)}
 .col-title{display:flex;align-items:center;gap:8px}
@@ -295,8 +295,8 @@ body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-ser
   <div class="hdr-right">
     <div class="status-dot" id="status-dot"></div>
     <span class="status-txt" id="status-txt">Idle</span>
-    <button class="hbtn" id="diag-btn" onclick="toggleDiag()">&#128269; Diag</button>
-    <button class="hbtn" id="gd-btn" onclick="retryGD()">&#9729; GD Retry</button>
+    <button class="hbtn" id="diag-btn" id="diag-btn-hdr">&#128269; Diag</button>
+    <button class="hbtn" id="gd-btn" id="gd-btn-hdr">&#9729; GD Retry</button>
   </div>
 </div>
 
@@ -304,7 +304,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-ser
   <div class="panel">
     <div class="panel-head">
       <span class="panel-title">&#128270; System Diagnostics</span>
-      <button class="panel-close" onclick="toggleDiag()">&#10005;</button>
+      <button class="panel-close" id="diag-btn-hdr">&#10005;</button>
     </div>
     <div id="diag-body"><div style="color:var(--mu);font-size:11px">Running checks&#8230;</div></div>
   </div>
@@ -322,7 +322,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-ser
           <div class="col-hm" id="scan-count">Loading&#8230;</div>
         </div>
       </div>
-      <button class="col-btn" title="Refresh" onclick="refreshScans()">&#8635;</button>
+      <button class="col-btn" title="Refresh" id="scan-refresh-btn">&#8635;</button>
     </div>
     <div class="flist" id="scan-list">
       <div class="empty"><div class="empty-ic">&#128194;</div><div class="empty-ti">Loading files&#8230;</div></div>
@@ -344,7 +344,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-ser
           <div class="col-hm" id="proc-count">Loading&#8230;</div>
         </div>
       </div>
-      <button class="col-btn" title="Refresh" onclick="refreshProcessed()">&#8635;</button>
+      <button class="col-btn" title="Refresh" id="proc-refresh-btn">&#8635;</button>
     </div>
     <div class="flist" id="proc-list">
       <div class="empty"><div class="empty-ic">&#128194;</div><div class="empty-ti">Loading files&#8230;</div></div>
@@ -870,6 +870,12 @@ el('run-btn').addEventListener('click',async function(){
   hideRunPanel();
   await startWatching(f);
 });
+// Header + column buttons (all wired here — functions are inside IIFE, not global)
+var _dh=el('diag-btn-hdr');   if(_dh) _dh.addEventListener('click',toggleDiag);
+var _gh=el('gd-btn-hdr');     if(_gh) _gh.addEventListener('click',retryGD);
+var _pc=el('panel-close-btn');if(_pc) _pc.addEventListener('click',toggleDiag);
+var _sr=el('scan-refresh-btn');if(_sr) _sr.addEventListener('click',refreshScans);
+var _pr=el('proc-refresh-btn');if(_pr) _pr.addEventListener('click',refreshProcessed);
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 buildPipeline();
