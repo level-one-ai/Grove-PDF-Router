@@ -79,13 +79,13 @@ function buildScanList(files, error) {
       + '<div class="de">Files appear here when dropped into OneDrive Scans</div></div>';
   }
   return files.map((f, idx) =>
-    '<div class="fi" id="sf-' + h(f.id) + '" onclick="selectFile(' + JSON.stringify(f.id) + ')">'
+    '<div class="fi" id="sf-' + h(f.id) + '" onclick="selectFile(\'' + h(f.id) + '\')">'
     + '<div class="fic">&#128196;</div>'
     + '<div class="fin">'
     + '<div class="fnm">' + h(f.name) + '</div>'
     + '<div class="fmeta">' + h(formatBytes(f.size)) + ' &middot; ' + h(formatDate(f.createdAt)) + '</div>'
     + '</div>'
-    + '<button class="rstbtn" title="Reset file" onclick="event.stopPropagation();doReset(' + JSON.stringify(f.id) + ')">&#8635;</button>'
+    + '<button class="rstbtn" title="Reset file" onclick="event.stopPropagation();doReset(\'' + h(f.id) + '\')">&#8635;</button>'
     + '</div>'
   ).join('');
 }
@@ -207,7 +207,7 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 .rfbtn:hover{border-color:var(--or);color:var(--or)}
 .pathbar{padding:5px 14px;background:var(--su);border-bottom:1px solid var(--bo);font-size:10px;color:var(--mu);flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pathbar span{color:var(--or)}
-.flist{overflow-y:auto;flex:1;padding:6px}
+.flist{overflow-y:auto;flex:1;padding:6px;min-height:0}
 .flist::-webkit-scrollbar{width:4px}.flist::-webkit-scrollbar-thumb{background:var(--bo);border-radius:2px}
 .fi{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:7px;border:1px solid transparent;margin-bottom:3px;background:var(--su);cursor:pointer;transition:border-color .15s,background .15s}
 .fi:hover{border-color:var(--bo)}
@@ -226,8 +226,8 @@ header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;hei
 .stmsg .ic{font-size:26px}.stmsg .ti{font-size:12px;font-weight:500;color:var(--tx)}.stmsg .de{font-size:11px;line-height:1.5}
 .rstbtn{background:none;border:1px solid var(--bo);color:var(--mu);width:18px;height:18px;border-radius:4px;cursor:pointer;font-size:9px;transition:all .15s;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .rstbtn:hover{border-color:var(--rd);color:var(--rd)}
-.run-area{padding:8px 14px;border-top:1px solid var(--bo);flex-shrink:0;display:none}
-.run-area.show{display:block}
+.run-area{padding:0 14px;border-top:0 solid var(--bo);flex-shrink:0;overflow:hidden;max-height:0;transition:max-height .2s ease,padding .2s ease,border-top-width .2s ease}
+.run-area.show{padding:8px 14px;border-top:1px solid var(--bo);max-height:120px}
 .run-fname{font-size:11px;font-weight:600;color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .run-fmeta{font-size:10px;color:var(--mu);margin-bottom:4px}
 .runbtn{width:100%;padding:8px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:6px}
@@ -690,12 +690,18 @@ function openNotifyStream(){
   var es=new EventSource('/api/notify');
   NOTIFY_ES=es;
   es.addEventListener('connected',function(){console.log('[dashboard] Notify connected');});
-  es.addEventListener('new-file',function(e){
+  es.addEventListener('new-file',async function(e){
     try{
       var d=JSON.parse(e.data);
-      refreshScans();
-      if(!PROCESSING&&d.files&&d.files.length>0)startWatching(d.files[0]);
-    }catch(ex){}
+      // Refresh scans first so SCAN_FILES is up to date
+      await refreshScans();
+      // Auto-start processing the new file if not already running
+      if(!PROCESSING){
+        // Use the file from SCAN_FILES (full object) not d.files (may be incomplete)
+        var fileToProcess = SCAN_FILES.length > 0 ? SCAN_FILES[0] : (d.files&&d.files[0]||null);
+        if(fileToProcess) startWatching(fileToProcess);
+      }
+    }catch(ex){console.warn('[dashboard] new-file handler error:',ex.message);}
   });
   es.addEventListener('reconnect',function(){es.close();NOTIFY_ES=null;setTimeout(openNotifyStream,1000);});
   es.onerror=function(){es.close();NOTIFY_ES=null;setTimeout(openNotifyStream,5000);};
