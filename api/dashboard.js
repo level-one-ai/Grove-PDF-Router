@@ -1,19 +1,33 @@
 /**
  * /api/dashboard
+ *
  * Grove PDF Router — monitoring dashboard.
  *
- * Server fetches both OneDrive folders and injects raw JSON into the page.
- * Client JS renders everything. No server/client HTML mixing.
- * Zero Firestore reads.
+ * On every page load (server-side):
+ *   1. Fetches Scans folder from OneDrive       — shows unprocessed files
+ *   2. Fetches Processed folder from OneDrive   — shows filed files
+ *   3. ONE Firestore batch read of completed records (by renamed file name)
+ *      — enriches processed files with GD link, customer, ref
+ *
+ * After page load (client-side):
+ *   - SSE /api/notify stream held open
+ *   - When Make.com fires scan-now → notify pushes "new-file" event
+ *   - Dashboard refreshes Scans column via /api/scan-files (no Firebase)
+ *   - Manual run: click file → "Process File" button → /api/test-run SSE
+ *
+ * Zero automatic polling. Zero Firebase reads after initial load.
  */
 
 module.exports.config = { maxDuration: 30 };
 
-async function fetchFolder(graphRequest, userId, folderPath) {
+const SCANS_PATH     = 'Grove Group Scotland/Grove Bedding/Scans';
+const PROCESSED_PATH = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
+
+async function fetchODFolder(graphRequest, userId, folderPath) {
   const path = `/users/${userId}/drive/root:/${folderPath}:/children` +
     `?$select=id,name,size,createdDateTime,webUrl,file&$top=500`;
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('OneDrive timeout')), 20000));
+  const timeout = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error('OneDrive timeout')), 25000));
   const result = await Promise.race([graphRequest('GET', path), timeout]);
   return (result?.value || [])
     .filter(f => {
@@ -24,13 +38,102 @@ async function fetchFolder(graphRequest, userId, folderPath) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
+async function fetchFirestoreRecords() {
+  try {
+    const admin = require('firebase-admin');
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId:   process.env.FIREBASE_PROJECT_ID,
+          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+          privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+        }),
+      });
+      admin.firestore().settings({ preferRest: true });
+    }
+    const snap = await admin.firestore()
+      .collection('processedFiles')
+      .where('status', '==', 'completed')
+      .orderBy('completedAt', 'desc')
+      .limit(300)
+      .get();
+
+    // Build a map: renamedFile (lowercased) → { customerName, ref, gdUrl, odUrl }
+    const byName = {};
+    snap.docs.forEach(doc => {
+      const d = doc.data();
+      const gdUrl = d.googleDriveFolderUrl ||
+        Object.values(d.pages || {}).map(p => p?.googleDrive?.folderUrl).find(u => !!u) || null;
+      (d.renamedFiles || []).forEach(fname => {
+        byName[fname.toLowerCase()] = {
+          customerName: d.customerName || null,
+          ref:          d.ref || null,
+          gdUrl,
+          odUrl: d.oneDriveProcessedFolderUrl || null,
+        };
+      });
+    });
+    console.log(`[dashboard] Firestore: ${snap.size} completed record(s) loaded`);
+    return byName;
+  } catch (err) {
+    console.warn('[dashboard] Firestore fetch failed (non-fatal):', err.message);
+    return {};
+  }
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
 
-  // Files are loaded client-side via /api/scan-files on page load.
-  // This avoids cold-start timeouts and ensures the dashboard always shows fresh data.
+  let scanFiles = [], procFiles = [], fsRecords = {};
+  let scanError = null, procError = null;
+
+  try {
+    const { graphRequest } = require('../lib/graph');
+    const userId = process.env.ONEDRIVE_USER_ID;
+    if (!userId) throw new Error('ONEDRIVE_USER_ID not set');
+
+    // Fetch all three in parallel — OneDrive Scans, OneDrive Processed, Firestore
+    const [sr, pr, fr] = await Promise.allSettled([
+      fetchODFolder(graphRequest, userId, SCANS_PATH),
+      fetchODFolder(graphRequest, userId, PROCESSED_PATH),
+      fetchFirestoreRecords(),
+    ]);
+
+    if (sr.status === 'fulfilled') {
+      scanFiles = sr.value;
+      console.log(`[dashboard] Scans: ${scanFiles.length} file(s)`);
+    } else {
+      scanError = sr.reason?.graphMessage || sr.reason?.message || 'OneDrive error';
+      console.error('[dashboard] Scans failed:', scanError);
+    }
+    if (pr.status === 'fulfilled') {
+      procFiles = pr.value;
+      console.log(`[dashboard] Processed: ${procFiles.length} file(s)`);
+    } else {
+      procError = pr.reason?.graphMessage || pr.reason?.message || 'OneDrive error';
+      console.error('[dashboard] Processed failed:', procError);
+    }
+    if (fr.status === 'fulfilled') {
+      fsRecords = fr.value;
+    }
+
+    // Enrich processed files with Firestore metadata
+    procFiles = procFiles.map(f => {
+      const meta = fsRecords[f.name.toLowerCase()] || {};
+      return { ...f, customerName: meta.customerName || null, ref: meta.ref || null, gdUrl: meta.gdUrl || null };
+    });
+
+  } catch (err) {
+    const msg = err.graphMessage || err.message;
+    console.error('[dashboard] Fatal:', msg);
+    scanError = msg; procError = msg;
+  }
+
+  function safeJson(v) {
+    return JSON.stringify(v).replace(/<\/script>/gi, '<\\/script>');
+  }
 
   res.status(200).send(`<!DOCTYPE html>
 <html lang="en">
@@ -40,599 +143,746 @@ module.exports = async function handler(req, res) {
 <title>Grove PDF Router</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--or:#d97700;--orl:#f59e0b;--bg:#0a0a0a;--su:#1a1a1a;--s2:#242424;--bo:#2e2e2e;--tx:#f0f0f0;--mu:#888;--gn:#22c55e;--rd:#ef4444;--yl:#eab308}
-body{background:var(--bg);color:var(--tx);font-family:system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
-header{background:var(--su);border-bottom:1px solid var(--bo);padding:0 16px;height:52px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
-.logo{display:flex;align-items:center;gap:8px}
-.li{width:28px;height:28px;background:var(--or);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px}
-.lt{font-size:13px;font-weight:600}.ls{font-size:10px;color:var(--mu)}
-.sub-row{display:flex;align-items:center;gap:7px}
-.dot{width:6px;height:6px;border-radius:50%;background:var(--mu)}
-.dot.g{background:var(--gn);box-shadow:0 0 5px var(--gn)}
-.sub-txt{font-size:11px;color:var(--mu)}
-.main{display:grid;grid-template-columns:1fr 1fr 360px;flex:1;overflow:hidden}
-.fcol{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--bo)}
-.fcol:last-child{border-right:none}
-.fhead{padding:10px 14px;border-bottom:1px solid var(--bo);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;min-height:46px}
-.fht{font-size:12px;font-weight:600}.fhm{font-size:11px;color:var(--mu)}
-.rfbtn{background:none;border:1px solid var(--bo);color:var(--mu);padding:3px 8px;border-radius:5px;font-size:11px;cursor:pointer;transition:all .15s}
-.rfbtn:hover{border-color:var(--or);color:var(--or)}
-.pathbar{padding:5px 14px;background:var(--su);border-bottom:1px solid var(--bo);font-size:10px;color:var(--mu);flex-shrink:0}
-.pathbar span{color:var(--or)}
-.flist{overflow-y:auto;flex:1;padding:6px;min-height:0}
-.flist::-webkit-scrollbar{width:4px}.flist::-webkit-scrollbar-thumb{background:var(--bo);border-radius:2px}
-.fi{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:7px;border:1px solid transparent;margin-bottom:3px;background:var(--su);cursor:pointer;transition:border-color .15s,background .15s}
-.fi:hover{border-color:var(--bo)}
-.fi.sel{border-color:var(--or)!important;background:#1f1500!important}
-.fi.active{border-color:var(--or);background:#1f1500}
-.fi.done{border-color:#22c55e22;background:#0a180a}
-.fi.done:hover{border-color:#22c55e55}
-.fic{width:30px;height:30px;background:#180f00;border:1px solid #3a2000;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0}
-.fi.done .fic{background:#0a180a;border-color:#22c55e33}
-.fi.active .fic{background:#2a1800;border-color:#d9770055}
-.fin{flex:1;min-width:0;pointer-events:none}
-.fnm{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.fmeta{font-size:10px;color:var(--mu);margin-top:1px}
-.fac{display:flex;gap:3px;flex-shrink:0;pointer-events:none}
-.stmsg{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:32px 16px;color:var(--mu);text-align:center;height:100%}
-.stmsg .ic{font-size:26px}.stmsg .ti{font-size:12px;font-weight:500;color:var(--tx)}.stmsg .de{font-size:11px;line-height:1.5}
-.rstbtn{background:none;border:1px solid var(--bo);color:var(--mu);width:20px;height:20px;border-radius:4px;cursor:pointer;font-size:10px;transition:all .15s;flex-shrink:0}
+:root{
+  --bg:#f8fafc;--card:#ffffff;--border:#e2e8f0;--border2:#cbd5e1;
+  --tx:#1e293b;--mu:#64748b;--sm:#94a3b8;
+  --sky:#0ea5e9;--sky2:#0284c7;--skyb:#e0f2fe;--skybr:#bae6fd;
+  --em:#10b981;--emb:#ecfdf5;--embr:#a7f3d0;
+  --rd:#ef4444;--rdb:#fef2f2;--rdbr:#fecaca;
+  --am:#f59e0b;--amb:#fffbeb;--ambr:#fde68a;
+  --sl:#475569;
+  --or:#0ea5e9;
+}
+body{background:var(--bg);color:var(--tx);font-family:'Inter',system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+/* Header */
+.hdr{background:var(--card);border-bottom:1px solid var(--border);padding:0 20px;height:56px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.hdr-left{display:flex;align-items:center;gap:10px}
+.hdr-logo{width:32px;height:32px;background:linear-gradient(135deg,#0ea5e9,#0284c7);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.hdr-title{font-size:14px;font-weight:700;color:var(--tx)}
+.hdr-sub{font-size:11px;color:var(--mu);margin-top:1px}
+.hdr-right{display:flex;align-items:center;gap:8px}
+.hbtn{display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--mu);font-size:11px;font-weight:600;cursor:pointer;transition:all .15s}
+.hbtn:hover{border-color:var(--sky);color:var(--sky)}
+.hbtn.active{background:var(--skyb);border-color:var(--skybr);color:var(--sky2)}
+.status-dot{width:7px;height:7px;border-radius:50%;background:var(--sm)}
+.status-dot.live{background:var(--em);box-shadow:0 0 0 2px var(--embr)}
+.status-txt{font-size:11px;color:var(--mu);font-weight:500}
+/* Main grid */
+.main{display:grid;grid-template-columns:1fr 1fr;gap:0;flex:1;overflow:hidden}
+.col{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
+.col:last-child{border-right:none}
+.col-head{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;background:var(--card)}
+.col-title{display:flex;align-items:center;gap:8px}
+.col-icon{width:28px;height:28px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0}
+.col-icon.scan{background:#e0f2fe;color:#0ea5e9}
+.col-icon.proc{background:#dcfce7;color:#16a34a}
+.col-ht{font-size:13px;font-weight:700;color:var(--tx)}
+.col-hm{font-size:10px;color:var(--mu);margin-top:1px;font-family:monospace}
+.col-btn{width:28px;height:28px;border-radius:7px;border:1px solid var(--border);background:var(--card);color:var(--mu);font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s}
+.col-btn:hover{border-color:var(--sky);color:var(--sky)}
+/* File list */
+.flist{overflow-y:auto;flex:1;padding:8px;min-height:0}
+.flist::-webkit-scrollbar{width:4px}.flist::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.fi{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);margin-bottom:5px;background:var(--card);cursor:pointer;transition:all .15s}
+.fi:hover{border-color:var(--border2);box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.fi.sel{border-color:var(--sky)!important;background:var(--skyb)!important;box-shadow:0 0 0 3px var(--skybr)}
+.fi.active{border-color:var(--am);background:var(--amb)}
+.fi-icon{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.fi-icon.scan{background:#e0f2fe}
+.fi-icon.proc{background:#dcfce7}
+.fi-icon.active{background:#fef3c7}
+.fi-body{flex:1;min-width:0}
+.fi-name{font-size:12px;font-weight:600;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fi-meta{font-size:10px;color:var(--mu);margin-top:2px;font-family:monospace}
+.fi-tags{display:flex;gap:4px;margin-top:3px;flex-wrap:wrap}
+.tag{font-size:9px;padding:1px 6px;border-radius:12px;font-weight:700;font-family:monospace}
+.tag.gd{background:#dcfce7;border:1px solid #a7f3d0;color:#15803d}
+.tag.od{background:#e0f2fe;border:1px solid #bae6fd;color:#0369a1}
+.tag.pend{background:#fffbeb;border:1px solid #fde68a;color:#92400e}
+.fi-right{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.fi-radio{width:16px;height:16px;border-radius:50%;border:2px solid var(--border2);display:flex;align-items:center;justify-content:center;transition:all .15s}
+.fi.sel .fi-radio{border-color:var(--sky);background:var(--sky)}
+.fi-radio-dot{width:6px;height:6px;border-radius:50%;background:#fff}
+.rstbtn{width:22px;height:22px;border-radius:6px;border:1px solid transparent;background:none;color:var(--sm);font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:0;transition:all .15s}
+.fi:hover .rstbtn{opacity:1}
 .rstbtn:hover{border-color:var(--rd);color:var(--rd)}
-.run-panel{background:var(--su);border-top:2px solid var(--or);padding:10px 14px;flex-shrink:0;display:none}
+/* Expanded proc row */
+.proc-expand{padding:0 12px 10px 56px;border-top:1px solid var(--border);background:#fafafa;display:none}
+.proc-expand.open{display:block}
+.proc-row{display:flex;gap:8px;margin-top:7px;font-size:10px}
+.proc-lbl{color:var(--mu);min-width:60px;flex-shrink:0;font-weight:600}
+.proc-val{color:var(--tx);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.proc-link{color:var(--sky);text-decoration:none;font-size:10px}
+.proc-link:hover{text-decoration:underline}
+/* Run panel */
+.run-panel{background:var(--card);border-top:2px solid var(--sky);padding:12px 16px;flex-shrink:0;display:none}
 .run-panel.show{display:block}
-.run-fname{font-size:12px;font-weight:600;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
-.run-fmeta{font-size:10px;color:var(--mu);margin-bottom:8px}
-.runbtn{width:100%;padding:9px;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer;border:none;background:var(--or);color:#fff;transition:background .15s}
-.runbtn:hover{background:var(--orl)}
-.runbtn:disabled{background:var(--s2);color:var(--mu);cursor:not-allowed}
-.folder-tag{font-size:9px;padding:2px 5px;border-radius:4px;font-weight:600}
-.folder-tag.od{background:#1a1a2f;color:#818cf8;border:1px solid #6366f133}
-.proc-drop{display:none;padding:8px 10px;background:var(--s2);border-top:1px solid var(--bo)}
-.proc-drop.open{display:block}
-.pd-row{display:flex;align-items:center;gap:6px;margin-bottom:5px;font-size:10px}
-.pd-row:last-child{margin-bottom:0}
-.pd-lbl{color:var(--mu);min-width:64px;flex-shrink:0}
-.pd-val{color:var(--tx);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pd-link{color:var(--or);text-decoration:none}
-.pd-link:hover{text-decoration:underline}
-.gd-btn{background:none;border:1px solid #22c55e44;color:var(--gn);border-radius:5px;padding:3px 8px;font-size:10px;cursor:pointer;font-weight:600}
-.gd-btn:hover{background:#1a2f1a}.gd-btn:disabled{opacity:.5;cursor:not-allowed}
-.gdpanel{border-top:1px solid var(--bo);flex-shrink:0;max-height:200px;display:none;flex-direction:column}
-.gdpanel.open{display:flex}
-.gdph{padding:7px 12px;border-bottom:1px solid var(--bo);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
-.gdph-title{font-size:11px;font-weight:600;color:var(--mu)}
-.gdph-close{background:none;border:none;color:var(--mu);cursor:pointer;font-size:14px;line-height:1}
-.gdpbody{overflow-y:auto;flex:1;padding:4px 0}
-.gdrow{display:flex;align-items:flex-start;gap:7px;padding:5px 12px;border-bottom:1px solid var(--bo);font-size:11px}
-.gdrow:last-child{border-bottom:none}
-.gdrow-ic{width:14px;flex-shrink:0;margin-top:1px}
-.gdrow-body{flex:1;min-width:0}
-.gdrow-name{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.gdrow-detail{color:var(--mu);font-size:10px}
-.gdrow-link{color:var(--or);text-decoration:none;font-size:10px}
-.gdrow.s .gdrow-ic{color:var(--gn)}.gdrow.f .gdrow-ic{color:var(--rd)}.gdrow.p .gdrow-ic{color:var(--yl)}
-.right{display:flex;flex-direction:column;overflow:hidden}
-.act-hdr{padding:12px 14px;border-bottom:1px solid var(--bo);flex-shrink:0;display:flex;flex-direction:column;justify-content:center;min-height:60px}
-.act-title{font-size:12px;font-weight:600;margin-bottom:3px;display:flex;align-items:center;gap:6px}
-.act-sub{font-size:11px;color:var(--mu)}
-.act-name{font-size:12px;font-weight:600;color:var(--or);word-break:break-all;margin-top:2px;display:none}
-.progpanel{flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:5px;min-height:0}
-.progtitle{font-size:10px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
-.progidle{display:flex;flex-direction:column;align-items:center;gap:6px;padding:24px 0;color:var(--mu);text-align:center}
-.progidle .ic{font-size:28px}.progidle .de{font-size:11px;line-height:1.6}
-.step{display:flex;align-items:flex-start;gap:7px;padding:7px 9px;border-radius:6px;background:var(--su);border:1px solid var(--bo);margin-bottom:3px;transition:all .25s}
-.step.running{border-color:var(--or);background:#1f1500}
-.step.done{border-color:#22c55e33;background:#0f1f0f}
-.step.error{border-color:#ef444433;background:#1f0f0f}
-.stepico{width:17px;height:17px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0;margin-top:1px}
-.step.pending .stepico{background:var(--s2);color:var(--mu)}
-.step.running .stepico{background:var(--or);color:#fff}
-.step.done .stepico{background:var(--gn);color:#fff}
-.step.error .stepico{background:var(--rd);color:#fff}
-.steplabel{font-size:11px;font-weight:500}
-.stepmsg{font-size:10px;color:var(--mu);line-height:1.4;margin-top:1px}
-.step.running .stepmsg{color:var(--or)}.step.done .stepmsg{color:#4ade80}.step.error .stepmsg{color:var(--rd)}
-.rescard{background:#0f1f0f;border:1px solid #22c55e44;border-radius:7px;padding:10px;margin-top:4px}
-.rescard.err{background:#1f0f0f;border-color:#ef444433}
-.restitle{font-size:11px;font-weight:600;color:var(--gn);margin-bottom:7px}
-.rescard.err .restitle{color:var(--rd)}
-.resrow{display:flex;align-items:flex-start;gap:5px;margin-bottom:4px;font-size:10px}
-.reslbl{color:var(--mu);min-width:64px;flex-shrink:0}.resval{color:var(--tx);word-break:break-all}
-.reslink{color:var(--or);text-decoration:none}.reslink:hover{text-decoration:underline}
-.fpill{background:var(--s2);border:1px solid var(--bo);border-radius:4px;padding:2px 5px;font-size:9px;color:var(--mu);font-family:monospace;margin-top:2px}
-.live{width:8px;height:8px;border-radius:50%;background:var(--mu);flex-shrink:0}
-.live.on{background:var(--gn);box-shadow:0 0 6px var(--gn)}
+.run-file{font-size:11px;font-weight:600;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
+.run-meta{font-size:10px;color:var(--mu);margin-bottom:10px;font-family:monospace}
+.run-btn{width:100%;padding:10px;border-radius:10px;border:none;background:var(--sky);color:#fff;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:7px;transition:background .15s}
+.run-btn:hover{background:var(--sky2)}
+.run-btn:disabled{background:#cbd5e1;color:#94a3b8;cursor:not-allowed}
+/* Empty state */
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:40px 20px;color:var(--sm);text-align:center;height:100%}
+.empty-ic{font-size:32px;opacity:.5}
+.empty-ti{font-size:13px;font-weight:600;color:var(--mu)}
+.empty-de{font-size:11px;line-height:1.5}
+.error-state{display:flex;flex-direction:column;align-items:center;gap:8px;padding:32px;text-align:center}
+.error-ic{font-size:28px}
+.error-ti{font-size:12px;font-weight:600;color:var(--rd)}
+.error-de{font-size:10px;color:var(--mu);line-height:1.5}
+/* Pipeline visualiser */
+.pipe-wrap{background:var(--card);border-top:1px solid var(--border);padding:14px 20px;flex-shrink:0}
+.pipe-status{display:flex;justify-content:flex-end;margin-bottom:6px}
+.pill{display:flex;align-items:center;gap:5px;padding:2px 9px;border-radius:99px;border:1px solid;font-size:10px;font-weight:700;font-family:monospace}
+.pill.idle{background:#f8fafc;border-color:#e2e8f0;color:#94a3b8}
+.pill.running{background:#e0f2fe;border-color:#bae6fd;color:#0369a1}
+.pill.done{background:#dcfce7;border-color:#a7f3d0;color:#15803d}
+.pill.error{background:#fef2f2;border-color:#fecaca;color:#991b1b}
+.pill-dot{width:6px;height:6px;border-radius:50%}
+.pipe-row{display:flex;align-items:flex-start;justify-content:center;overflow-x:auto;padding-bottom:4px}
+.pipe-step{display:flex;flex-direction:column;align-items:center;width:76px;flex-shrink:0}
+.pipe-circle{width:46px;height:46px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;border:2.5px solid;transition:all .5s;position:relative;flex-shrink:0}
+.pipe-label{font-size:10px;font-weight:700;text-align:center;margin-top:5px;transition:color .5s}
+.pipe-sub{font-size:9px;color:var(--sm);text-align:center;line-height:1.2;padding:0 2px}
+.pipe-badge{display:flex;align-items:center;gap:3px;margin-top:4px}
+.pipe-bdot{width:5px;height:5px;border-radius:50%}
+.pipe-btxt{font-size:8px;font-weight:700;font-family:monospace;text-transform:uppercase}
+.pipe-ts{font-size:8px;color:var(--sm);margin-top:2px;font-family:monospace}
+.pipe-arrow{display:flex;align-items:center;margin-top:20px;width:20px;flex-shrink:0}
+.pipe-arrow-line{flex:1;height:1.5px;transition:background .5s}
+.pipe-arrow-head{width:0;height:0;border-top:4px solid transparent;border-bottom:4px solid transparent;border-left:6px solid;transition:border-left-color .5s}
+/* spin */
 @keyframes spin{to{transform:rotate(360deg)}}
-.spin{width:10px;height:10px;border:2px solid rgba(255,255,255,.25);border-top-color:currentColor;border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
+.spin{display:inline-block;width:10px;height:10px;border:2px solid rgba(255,255,255,.3);border-top-color:currentColor;border-radius:50%;animation:spin .7s linear infinite}
+.spin-ring{position:absolute;inset:-5px;border-radius:50%;border:2.5px solid transparent;border-top-color:var(--sky);animation:spin .8s linear infinite}
+/* Result card */
+.result-card{margin-top:10px;padding:10px 14px;border-radius:10px;background:#ecfdf5;border:1px solid #a7f3d0}
+.result-card.err{background:#fef2f2;border-color:#fecaca}
+.result-title{font-size:11px;font-weight:700;color:#15803d;margin-bottom:6px}
+.result-card.err .result-title{color:#991b1b}
+.result-row{display:flex;gap:6px;margin-bottom:3px;font-size:10px}
+.result-lbl{color:var(--mu);min-width:70px;flex-shrink:0;font-weight:600}
+.result-val{color:var(--tx);word-break:break-all}
+.result-link{color:var(--sky);text-decoration:none}
+.result-link:hover{text-decoration:underline}
+/* Diag panel */
+.panel{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin:8px 12px 0}
+.panel-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.panel-title{font-size:12px;font-weight:700;color:var(--tx);display:flex;align-items:center;gap:6px}
+.panel-close{background:none;border:none;color:var(--sm);cursor:pointer;font-size:15px;line-height:1}
+.panel-close:hover{color:var(--tx)}
+.diag-row{display:flex;align-items:flex-start;gap:8px;padding:7px 10px;border-radius:8px;border:1px solid;margin-bottom:5px;font-size:11px}
+.diag-row.ok{background:#ecfdf5;border-color:#a7f3d0}
+.diag-row.fail{background:#fef2f2;border-color:#fecaca}
+.diag-ic{flex-shrink:0;font-size:13px}
+.diag-label{font-weight:700;color:var(--tx)}
+.diag-detail{font-family:monospace;font-size:10px;margin-top:1px}
+.diag-row.ok .diag-detail{color:#15803d}
+.diag-row.fail .diag-detail{color:#991b1b}
 </style>
 </head>
 <body>
-<header>
-  <div class="logo">
-    <div class="li">&#128196;</div>
-    <div><div class="lt">Grove PDF Router</div><div class="ls">Monitoring Dashboard</div></div>
-  </div>
-  <div class="sub-row">
-    <div class="dot" id="sdot"></div>
-    <span class="sub-txt" id="stxt">Watching for files...</span>
-    <a href="/api/diag" target="_blank" style="margin-left:8px;font-size:10px;color:var(--mu);text-decoration:none;border:1px solid var(--bo);padding:2px 7px;border-radius:4px">&#128269; Diag</a>
-  </div>
-</header>
-<div class="main">
-  <div class="fcol">
-    <div class="fhead">
-      <div><div class="fht">&#128228; Scans</div><div class="fhm" id="scan-count"></div></div>
-      <button class="rfbtn" id="scan-refresh">&#8635;</button>
-    </div>
-    <div class="pathbar">&#128193; Grove Bedding &rsaquo; <span>Scans</span></div>
-    <div class="flist" id="scan-list"></div>
-    <div class="run-panel" id="run-panel">
-      <div class="run-fname" id="run-fname"></div>
-      <div class="run-fmeta" id="run-fmeta"></div>
-      <button class="runbtn" id="runbtn">&#9654; Run this file</button>
+
+<div class="hdr">
+  <div class="hdr-left">
+    <div class="hdr-logo">&#128196;</div>
+    <div>
+      <div class="hdr-title">Grove PDF Router</div>
+      <div class="hdr-sub">OneDrive &middot; Make.com &middot; Google Drive</div>
     </div>
   </div>
-  <div class="fcol">
-    <div class="fhead">
-      <div><div class="fht">&#9989; Processed</div><div class="fhm" id="proc-count"></div></div>
-      <div style="display:flex;gap:5px">
-        <button class="rfbtn" id="gd-retry-btn" style="border-color:#22c55e44;color:var(--gn)">&#128230; GD</button>
-        <button class="rfbtn" id="proc-refresh">&#8635;</button>
-      </div>
-    </div>
-    <div class="pathbar">&#128193; Grove Bedding &rsaquo; Scans &rsaquo; <span>Processed</span></div>
-    <div class="gdpanel" id="gdpanel">
-      <div class="gdph">
-        <span class="gdph-title" id="gdp-title">Google Drive Filing</span>
-        <button class="gdph-close" id="gdp-close">&#10005;</button>
-      </div>
-      <div class="gdpbody" id="gdp-body"></div>
-    </div>
-    <div class="flist" id="proc-list"></div>
-  </div>
-  <div class="right">
-    <div class="act-hdr">
-      <div class="act-title"><div class="live" id="live"></div><span>Activity</span></div>
-      <div class="act-sub" id="act-sub">Waiting for automation...</div>
-      <div class="act-name" id="act-name"></div>
-    </div>
-    <div class="progpanel">
-      <div class="progtitle">Progress</div>
-      <div class="progidle" id="progidle">
-        <div class="ic">&#129514;</div>
-        <div class="de">Activity cards appear here<br>when a file is processing</div>
-      </div>
-      <div id="steplist"></div>
-      <div id="rescard"></div>
-    </div>
+  <div class="hdr-right">
+    <div class="status-dot" id="status-dot"></div>
+    <span class="status-txt" id="status-txt">Idle</span>
+    <button class="hbtn" id="diag-btn" onclick="toggleDiag()">&#128269; Diag</button>
+    <button class="hbtn" id="gd-btn" onclick="retryGD()">&#9729; GD Retry</button>
   </div>
 </div>
+
+<div id="diag-panel" style="display:none">
+  <div class="panel">
+    <div class="panel-head">
+      <span class="panel-title">&#128270; System Diagnostics</span>
+      <button class="panel-close" onclick="toggleDiag()">&#10005;</button>
+    </div>
+    <div id="diag-body"><div style="color:var(--mu);font-size:11px">Running checks&#8230;</div></div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- SCANS COLUMN -->
+  <div class="col" id="scan-col">
+    <div class="col-head">
+      <div class="col-title">
+        <div class="col-icon scan">&#128228;</div>
+        <div>
+          <div class="col-ht">Scans</div>
+          <div class="col-hm" id="scan-count">Loading&#8230;</div>
+        </div>
+      </div>
+      <button class="col-btn" title="Refresh" onclick="refreshScans()">&#8635;</button>
+    </div>
+    <div class="flist" id="scan-list">
+      <div class="empty"><div class="empty-ic">&#128194;</div><div class="empty-ti">Loading files&#8230;</div></div>
+    </div>
+    <div class="run-panel" id="run-panel">
+      <div class="run-file" id="run-fname"></div>
+      <div class="run-meta" id="run-fmeta"></div>
+      <button class="run-btn" id="run-btn">&#9654;&#xFE0E; Process File</button>
+    </div>
+  </div>
+
+  <!-- PROCESSED COLUMN -->
+  <div class="col" id="proc-col">
+    <div class="col-head">
+      <div class="col-title">
+        <div class="col-icon proc">&#9989;</div>
+        <div>
+          <div class="col-ht">Processed</div>
+          <div class="col-hm" id="proc-count">Loading&#8230;</div>
+        </div>
+      </div>
+      <button class="col-btn" title="Refresh" onclick="refreshProcessed()">&#8635;</button>
+    </div>
+    <div class="flist" id="proc-list">
+      <div class="empty"><div class="empty-ic">&#128194;</div><div class="empty-ti">Loading files&#8230;</div></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- PIPELINE VISUALISER (full width, below the two columns) -->
+<div class="pipe-wrap">
+  <div class="pipe-status"><div class="pill idle" id="pipe-pill"><div class="pill-dot" style="background:#94a3b8"></div><span>Idle</span></div></div>
+  <div class="pipe-row" id="pipe-row"></div>
+  <div id="result-area"></div>
+</div>
+
 <script>
-(function() {
+(function(){
 'use strict';
 
-// ── Data — populated on load via /api/scan-files ──────────────────────────────
-var SCAN_DATA  = [];
-var PROC_DATA  = [];
-var SCAN_ERROR = null;
-var PROC_ERROR = null;
+// ── Server-injected data ──────────────────────────────────────────────────────
+var SCAN_DATA  = ${safeJson(scanFiles)};
+var PROC_DATA  = ${safeJson(procFiles)};
+var SCAN_ERROR = ${safeJson(scanError)};
+var PROC_ERROR = ${safeJson(procError)};
 
 // ── State ─────────────────────────────────────────────────────────────────────
-var PROCESSING    = false;
-var SELECTED      = null;   // currently selected scan file object
-var CURRENT       = null;   // file currently being processed
-var NOTIFY_ES     = null;
+var PROCESSING  = false;
+var SELECTED    = null;
+var CURRENT     = null;
+var NOTIFY_ES   = null;
 
 var STEPS = [
-  {id:1, l:'Initialise record'},
-  {id:2, l:'Download from OneDrive'},
-  {id:3, l:'Split PDF into pages'},
-  {id:4, l:'Send page to Make.com'},
-  {id:5, l:'AI extraction \u2014 Claude reads page'},
-  {id:6, l:'File page to OneDrive & Google Drive'}
+  {id:1, icon:'☁️',  label:'OneDrive',      sub:'File detected'},
+  {id:2, icon:'⬇️',  label:'Download',      sub:'Pull from OD'},
+  {id:3, icon:'📄',  label:'Split PDF',     sub:'Separate pages'},
+  {id:4, icon:'⚡',  label:'Make.com',      sub:'Send to webhook'},
+  {id:5, icon:'🧠',  label:'Claude AI',     sub:'Extract data'},
+  {id:6, icon:'📁',  label:'OneDrive',      sub:'Move to Processed'},
+  {id:7, icon:'🟢',  label:'Google Drive',  sub:'Copy to GD'},
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function esc(s){ return s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):''; }
-function fmtDate(iso){ if(!iso)return ''; try{ var d=new Date(iso); return d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}); }catch(e){return '';} }
-function fmtSize(b){ if(!b)return ''; var k=1024,s=['B','KB','MB','GB'],i=Math.floor(Math.log(b)/Math.log(k)); return parseFloat((b/Math.pow(k,i)).toFixed(1))+' '+s[i]; }
 function el(id){ return document.getElementById(id); }
-
-async function apiCall(url, opts) {
-  try {
-    var c = new AbortController();
-    var t = setTimeout(function(){ c.abort(); }, 20000);
-    var r = await fetch(url, Object.assign({ signal: c.signal }, opts || {}));
+function fdate(iso){
+  if(!iso) return '';
+  try{
+    var d=new Date(iso);
+    return d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})
+      +' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+  }catch(e){return '';}
+}
+function fsize(b){
+  if(!b) return '';
+  var k=1024,s=['B','KB','MB','GB'],i=Math.floor(Math.log(b)/Math.log(k));
+  return parseFloat((b/Math.pow(k,i)).toFixed(1))+' '+s[i];
+}
+function now(){ return new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}); }
+async function api(url,opts){
+  try{
+    var c=new AbortController(),t=setTimeout(function(){c.abort();},30000);
+    var r=await fetch(url,Object.assign({signal:c.signal},opts||{}));
     clearTimeout(t);
-    return await r.json().catch(function(){ return null; });
-  } catch(e) { return null; }
+    if(!r.ok){ var e=await r.json().catch(function(){return{error:'HTTP '+r.status};}); return e; }
+    return await r.json().catch(function(){return null;});
+  }catch(e){ console.error('[api]',url,e.message); return null; }
+}
+
+// ── Pipeline ─────────────────────────────────────────────────────────────────
+var stepState = {}; // id → {status:'idle'|'running'|'done'|'error', ts:''}
+STEPS.forEach(function(s){ stepState[s.id]={status:'idle',ts:''}; });
+
+function buildPipeline(){
+  var row=el('pipe-row');
+  row.innerHTML='';
+  STEPS.forEach(function(s,idx){
+    var st=stepState[s.id];
+    var col={
+      idle:   {border:'#e2e8f0',bg:'#f8fafc',txt:'#94a3b8',dot:'#cbd5e1'},
+      running:{border:'#0ea5e9',bg:'#e0f2fe',txt:'#0369a1',dot:'#0ea5e9'},
+      done:   {border:'#10b981',bg:'#dcfce7', txt:'#065f46',dot:'#10b981'},
+      error:  {border:'#ef4444',bg:'#fef2f2', txt:'#991b1b',dot:'#ef4444'},
+    }[st.status];
+
+    // Circle
+    var div=document.createElement('div');
+    div.className='pipe-step';
+    div.id='step-'+s.id;
+
+    var circ=document.createElement('div');
+    circ.className='pipe-circle';
+    circ.style.borderColor=col.border;
+    circ.style.background=col.bg;
+    if(st.status==='running'){
+      var ring=document.createElement('div');
+      ring.className='spin-ring';
+      circ.appendChild(ring);
+    }
+    var icon=document.createElement('span');
+    icon.textContent=s.icon;
+    icon.style.filter=st.status==='idle'?'grayscale(1) opacity(.35)':'none';
+    icon.style.fontSize='18px';
+    circ.appendChild(icon);
+    div.appendChild(circ);
+
+    // Label
+    var lbl=document.createElement('p');
+    lbl.className='pipe-label';
+    lbl.textContent=s.label;
+    lbl.style.color=col.txt;
+    div.appendChild(lbl);
+
+    // Sublabel
+    var sub=document.createElement('p');
+    sub.className='pipe-sub';
+    sub.textContent=s.sub;
+    div.appendChild(sub);
+
+    // Badge
+    var badge=document.createElement('div');
+    badge.className='pipe-badge';
+    var bdot=document.createElement('div');
+    bdot.className='pipe-bdot';
+    bdot.style.background=col.dot;
+    var btxt=document.createElement('span');
+    btxt.className='pipe-btxt';
+    btxt.textContent=st.status;
+    btxt.style.color=col.dot;
+    badge.appendChild(bdot); badge.appendChild(btxt);
+    div.appendChild(badge);
+
+    // Timestamp
+    if(st.ts){
+      var ts=document.createElement('p');
+      ts.className='pipe-ts';
+      ts.textContent=st.ts;
+      div.appendChild(ts);
+    }
+
+    row.appendChild(div);
+
+    // Arrow between steps
+    if(idx<STEPS.length-1){
+      var next=stepState[s.id+1];
+      var active=next.status!=='idle';
+      var arr=document.createElement('div');
+      arr.className='pipe-arrow';
+      arr.style.marginTop='20px';
+      var line=document.createElement('div');
+      line.className='pipe-arrow-line';
+      line.style.background=active?'#10b981':'#e2e8f0';
+      var head=document.createElement('div');
+      head.className='pipe-arrow-head';
+      head.style.borderLeftColor=active?'#10b981':'#e2e8f0';
+      arr.appendChild(line); arr.appendChild(head);
+      row.appendChild(arr);
+    }
+  });
+}
+
+function updateStep(id, status, ts){
+  // Mark all previous steps as done
+  STEPS.forEach(function(s){
+    if(s.id<id && (stepState[s.id].status==='idle'||stepState[s.id].status==='running')){
+      stepState[s.id]={status:'done',ts:ts||now()};
+    }
+  });
+  stepState[id]={status:status,ts:ts||now()};
+  buildPipeline();
+}
+
+function resetPipeline(){
+  STEPS.forEach(function(s){ stepState[s.id]={status:'idle',ts:''}; });
+  buildPipeline();
+  el('result-area').innerHTML='';
+}
+
+function setPillStatus(st){
+  var pill=el('pipe-pill');
+  var cfg={
+    idle:   {cls:'idle',   dot:'#94a3b8',label:'Idle'},
+    running:{cls:'running',dot:'#0ea5e9',label:'Running'},
+    done:   {cls:'done',   dot:'#10b981',label:'Complete'},
+    error:  {cls:'error',  dot:'#ef4444',label:'Failed'},
+  }[st];
+  pill.className='pill '+cfg.cls;
+  pill.innerHTML='<div class="pill-dot" style="background:'+cfg.dot+'"></div><span>'+cfg.label+'</span>';
+}
+
+function setStatus(on,label){
+  el('status-dot').className='status-dot'+(on?' live':'');
+  el('status-txt').textContent=label||(on?'Processing\u2026':'Idle');
 }
 
 // ── Scans column ──────────────────────────────────────────────────────────────
-function renderScans(files, error) {
-  var list = el('scan-list');
-  var count = el('scan-count');
-  if (error) {
-    count.textContent = 'Error';
-    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Scans</div><div class="de">'+esc(error)+'</div></div>';
+function renderScans(files, error){
+  var list=el('scan-list'), count=el('scan-count');
+  if(error){
+    count.textContent='Error';
+    list.innerHTML='<div class="error-state"><div class="error-ic">&#10060;</div>'
+      +'<div class="error-ti">Failed to load Scans</div>'
+      +'<div class="error-de">'+esc(error)+'<br><a href="/api/diag" target="_blank" style="color:var(--sky)">Run diagnostics &#8599;</a></div></div>';
     return;
   }
-  count.textContent = files.length + ' file' + (files.length === 1 ? '' : 's');
-  if (!files.length) {
-    list.innerHTML = '<div class="stmsg"><div class="ic">&#10003;</div><div class="ti">Scans folder is empty</div><div class="de">Drop PDFs into OneDrive Scans to begin</div></div>';
+  count.textContent=files.length+' file'+(files.length===1?'':'s')+' \u00b7 OneDrive Scans';
+  list.innerHTML='';
+  if(!files.length){
+    list.innerHTML='<div class="empty"><div class="empty-ic">&#10003;</div><div class="empty-ti">Scans folder is empty</div><div class="empty-de">Files appear here when Make.com detects a new upload</div></div>';
     return;
   }
-  list.innerHTML = '';
-  files.forEach(function(f) {
-    var isActive  = CURRENT   && CURRENT.id   === f.id;
-    var isSelected = SELECTED && SELECTED.id  === f.id && !isActive;
+  files.forEach(function(f){
+    var isActive=CURRENT&&CURRENT.id===f.id;
+    var isSel=SELECTED&&SELECTED.id===f.id&&!isActive;
+    var row=document.createElement('div');
+    row.className='fi'+(isActive?' active':isSel?' sel':'');
+    row.id='sf-'+f.id;
 
-    var row = document.createElement('div');
-    row.className = 'fi' + (isActive ? ' active' : isSelected ? ' sel' : '');
-    row.id = 'sf-' + f.id;
+    var rst=document.createElement('button');
+    rst.className='rstbtn'; rst.title='Reset file'; rst.innerHTML='&#8635;';
+    rst.addEventListener('click',function(e){e.stopPropagation();doReset(f.id);});
 
-    // rstbtn — separate element, stop propagation
-    var rst = document.createElement('button');
-    rst.className = 'rstbtn';
-    rst.title = 'Reset file';
-    rst.innerHTML = '&#8635;';
-    rst.addEventListener('click', function(e) {
-      e.stopPropagation();
-      doReset(f.id);
-    });
+    row.innerHTML=
+      '<div class="fi-icon '+(isActive?'active':'scan')+'">'+(isActive?'&#9203;':'&#128196;')+'</div>'
+      +'<div class="fi-body">'
+        +'<div class="fi-name">'+esc(f.name)+'</div>'
+        +'<div class="fi-meta">'+fsize(f.size)+(f.createdAt?' \u00b7 '+fdate(f.createdAt):'')+''+(isActive?' \u00b7 <span style="color:#f59e0b;font-weight:700">Processing\u2026</span>':'')+'</div>'
+      +'</div>'
+      +'<div class="fi-right"></div>';
 
-    row.innerHTML =
-      '<div class="fic">' + (isActive ? '<span class="spin" style="color:var(--or)"></span>' : '&#128196;') + '</div>'
-      + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div>'
-      + '<div class="fmeta">' + fmtSize(f.size) + ' &middot; ' + fmtDate(f.createdAt)
-      + (isActive ? ' &middot; <span style="color:var(--or)">Processing\u2026</span>' : '') + '</div></div>';
+    var right=row.querySelector('.fi-right');
+    right.appendChild(rst);
+    var radio=document.createElement('div');
+    radio.className='fi-radio';
+    if(isSel) radio.innerHTML='<div class="fi-radio-dot"></div>';
+    right.appendChild(radio);
 
-    row.appendChild(rst);
-
-    // Click handler on the row itself — NOT via onclick attribute
-    row.addEventListener('click', function() {
-      selectFile(f);
-    });
-
+    row.addEventListener('click',function(){selectFile(f);});
     list.appendChild(row);
   });
 }
 
-function selectFile(f) {
-  if (PROCESSING) return;
-  SELECTED = f;
-
-  // Update visual selection
-  document.querySelectorAll('#scan-list .fi.sel').forEach(function(e) { e.classList.remove('sel'); });
-  var row = el('sf-' + f.id);
-  if (row) row.classList.add('sel');
-
-  // Show run panel
-  el('run-fname').textContent = f.name;
-  el('run-fmeta').textContent = fmtSize(f.size) + ' \u00b7 ' + fmtDate(f.createdAt);
-  el('run-panel').className = 'run-panel show';
-  var btn = el('runbtn');
-  btn.disabled = false;
-  btn.textContent = '\u25b6 Run this file';
+function selectFile(f){
+  if(PROCESSING) return;
+  SELECTED=f;
+  document.querySelectorAll('#scan-list .fi.sel').forEach(function(e){e.classList.remove('sel');});
+  var row=el('sf-'+f.id); if(row) row.classList.add('sel');
+  el('run-fname').textContent=f.name;
+  el('run-fmeta').textContent=fsize(f.size)+(f.createdAt?' \u00b7 '+fdate(f.createdAt):'');
+  el('run-panel').className='run-panel show';
+  var btn=el('run-btn'); btn.disabled=false; btn.innerHTML='&#9654;&#xFE0E; Process File';
 }
 
-function hideRunPanel() {
-  SELECTED = null;
-  el('run-panel').className = 'run-panel';
-  document.querySelectorAll('#scan-list .fi.sel').forEach(function(e) { e.classList.remove('sel'); });
+function hideRunPanel(){
+  SELECTED=null;
+  el('run-panel').className='run-panel';
+  document.querySelectorAll('#scan-list .fi.sel').forEach(function(e){e.classList.remove('sel');});
 }
 
-async function refreshScans() {
-  el('scan-list').innerHTML = '<div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading\u2026</div></div>';
-  el('scan-count').textContent = '\u2014';
-  var d = await apiCall('/api/scan-files');
-  SCAN_DATA = (d && d.success) ? (d.files || []) : [];
-  renderScans(SCAN_DATA, (d && d.success) ? null : (d && d.error ? d.error : 'Could not reach OneDrive'));
+async function refreshScans(){
+  el('scan-list').innerHTML='<div class="empty"><div class="empty-ic">&#128194;</div><div class="empty-ti">Loading\u2026</div></div>';
+  el('scan-count').textContent='\u2014';
+  var d=await api('/api/scan-files');
+  SCAN_DATA=(d&&d.success)?d.files||[]:[];
+  renderScans(SCAN_DATA,(d&&d.success)?null:(d&&d.error?d.error:'Could not reach OneDrive'));
 }
 
 // ── Processed column ──────────────────────────────────────────────────────────
-function renderProcessed(files, error) {
-  var list = el('proc-list');
-  var count = el('proc-count');
-  if (error) {
-    count.textContent = 'Error';
-    list.innerHTML = '<div class="stmsg"><div class="ic">&#10060;</div><div class="ti">Failed to load Processed</div><div class="de">'+esc(error)+'</div></div>';
+function renderProcessed(files, error){
+  var list=el('proc-list'), count=el('proc-count');
+  if(error){
+    count.textContent='Error';
+    list.innerHTML='<div class="error-state"><div class="error-ic">&#10060;</div>'
+      +'<div class="error-ti">Failed to load Processed</div>'
+      +'<div class="error-de">'+esc(error)+'</div></div>';
     return;
   }
-  count.textContent = files.length + ' file' + (files.length === 1 ? '' : 's');
-  if (!files.length) {
-    list.innerHTML = '<div class="stmsg"><div class="ic">&#128100;</div><div class="ti">No files yet</div><div class="de">Processed files appear here</div></div>';
+  count.textContent=files.length+' file'+(files.length===1?'':'s')+' \u00b7 OneDrive Processed';
+  list.innerHTML='';
+  if(!files.length){
+    list.innerHTML='<div class="empty"><div class="empty-ic">&#128100;</div><div class="empty-ti">No processed files yet</div><div class="empty-de">Files appear here after automation runs</div></div>';
     return;
   }
-  list.innerHTML = '';
-  files.forEach(function(f, idx) {
-    var odUrl = f.webUrl || '';
+  files.forEach(function(f,idx){
+    var wrap=document.createElement('div');
+    wrap.style.marginBottom='5px';
 
-    // Outer row — click toggles dropdown
-    var row = document.createElement('div');
-    row.className = 'fi done';
-    row.style.flexDirection = 'column';
-    row.style.alignItems = 'stretch';
+    var row=document.createElement('div');
+    row.className='fi';
+    row.style.cursor='pointer';
 
-    // Top part
-    var top = document.createElement('div');
-    top.style.display = 'flex';
-    top.style.alignItems = 'center';
-    top.style.gap = '8px';
-    top.style.pointerEvents = 'none';  // let row handle click
-    top.innerHTML =
-      '<div class="fic">&#128196;</div>'
-      + '<div class="fin"><div class="fnm">' + esc(f.name) + '</div>'
-      + '<div class="fmeta">' + fmtSize(f.size) + ' &middot; ' + fmtDate(f.createdAt) + '</div></div>'
-      + '<div class="fac"><span class="folder-tag od">&#128196; OD</span></div>';
+    var hasGd=!!f.gdUrl, hasOd=!!f.webUrl;
+    var tags='';
+    if(hasGd) tags+='<span class="tag gd">GD &#10003;</span>';
+    if(hasOd) tags+='<span class="tag od">OD &#10003;</span>';
+    if(!hasGd&&f.customerName) tags+='<span class="tag pend">GD pending</span>';
 
-    // Dropdown
-    var drop = document.createElement('div');
-    drop.className = 'proc-drop';
-    drop.id = 'pd-' + idx;
+    row.innerHTML=
+      '<div class="fi-icon proc">&#9989;</div>'
+      +'<div class="fi-body">'
+        +'<div class="fi-name">'+esc(f.name)+'</div>'
+        +'<div class="fi-meta">'+fsize(f.size)+(f.createdAt?' \u00b7 '+fdate(f.createdAt):'')+'</div>'
+        +(tags?'<div class="fi-tags">'+tags+'</div>':'')
+      +'</div>'
+      +'<div class="fi-right"><span style="font-size:12px;color:var(--sm)">&#8964;</span></div>';
 
-    var dropHtml =
-      '<div class="pd-row"><div class="pd-lbl">Size</div><div class="pd-val">' + esc(fmtSize(f.size)) + '</div></div>'
-      + '<div class="pd-row"><div class="pd-lbl">Filed</div><div class="pd-val">' + esc(fmtDate(f.createdAt)) + '</div></div>';
-    if (odUrl) {
-      dropHtml += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="' + esc(odUrl) + '" target="_blank">Open in OneDrive &#8599;</a></div>';
-    }
-    dropHtml += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><button class="gd-btn" id="gdb-' + idx + '">&#128230; Send to GD</button></div>';
-    drop.innerHTML = dropHtml;
+    var exp=document.createElement('div');
+    exp.className='proc-expand';
+    exp.id='pe-'+idx;
 
-    row.appendChild(top);
-    row.appendChild(drop);
+    var rows='';
+    if(f.customerName) rows+='<div class="proc-row"><span class="proc-lbl">Customer</span><span class="proc-val">'+esc(f.customerName)+'</span></div>';
+    if(f.ref) rows+='<div class="proc-row"><span class="proc-lbl">Reference</span><span class="proc-val">'+esc(f.ref)+'</span></div>';
+    if(f.size) rows+='<div class="proc-row"><span class="proc-lbl">Size</span><span class="proc-val">'+esc(fsize(f.size))+'</span></div>';
+    if(f.createdAt) rows+='<div class="proc-row"><span class="proc-lbl">Filed</span><span class="proc-val">'+esc(fdate(f.createdAt))+'</span></div>';
+    if(f.webUrl) rows+='<div class="proc-row"><span class="proc-lbl">OneDrive</span><a class="proc-link" href="'+esc(f.webUrl)+'" target="_blank">Open file &#8599;</a></div>';
+    if(f.gdUrl) rows+='<div class="proc-row"><span class="proc-lbl">Google Drive</span><a class="proc-link" href="'+esc(f.gdUrl)+'" target="_blank">Open folder &#8599;</a></div>';
+    if(!rows) rows='<div class="proc-row"><span class="proc-lbl" style="color:var(--sm)">No metadata</span></div>';
+    exp.innerHTML=rows;
 
-    // Click handler
-    row.addEventListener('click', function() {
-      var isOpen = drop.classList.contains('open');
-      document.querySelectorAll('.proc-drop.open').forEach(function(d) { d.classList.remove('open'); });
-      if (!isOpen) drop.classList.add('open');
+    row.addEventListener('click',function(){
+      var open=exp.classList.contains('open');
+      document.querySelectorAll('.proc-expand.open').forEach(function(e){e.classList.remove('open');});
+      if(!open) exp.classList.add('open');
     });
 
-    // GD button — must add after row is in DOM would cause issue, so use closure
-    var gdBtn = drop.querySelector('.gd-btn');
-    if (gdBtn) {
-      gdBtn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        sendToGDrive(gdBtn, f.name, f.id);
+    wrap.appendChild(row); wrap.appendChild(exp);
+    list.appendChild(wrap);
+  });
+}
+
+async function refreshProcessed(){
+  el('proc-list').innerHTML='<div class="empty"><div class="empty-ic">&#128194;</div><div class="empty-ti">Loading\u2026</div></div>';
+  el('proc-count').textContent='\u2014';
+  var d=await api('/api/scan-files?folder=Processed');
+  PROC_DATA=(d&&d.success)?d.files||[]:[];
+  // On refresh we lose the Firestore metadata (GD links) — show what OneDrive has
+  renderProcessed(PROC_DATA,(d&&d.success)?null:(d&&d.error?d.error:'Could not reach OneDrive'));
+}
+
+// ── Reset ─────────────────────────────────────────────────────────────────────
+async function doReset(fid){
+  if(!confirm('Reset this file so it can be reprocessed?')) return;
+  var d=await api('/api/admin?action=reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileId:fid})});
+  if(d&&d.success) refreshScans();
+  else alert('Reset failed: '+(d&&d.error?d.error:'Unknown'));
+}
+
+// ── Run a file via test-run SSE ───────────────────────────────────────────────
+async function startWatching(file){
+  if(PROCESSING) return;
+  PROCESSING=true; CURRENT=file;
+  SELECTED=null;
+  setStatus(true,'Processing \u2022 '+file.name);
+  setPillStatus('running');
+  resetPipeline();
+  el('result-area').innerHTML='';
+
+  // Update the row visually
+  var row=el('sf-'+file.id);
+  if(row){ row.className='fi active'; }
+
+  try{
+    var resp=await fetch('/api/test-run',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({fileId:file.id,fileName:file.name,runMode:'auto',runStep:1})
+    });
+    if(!resp.ok){ showError('Server error '+resp.status,1); return; }
+
+    var reader=resp.body.getReader(),dec=new TextDecoder(),buf='',evt=null;
+    while(true){
+      var chunk=await reader.read(); if(chunk.done) break;
+      buf+=dec.decode(chunk.value,{stream:true});
+      var lines=buf.split('\n'); buf=lines.pop();
+      lines.forEach(function(line){
+        if(line.startsWith('event: ')){ evt=line.slice(7).trim(); return; }
+        if(line.startsWith('data: ')){
+          try{
+            var d=JSON.parse(line.slice(6));
+            if(evt==='progress'){
+              var ps=d.step||0;
+              if(d.status==='running') updateStep(ps,'running');
+              else if(d.status==='done') updateStep(ps,'done');
+              else if(d.status==='error') updateStep(ps,'error');
+            } else if(evt==='complete'){
+              STEPS.forEach(function(s){ updateStep(s.id,'done'); });
+              showResult(d); onDone();
+            } else if(evt==='error'){
+              updateStep(d.step||1,'error');
+              showError(d.message||'Unknown error',d.step||1);
+              onErr();
+            }
+          }catch(e){}
+        }
+        if(line==='') evt=null;
       });
     }
-
-    list.appendChild(row);
-  });
-}
-
-async function refreshProcessed() {
-  el('proc-list').innerHTML = '<div class="stmsg"><div class="ic">&#128194;</div><div class="ti">Loading\u2026</div></div>';
-  el('proc-count').textContent = '\u2014';
-  var d = await apiCall('/api/scan-files?folder=Processed');
-  PROC_DATA = (d && d.success) ? (d.files || []) : [];
-  renderProcessed(PROC_DATA, (d && d.success) ? null : (d && d.error ? d.error : 'Could not reach OneDrive'));
-}
-
-// ── File run ──────────────────────────────────────────────────────────────────
-async function doReset(fid) {
-  if (!confirm('Reset this file so it can be reprocessed?')) return;
-  var d = await apiCall('/api/admin?action=reset', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileId:fid}) });
-  if (d && d.success) refreshScans();
-  else alert('Reset failed: ' + (d && d.error ? d.error : 'Unknown error'));
-}
-
-// ── GD filing ─────────────────────────────────────────────────────────────────
-async function sendToGDrive(btn, fname, fid) {
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
-  var d = await apiCall('/api/gdrive?action=file', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileName:fname, fileId:fid}) });
-  if (d && d.success) {
-    var url = d.gdFileUrl || d.gdFolderUrl || '';
-    btn.parentElement.innerHTML = '<div class="pd-lbl">Google Drive</div>'
-      + (url ? '<a class="pd-link" href="' + esc(url) + '" target="_blank">Open &#8599;</a>' : 'Filed &#10003;');
-  } else {
-    btn.disabled = false; btn.innerHTML = '&#10007; Retry'; btn.style.color = 'var(--rd)';
-    setTimeout(function(){ btn.innerHTML = '&#128230; Send to GD'; btn.style.color = ''; }, 6000);
-  }
-}
-
-// ── GD Retry panel ────────────────────────────────────────────────────────────
-async function retryGD() {
-  var btn = el('gd-retry-btn'); btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
-  var panel = el('gdpanel'), body = el('gdp-body'), title = el('gdp-title');
-  panel.classList.add('open'); body.innerHTML = ''; title.textContent = 'Google Drive Filing';
-  function addRow(id, cls, ic, name, detail, link, linkTxt) {
-    var ex = body.querySelector('[data-rid="'+id+'"]');
-    var html = '<div class="gdrow '+cls+'" data-rid="'+esc(id)+'">'
-      +'<div class="gdrow-ic">'+ic+'</div>'
-      +'<div class="gdrow-body"><div class="gdrow-name">'+esc(name)+'</div>'
-      +(detail?'<div class="gdrow-detail">'+esc(detail)+'</div>':'')
-      +(link?'<a class="gdrow-link" href="'+esc(link)+'" target="_blank">Open '+(linkTxt||'folder')+' &#8599;</a>':'')
-      +'</div></div>';
-    if (ex) ex.outerHTML = html; else body.insertAdjacentHTML('beforeend', html);
-    body.scrollTop = body.scrollHeight;
-  }
-  try {
-    var resp = await fetch('/api/gdrive?action=retry', { method:'POST' });
-    var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '';
-    while (true) {
-      var chunk = await reader.read(); if (chunk.done) break;
-      buf += dec.decode(chunk.value, { stream: true });
-      var lines = buf.split('\n'); buf = lines.pop();
-      for (var i = 0; i < lines.length; i++) {
-        var line = lines[i].trim();
-        if (!line || line.startsWith(': ')) continue;
-        if (line.startsWith('data: ')) {
-          try {
-            var ev = JSON.parse(line.slice(6));
-            if (ev.type==='start') title.textContent = 'Filing '+ev.total+' file'+(ev.total===1?'':'s')+' to Google Drive';
-            else if (ev.type==='file'&&ev.status==='filing') addRow('f-'+ev.name,'p','&#9203;',ev.name,'Filing\u2026',null,null);
-            else if (ev.type==='file'&&ev.status==='success') addRow('f-'+ev.name,'s','&#10003;',ev.name,ev.pages+' page(s)',ev.gdFolderUrl,'folder');
-            else if (ev.type==='file'&&ev.status==='failed') addRow('f-'+ev.name,'f','&#10007;',ev.name,'Failed',null,null);
-            else if (ev.type==='page'&&ev.status==='success') addRow('p-'+ev.name+'-'+ev.page,'s','&#128196;',ev.fileName,'Page '+ev.page,ev.gdFileUrl||ev.gdFolderUrl,ev.gdFileUrl?'file':'folder');
-            else if (ev.type==='done') { title.textContent='Complete'; if(ev.total===0) body.innerHTML='<div class="gdrow s"><div class="gdrow-ic">&#10003;</div><div class="gdrow-body"><div class="gdrow-name">All files already filed</div></div></div>'; }
-          } catch(ex) {}
-        }
-      }
+    // Stream ended without complete event — check status
+    if(PROCESSING){
+      var rec=await api('/api/status?fileId='+encodeURIComponent(file.id));
+      if(rec&&rec.record&&rec.record.status==='completed'){
+        STEPS.forEach(function(s){ updateStep(s.id,'done'); });
+        showResult(rec.record); onDone();
+      } else if(PROCESSING){ showError('Stream ended unexpectedly',0); onErr(); }
     }
-  } catch(err) {
-    body.insertAdjacentHTML('beforeend','<div class="gdrow f"><div class="gdrow-ic">&#10007;</div><div class="gdrow-body"><div class="gdrow-name">Error: '+esc(err.message)+'</div></div></div>');
-  }
-  btn.disabled = false; btn.innerHTML = '&#128230; GD'; btn.style.color = 'var(--gn)';
+  }catch(err){ showError(err.message,0); onErr(); }
 }
 
-// ── Activity cards ────────────────────────────────────────────────────────────
-function setLive(on, label) {
-  el('live').className = 'live' + (on ? ' on' : '');
-  el('stxt').textContent = label || (on ? 'Processing\u2026' : 'Watching for files\u2026');
-  el('sdot').className = 'dot' + (on ? ' g' : '');
+function onDone(){
+  PROCESSING=false; CURRENT=null;
+  setStatus(false,'Idle'); setPillStatus('done');
+  hideRunPanel();
+  setTimeout(function(){
+    if(!PROCESSING){
+      setStatus(false,'Idle');
+      refreshScans(); refreshProcessed();
+    }
+  },8000);
 }
 
-function setActivityName(name) {
-  el('act-sub').textContent = name ? 'Currently processing:' : 'Waiting for automation\u2026';
-  var n = el('act-name'); n.textContent = name || ''; n.style.display = name ? '' : 'none';
-}
-
-function mkStep(id, label, msg, st) {
-  var ico = st==='running' ? '<span class="spin"></span>' : st==='done' ? '\u2713' : st==='error' ? '\u2715' : String(id);
-  return '<div class="step '+st+'" id="st-'+id+'" data-st="'+st+'">'
-    +'<div class="stepico">'+ico+'</div>'
-    +'<div style="flex:1;min-width:0"><div class="steplabel">'+esc(label)+'</div>'
-    +(msg?'<div class="stepmsg">'+esc(msg)+'</div>':'')+'</div></div>';
-}
-
-function updStep(n, msg, st) {
-  STEPS.forEach(function(s) {
-    if (s.id < n) { var e=el('st-'+s.id); if(e&&(e.dataset.st==='pending'||e.dataset.st==='running'))e.outerHTML=mkStep(s.id,s.l,'','done'); }
-  });
-  var ex = el('st-'+n), step = STEPS.find(function(s){ return s.id===n; });
-  if (!step) return;
-  if (ex) ex.outerHTML = mkStep(n, step.l, msg, st);
-  else el('steplist').insertAdjacentHTML('beforeend', mkStep(n, step.l, msg, st));
-}
-
-function showResult(d) {
-  var files = (d.renamedFiles||[]).map(function(f){ return '<div class="fpill">'+esc(f)+'</div>'; }).join('');
-  el('rescard').innerHTML = '<div class="rescard">'
-    +'<div class="restitle">&#9989; Complete</div>'
-    +'<div class="resrow"><div class="reslbl">Customer</div><div class="resval">'+esc(d.customerName||'\u2014')+'</div></div>'
-    +'<div class="resrow"><div class="reslbl">Reference</div><div class="resval">'+esc(d.ref||'\u2014')+'</div></div>'
-    +'<div class="resrow"><div class="reslbl">Pages</div><div class="resval">'+(d.totalPages||'\u2014')+'</div></div>'
-    +(d.googleDriveFolderUrl?'<div class="resrow"><div class="reslbl">Google Drive</div><div class="resval"><a class="reslink" href="'+d.googleDriveFolderUrl+'" target="_blank">Open &#8599;</a></div></div>':'')
-    +(d.oneDriveProcessedFolderUrl?'<div class="resrow"><div class="reslbl">OneDrive</div><div class="resval"><a class="reslink" href="'+d.oneDriveProcessedFolderUrl+'" target="_blank">Open &#8599;</a></div></div>':'')
-    +(files?'<div class="resrow" style="flex-direction:column;gap:2px"><div class="reslbl">Files</div>'+files+'</div>':'')
-    +'</div>';
-}
-
-function showError(msg) {
-  el('rescard').innerHTML = '<div class="rescard err"><div class="restitle">&#10060; Failed</div>'
-    +'<div class="resrow"><div class="reslbl">Error</div><div class="resval" style="color:var(--rd)">'+esc(msg)+'</div></div></div>';
-}
-
-function handleEvt(ev, d) {
-  if (ev==='progress') {
-    if (d.status==='running') requestAnimationFrame(function(){ updStep(d.step,d.message,d.status); });
-    else updStep(d.step, d.message, d.status);
-  } else if (ev==='complete') {
-    updStep(4,'All '+(d.totalPages||'')+' page(s) sent to Make.com \u2713','done');
-    updStep(5,'All '+(d.totalPages||'')+' page(s) extracted by Claude \u2713','done');
-    updStep(6,'All '+(d.totalPages||'')+' page(s) filed \u2713','done');
-    showResult(d); onDone();
-  } else if (ev==='error') { showError(d.message); onErr(); }
-}
-
-function onDone() {
-  PROCESSING = false; CURRENT = null;
-  setLive(false); hideRunPanel();
-  setTimeout(function(){ if(!PROCESSING) setActivityName(null); }, 10000);
-  refreshScans(); refreshProcessed();
-}
-function onErr() {
-  PROCESSING = false; CURRENT = null;
-  setLive(false, 'Error \u2014 check Vercel logs'); hideRunPanel();
+function onErr(){
+  PROCESSING=false; CURRENT=null;
+  setStatus(false,'Error'); setPillStatus('error');
+  hideRunPanel();
+  setTimeout(function(){ if(!PROCESSING) setStatus(false,'Idle'); },15000);
   refreshScans();
 }
 
-// ── Start watching a file via test-run SSE ────────────────────────────────────
-async function startWatching(file) {
-  if (PROCESSING) return;
-  PROCESSING = true; CURRENT = file;
-  setLive(true, 'Processing \u2022 ' + file.name);
-  setActivityName(file.name);
-  el('progidle').style.display = 'none';
-  el('steplist').innerHTML = STEPS.map(function(s){ return mkStep(s.id,s.l,'','pending'); }).join('');
-  el('rescard').innerHTML = '';
-  var row = el('sf-' + file.id);
-  if (row) { row.className = 'fi active'; row.querySelector('.fic').innerHTML = '<span class="spin" style="color:var(--or)"></span>'; }
-  try {
-    var resp = await fetch('/api/test-run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({fileId:file.id, fileName:file.name, runMode:'auto', runStep:1}) });
-    if (!resp.ok) { showError('Server error ' + resp.status); onErr(); return; }
-    var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '', evt = null;
-    while (true) {
-      var chunk = await reader.read(); if (chunk.done) break;
-      buf += dec.decode(chunk.value, { stream: true });
-      var lines = buf.split('\n'); buf = lines.pop();
-      lines.forEach(function(line) {
-        if (line.startsWith('event: ')) evt = line.slice(7).trim();
-        else if (line.startsWith('data: ')) { try{ handleEvt(evt, JSON.parse(line.slice(6))); }catch(e){} }
-        else if (line === '') evt = null;
-      });
-    }
-    if (PROCESSING) {
-      var rec = await apiCall('/api/status?fileId=' + encodeURIComponent(file.id));
-      if (rec && rec.record && rec.record.status === 'completed') {
-        updStep(4,'All page(s) sent \u2713','done');
-        updStep(5,'All page(s) extracted \u2713','done');
-        updStep(6,'All page(s) filed \u2713','done');
-        showResult(rec.record); onDone();
-      } else if (PROCESSING) onErr();
-    }
-  } catch(err) { showError(err.message); onErr(); }
+function showResult(d){
+  var files=(d.renamedFiles||[]).map(function(f){
+    return '<span style="font-family:monospace;font-size:9px;background:#e0f2fe;padding:1px 5px;border-radius:4px;margin:1px">'+esc(f)+'</span>';
+  }).join(' ');
+  el('result-area').innerHTML=
+    '<div class="result-card">'
+    +'<div class="result-title">&#9989; Processing Complete</div>'
+    +(d.customerName?'<div class="result-row"><span class="result-lbl">Customer</span><span class="result-val">'+esc(d.customerName)+'</span></div>':'')
+    +(d.ref?'<div class="result-row"><span class="result-lbl">Reference</span><span class="result-val">'+esc(d.ref)+'</span></div>':'')
+    +(d.totalPages?'<div class="result-row"><span class="result-lbl">Pages</span><span class="result-val">'+d.totalPages+'</span></div>':'')
+    +(d.googleDriveFolderUrl?'<div class="result-row"><span class="result-lbl">Google Drive</span><a class="result-link" href="'+esc(d.googleDriveFolderUrl)+'" target="_blank">Open folder &#8599;</a></div>':'')
+    +(d.oneDriveProcessedFolderUrl?'<div class="result-row"><span class="result-lbl">OneDrive</span><a class="result-link" href="'+esc(d.oneDriveProcessedFolderUrl)+'" target="_blank">Open folder &#8599;</a></div>':'')
+    +(files?'<div class="result-row"><span class="result-lbl">Files</span><div style="flex:1">'+files+'</div></div>':'')
+    +'</div>';
 }
 
-// ── SSE Notify ────────────────────────────────────────────────────────────────
-function openNotifyStream() {
-  if (NOTIFY_ES) { NOTIFY_ES.close(); NOTIFY_ES = null; }
-  var es = new EventSource('/api/notify');
-  NOTIFY_ES = es;
-  es.addEventListener('connected', function(){ console.log('[dashboard] notify connected'); });
-  es.addEventListener('new-file', async function(e) {
-    try {
+function showError(msg,step){
+  el('result-area').innerHTML=
+    '<div class="result-card err">'
+    +'<div class="result-title">&#10060; Processing Failed</div>'
+    +'<div class="result-row"><span class="result-lbl">Error</span><span class="result-val" style="color:#991b1b">'+esc(msg)+'</span></div>'
+    +(step?'<div class="result-row"><span class="result-lbl">Step</span><span class="result-val">'+step+'</span></div>':'')
+    +'</div>';
+}
+
+// ── GD Retry ─────────────────────────────────────────────────────────────────
+async function retryGD(){
+  var btn=el('gd-btn'); btn.textContent='&#9729; Filing\u2026'; btn.disabled=true;
+  try{
+    var resp=await fetch('/api/gdrive?action=retry',{method:'POST'});
+    var reader=resp.body.getReader(),dec=new TextDecoder(),buf='';
+    while(true){
+      var chunk=await reader.read(); if(chunk.done) break;
+      buf+=dec.decode(chunk.value,{stream:true});
+      buf.split('\n').forEach(function(line){
+        if(line.startsWith('data: ')){
+          try{
+            var ev=JSON.parse(line.slice(6));
+            if(ev.type==='done') refreshProcessed();
+          }catch(e){}
+        }
+      });
+    }
+  }catch(e){}
+  btn.textContent='&#9729; GD Retry'; btn.disabled=false;
+  refreshProcessed();
+}
+
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+var diagOpen=false;
+function toggleDiag(){
+  diagOpen=!diagOpen;
+  el('diag-panel').style.display=diagOpen?'':'none';
+  el('diag-btn').className='hbtn'+(diagOpen?' active':'');
+  if(diagOpen) loadDiag();
+}
+async function loadDiag(){
+  el('diag-body').innerHTML='<div style="color:var(--mu);font-size:11px">Running checks\u2026</div>';
+  var d=await api('/api/diag?format=json');
+  var items=d&&d.results?d.results:[];
+  if(!items.length){ el('diag-body').innerHTML='<div style="color:var(--mu);font-size:11px">No results</div>'; return; }
+  el('diag-body').innerHTML=items.map(function(item){
+    return '<div class="diag-row '+(item.ok?'ok':'fail')+'">'
+      +'<div class="diag-ic">'+(item.ok?'&#10003;':'&#10007;')+'</div>'
+      +'<div><div class="diag-label">'+esc(item.label)+'</div>'
+      +'<div class="diag-detail">'+esc(item.detail)+'</div></div>'
+      +'</div>';
+  }).join('');
+}
+
+// ── SSE Notify stream ─────────────────────────────────────────────────────────
+function openNotifyStream(){
+  if(NOTIFY_ES){ NOTIFY_ES.close(); NOTIFY_ES=null; }
+  var es=new EventSource('/api/notify');
+  NOTIFY_ES=es;
+  es.addEventListener('connected',function(){ console.log('[dashboard] notify connected'); });
+  es.addEventListener('new-file',async function(){
+    // Make.com triggered scan-now → new file detected → refresh scans column
+    try{
       await refreshScans();
-      if (!PROCESSING && SCAN_DATA.length > 0) startWatching(SCAN_DATA[0]);
-    } catch(ex) {}
+      // Auto-start the first file if not already processing
+      if(!PROCESSING&&SCAN_DATA.length>0) startWatching(SCAN_DATA[0]);
+    }catch(ex){}
   });
-  es.addEventListener('reconnect', function(){ es.close(); NOTIFY_ES=null; setTimeout(openNotifyStream,1000); });
-  es.onerror = function(){ es.close(); NOTIFY_ES=null; setTimeout(openNotifyStream,5000); };
+  es.addEventListener('reconnect',function(){ es.close(); NOTIFY_ES=null; setTimeout(openNotifyStream,1000); });
+  es.onerror=function(){ es.close(); NOTIFY_ES=null; setTimeout(openNotifyStream,5000); };
 }
 
 // ── Wire up buttons ───────────────────────────────────────────────────────────
-el('runbtn').addEventListener('click', async function() {
-  if (!SELECTED || PROCESSING) return;
-  var f = SELECTED;
-  this.disabled = true;
-  this.innerHTML = '<span class="spin"></span> Running\u2026';
+el('run-btn').addEventListener('click',async function(){
+  if(!SELECTED||PROCESSING) return;
+  var f=SELECTED;
+  this.disabled=true;
+  this.innerHTML='<span class="spin"></span> Running\u2026';
   hideRunPanel();
   await startWatching(f);
 });
-el('scan-refresh').addEventListener('click', refreshScans);
-el('proc-refresh').addEventListener('click', refreshProcessed);
-el('gd-retry-btn').addEventListener('click', retryGD);
-el('gdp-close').addEventListener('click', function(){ el('gdpanel').classList.remove('open'); });
 
-// ── Init — fetch both columns fresh from OneDrive ─────────────────────────────
-try {
-  openNotifyStream();
-  // Always fetch live from /api/scan-files — avoids cold-start race conditions
-  Promise.all([refreshScans(), refreshProcessed()]).then(function() {
-    console.log('[dashboard] Init OK — Scans:', SCAN_DATA.length, 'Processed:', PROC_DATA.length);
-  });
-} catch(initErr) {
-  console.error('[dashboard] Init error:', initErr);
-  var errDiv = document.createElement('div');
-  errDiv.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:#1f0f0f;border:1px solid #ef4444;color:#f87171;padding:12px 20px;border-radius:8px;font-size:12px;z-index:999;max-width:80%';
-  errDiv.textContent = 'Dashboard JS error: ' + initErr.message;
-  document.body.appendChild(errDiv);
+// ── Init ──────────────────────────────────────────────────────────────────────
+buildPipeline();
+try{
+  renderScans(SCAN_DATA,SCAN_ERROR);
+  renderProcessed(PROC_DATA,PROC_ERROR);
+  console.log('[dashboard] Init \u2014 Scans:',SCAN_DATA.length,'Processed:',PROC_DATA.length);
+}catch(err){
+  console.error('[dashboard] Init error:',err);
 }
+openNotifyStream();
 
-})(); // end IIFE
+})();
 </script>
 </body></html>`);
 };
