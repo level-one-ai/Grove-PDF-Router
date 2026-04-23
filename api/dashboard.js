@@ -108,30 +108,35 @@ function buildProcList(files, error) {
       + '<div class="ti">No files yet</div>'
       + '<div class="de">Processed files appear here after the automation runs</div></div>';
   }
-  return files.map((f, idx) => {
+  return files.map(function(f, idx) {
     const did = 'pdrop-' + idx;
     const odUrl = f.webUrl || '';
     let drop = '<div class="proc-drop" id="' + did + '">';
     drop += '<div class="pd-row"><div class="pd-lbl">Size</div><div class="pd-val">' + h(formatBytes(f.size)) + '</div></div>';
     drop += '<div class="pd-row"><div class="pd-lbl">Filed</div><div class="pd-val">' + h(formatDate(f.createdAt)) + '</div></div>';
-    if (odUrl) drop += '<div class="pd-row"><div class="pd-lbl">OneDrive</div>'
-      + '<a class="pd-link" href="' + h(odUrl) + '" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
+    if (odUrl) {
+      drop += '<div class="pd-row"><div class="pd-lbl">OneDrive</div>'
+        + '<a class="pd-link" href="' + h(odUrl) + '" target="_blank" onclick="event.stopPropagation()">Open in OneDrive &#8599;</a></div>';
+    }
     drop += '<div class="pd-row"><div class="pd-lbl">Google Drive</div>'
       + '<button class="gd-send-btn" data-fname="' + h(f.name) + '" data-fid="' + h(f.id) + '" '
       + 'onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
     drop += '</div>';
-    return '<div class="fi done-f" data-dropid="' + did + '" '
-      + 'onclick="toggleDrop(this.dataset.dropid)" style="flex-direction:column;align-items:stretch">'
+    const tags = odUrl
+      ? '<span class="folder-tag od">&#128196; OD</span>'
+      : '<span class="folder-tag" style="background:#1a1a00;color:#eab308;border:1px solid #eab30833">&#9203; Pending</span>';
+    return '<div class="fi done-f" data-dropid="' + did + '" onclick="toggleDrop(this)" style="flex-direction:column;align-items:stretch">'
       + '<div style="display:flex;align-items:center;gap:8px">'
       + '<div class="fic">&#128196;</div>'
       + '<div class="fin">'
       + '<div class="fnm">' + h(f.name) + '</div>'
       + '<div class="fmeta">' + h(formatBytes(f.size)) + ' &middot; ' + h(formatDate(f.createdAt)) + '</div>'
       + '</div>'
-      + '<div class="fac"><span class="folder-tag od">&#128196; OD</span></div>'
+      + '<div class="fac">' + tags + '</div>'
       + '</div>' + drop + '</div>';
   }).join('');
 }
+
 
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -456,7 +461,7 @@ function renderProcessed(files, error) {
     if (odUrl) drop += '<div class="pd-row"><div class="pd-lbl">OneDrive</div><a class="pd-link" href="'+esc(odUrl)+'" target="_blank" onclick="event.stopPropagation()">Open file &#8599;</a></div>';
     drop += '<div class="pd-row"><div class="pd-lbl">Google Drive</div><button class="gd-send-btn" data-fname="'+esc(f.name)+'" data-fid="'+esc(f.id)+'" onclick="event.stopPropagation();sendToGDrive(this)">&#128230; Send to GD</button></div>';
     drop += '</div>';
-    return '<div class="fi done-f" data-dropid="'+did+'" onclick="toggleDrop(this.dataset.dropid)" style="flex-direction:column;align-items:stretch">'
+    return '<div class="fi done-f" data-dropid="'+did+'" onclick="toggleDrop(this)" style="flex-direction:column;align-items:stretch">'
       +'<div style="display:flex;align-items:center;gap:8px">'
       +'<div class="fic">&#128196;</div>'
       +'<div class="fin"><div class="fnm">'+esc(f.name)+'</div><div class="fmeta">'+esc(fsize(f.size))+' &middot; '+esc(fdate(f.createdAt))+'</div></div>'
@@ -485,19 +490,18 @@ async function refreshProcessed(){
 // ── File selection & run ──────────────────────────────────────────────────────
 function selectFile(el){
   if(PROCESSING)return;
-  // Read file data directly from element data attributes — no SCAN_FILES lookup needed
-  var fid   = el.dataset.fid;
-  var fname = el.dataset.fname;
-  var fsize_val = parseInt(el.dataset.fsize||'0',10);
-  var fdate_val = el.dataset.fdate||'';
+  // Walk up to the .fi element that holds the data attributes
+  // (user may have clicked a child element like the filename text)
+  var fi = el.closest ? el.closest('[data-fid]') : el;
+  if(!fi) return;
+  var fid   = fi.dataset.fid;
+  var fname = fi.dataset.fname;
+  var fsize_val = parseInt(fi.dataset.fsize||'0',10);
+  var fdate_val = fi.dataset.fdate||'';
   if(!fid||!fname)return;
   SELECTED_FILE = {id:fid, name:fname, size:fsize_val, createdAt:fdate_val};
-  // Update SCAN_FILES too so startWatching has the full object
-  if(!SCAN_FILES.find(function(x){return x.id===fid;})){
-    SCAN_FILES.push(SELECTED_FILE);
-  }
   document.querySelectorAll('.fi.sel-f').forEach(function(e){e.classList.remove('sel-f');});
-  el.classList.add('sel-f');
+  fi.classList.add('sel-f');
   $('run-fname').textContent=fname;
   $('run-fmeta').textContent=fsize(fsize_val)+' \u00b7 '+fdate(fdate_val);
   var ra=$('run-area'); ra.classList.add('show');
@@ -526,7 +530,10 @@ async function doReset(fid){
 }
 
 // ── Processed dropdown & GD ───────────────────────────────────────────────────
-function toggleDrop(id){
+function toggleDrop(el){
+  // el may be the .fi.done-f div or a child — walk up to find the one with data-dropid
+  var fi = (typeof el === 'string') ? null : (el.closest ? el.closest('[data-dropid]') : el);
+  var id = fi ? fi.dataset.dropid : el;
   var d=document.getElementById(id); if(!d)return;
   var open=d.classList.contains('open');
   document.querySelectorAll('.proc-drop.open').forEach(function(x){x.classList.remove('open');});
