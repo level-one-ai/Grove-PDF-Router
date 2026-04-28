@@ -299,21 +299,23 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
       let nextTempData = (pageStore || {})[nextPage] || (pageStore || {})[String(nextPage)] || null;
 
       if (!nextTempData?.tempItemId) {
-        // Not in passed pageStore — fetch originalFileName if we don't have it
-        if (!originalFileName) {
-          const r = await db.getRecord(fileId);
-          originalFileName = r?.originalFileName;
-          const ps = r?.pageStore || {};
-          nextTempData = ps[nextPage] || ps[String(nextPage)] || null;
-        }
+        // Not in passed pageStore — always re-read Firestore for the latest pageStore.
+        // The passed pageStore may be stale (fetched before scan-now wrote the next
+        // page's tempItemId), so we must check the live record regardless of whether
+        // we already have originalFileName.
+        const r = await db.getRecord(fileId);
+        if (!originalFileName) originalFileName = r?.originalFileName;
+        const ps = r?.pageStore || {};
+        nextTempData = ps[nextPage] || ps[String(nextPage)] || null;
       }
 
       if (!nextTempData?.tempItemId) {
+        // Still not there — wait up to 3 minutes for scan-now to write it
         nextTempData = await waitForTempPage(fileId, nextPage, 180000);
       }
 
       if (!nextTempData?.tempItemId) {
-        // Final direct read fallback
+        // Final direct read fallback after wait
         const latestRecord = await db.getRecord(fileId);
         if (!originalFileName) originalFileName = latestRecord?.originalFileName;
         const latestPs = latestRecord?.pageStore || {};
