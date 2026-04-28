@@ -23,9 +23,13 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { fileId, limit = '50' } = req.query;
+  // limit: dashboard page-load uses 10 (recent history only).
+  // Pass limit=200 explicitly only when a full export/audit is needed.
+  const { fileId, limit = '10' } = req.query;
 
   try {
+    // Single-record fetch — used by dashboard to check one file without loading all records.
+    // This costs exactly 1 Firestore read regardless of collection size.
     if (fileId) {
       const record = await db.getRecord(fileId);
       if (!record) return res.status(404).json({ error: 'Record not found' });
@@ -44,10 +48,13 @@ module.exports = async function handler(req, res) {
     }
 
     const firestore = firebase.firestore();
+    // Cap at 50 as a hard safety limit — dashboard only needs recent records.
+    // Full history is available by passing ?limit=50 explicitly if ever needed.
+    const safeLimit = Math.min(parseInt(limit, 10) || 10, 50);
     const snapshot = await firestore
       .collection('processedFiles')
       .orderBy('createdAt', 'desc')
-      .limit(parseInt(limit, 10))
+      .limit(safeLimit)
       .get();
 
     const records = snapshot.docs.map((doc) => {

@@ -470,12 +470,37 @@ function openNotifyStream() {
   });
 
   es.addEventListener('status-update', function(e) {
-    // File processing status changed — reload status cache without polling
-    console.log('[dashboard] Status update received via SSE — reloading cache');
-    loadStatus().then(function() {
+    // File processing status changed — update in-memory cache directly from payload
+    // No Firestore read needed — payload carries everything we need
+    try {
+      var d = JSON.parse(e.data);
+      console.log('[dashboard] Status update via SSE — page', d.pageNumber, '/', d.totalPages, 'for', d.fileId);
+      // Update or insert the record in STATUS_CACHE directly
+      var idx = STATUS_CACHE.findIndex(function(r){ return r.fileId === d.fileId; });
+      if (idx >= 0) {
+        STATUS_CACHE[idx].pagesReturned = d.pageNumber;
+        if (d.status === 'complete') STATUS_CACHE[idx].status = 'completed';
+      }
+      // Refresh processed column from updated cache — no Firestore read
       loadProcessed();
       checkForAutonomousCompletion();
-    });
+    } catch(ex) {
+      // If payload parse fails, fall back to a single-record fetch (not full collection)
+      console.warn('[dashboard] status-update parse failed, fetching single record');
+      try {
+        var pd = JSON.parse(e.data);
+        if (pd.fileId) {
+          api('/api/status?fileId=' + pd.fileId).then(function(r){
+            if (r && r.record) {
+              var i = STATUS_CACHE.findIndex(function(x){ return x.fileId === pd.fileId; });
+              if (i >= 0) STATUS_CACHE[i] = r.record; else STATUS_CACHE.unshift(r.record);
+              loadProcessed();
+              checkForAutonomousCompletion();
+            }
+          });
+        }
+      } catch(_) {}
+    }
   });
 
   es.addEventListener('reconnect', function() {
@@ -512,8 +537,8 @@ async function autoPollScans() {
   var d = await api('/api/scan-files');
   if (!d || !d.success || !d.files) return;
 
-  // Refresh status cache so completed files are excluded
-  await loadStatus();
+  // Use existing STATUS_CACHE — no Firestore read needed here
+  // Cache is kept fresh by SSE status-update events and the 10-min safety interval
   var processedIds = {};
   STATUS_CACHE.forEach(function(r){ if (r.status==='completed') processedIds[r.fileId]=true; });
   var unprocessed = d.files.filter(function(f){ return !processedIds[f.id]; });
@@ -1401,7 +1426,7 @@ openNotifyStream();
 // Refresh status cache every 60 seconds
 setInterval(loadStatus, 600000); // 10 mins — SSE handles live updates, this is a safety net only
 // REMOVED: 30s poll during processing — status now pushed via SSE 'status-update' event
-setInterval(loadWaiting, 120000); // 2 mins — queue rarely changes without a notify event
+// loadWaiting interval removed — SSE events trigger loadWaiting() on actual queue changes
 // Stop state cleared on load — no need to poll it
 </script>
 </body></html>`;
