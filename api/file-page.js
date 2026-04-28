@@ -242,6 +242,19 @@ module.exports = async function handler(req, res) {
       });
     } catch(e) { /* non-fatal */ }
 
+    // Broadcast status-update so dashboard knows this page is done
+    {
+      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+      axios.post(`${baseUrl}/api/notify`, {
+        event: 'status-update',
+        data: { fileId, pageNumber, totalPages, status: pageNumber >= totalPages ? 'complete' : 'page-complete' },
+        secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
+      }, {
+        headers: { 'Content-Type': 'application/json', 'x-notify-secret': process.env.CALLBACK_SECRET || 'grove-pdf-router-secret' },
+        timeout: 3000,
+      }).catch(() => {});
+    }
+
     // ── FIX: pass originalFileName and cachedQueue so chain continues cleanly ──
     await dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName, record?.pageStore || {}, cachedQueue);
 
@@ -332,6 +345,19 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
       ]).catch(err => console.warn('[file-page] Cleanup warning:', err.message));
     } catch (completeErr) {
       console.error('[file-page] Failed to mark complete:', completeErr.message);
+    }
+
+    // Broadcast completion so dashboard steps turn green immediately
+    {
+      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+      axios.post(`${baseUrl}/api/notify`, {
+        event: 'status-update',
+        data: { fileId, pageNumber, totalPages, status: 'complete' },
+        secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
+      }, {
+        headers: { 'Content-Type': 'application/json', 'x-notify-secret': process.env.CALLBACK_SECRET || 'grove-pdf-router-secret' },
+        timeout: 3000,
+      }).catch(() => {});
     }
 
     const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
