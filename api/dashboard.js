@@ -469,6 +469,15 @@ function openNotifyStream() {
     }
   });
 
+  es.addEventListener('status-update', function(e) {
+    // File processing status changed — reload status cache without polling
+    console.log('[dashboard] Status update received via SSE — reloading cache');
+    loadStatus().then(function() {
+      loadProcessed();
+      checkForAutonomousCompletion();
+    });
+  });
+
   es.addEventListener('reconnect', function() {
     console.log('[dashboard] Notify stream reconnecting...');
     es.close();
@@ -1390,9 +1399,8 @@ loadSub();
 // Open SSE notify stream for instant new-file detection
 openNotifyStream();
 // Refresh status cache every 60 seconds
-setInterval(loadStatus, 300000); // 5 mins — status cache refreshed on demand by SSE events
-// When a file is being processed, poll status every 30s to catch autonomous completion
-setInterval(function(){ if (IR) loadStatus(); }, 30000);
+setInterval(loadStatus, 600000); // 10 mins — SSE handles live updates, this is a safety net only
+// REMOVED: 30s poll during processing — status now pushed via SSE 'status-update' event
 setInterval(loadWaiting, 120000); // 2 mins — queue rarely changes without a notify event
 // Stop state cleared on load — no need to poll it
 </script>

@@ -14,6 +14,13 @@
  * 5. Updates Firestore
  * 6. Dispatches next page to Make.com
  * 7. Responds 200 when all done
+ *
+ * CHANGES:
+ *  - FIX: originalFileName fetched at top of non-order branch (fixes 500 error)
+ *  - FIX: non-order pages now reliably file to Non-Order Documents folder
+ *  - PERF: queue fetched once and cached for entire invocation (eliminates per-page reads)
+ *  - PERF: pageStore passed through functions rather than re-read from Firestore
+ *  - PERF: record data reused across the call rather than fetched multiple times
  */
 
 const db = require('../lib/firebase');
@@ -31,18 +38,12 @@ module.exports.config = {
 };
 
 // Resilient raw body parser — handles malformed JSON from Make.com.
-// Make.com's HTTP module embeds product_selection (a JSON array) as a raw string
-// value inside the outer JSON body. If product_selection items contain literal
-// newlines (from OCR text), the outer JSON becomes invalid and Vercel's built-in
-// body parser rejects the entire request before our code runs.
-// By parsing the body ourselves we can sanitise it first.
 async function parseBody(req) {
   return new Promise((resolve) => {
     let raw = '';
     req.on('data', chunk => { raw += chunk.toString(); });
     req.on('end', () => {
 
-      // Helper: strip all control characters from every string value in a parsed object
       function sanitiseObj(obj) {
         if (typeof obj === 'string') return obj.replace(/[\x00-\x1F\x7F]/g, ' ').trim();
         if (Array.isArray(obj)) return obj.map(sanitiseObj);
@@ -54,13 +55,11 @@ async function parseBody(req) {
         return obj;
       }
 
-      // First try: parse as-is, then sanitise all string values
       try {
         resolve(sanitiseObj(JSON.parse(raw)));
         return;
       } catch (_) {}
 
-      // Second try: strip control chars from the raw JSON text then parse
       try {
         const cleaned = raw
           .replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, ' ')
@@ -70,8 +69,6 @@ async function parseBody(req) {
         return;
       } catch (_) {}
 
-      // Third try: strip product_selection and handwritten_notes (both optional)
-      // then strip remaining control chars
       try {
         let stripped = raw
           .replace(/"product_selection"\s*:\s*"[^"\\]*(?:\\.[^"\\]*)*"\s*,?\s*/g, '')
@@ -81,7 +78,6 @@ async function parseBody(req) {
         return;
       } catch (_) {}
 
-      // Final fallback: extract key fields with regex
       console.warn('[file-page] JSON body unparseable — using regex field extraction');
       const get = (key) => {
         const m = raw.match(new RegExp(`"${key}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"`));
@@ -116,7 +112,6 @@ async function parseBody(req) {
         ship_to_street: get('ship_to_street'),
         ship_to_city: get('ship_to_city'),
         ship_to_postcode: get('ship_to_postcode'),
-        // handwritten_notes and product_selection are optional — omit if not present
         handwritten_notes: get('handwritten_notes') || '',
         product_selection: getProdSelection(),
       });
@@ -154,14 +149,10 @@ module.exports = async function handler(req, res) {
     if (claudeJson) console.log('[file-page] Built claudeJson from flat fields');
   }
   if (!claudeJson) {
-    // If document_type is present but document fields are empty (e.g. non-order doc),
-    // build a minimal claudeJson so the type check can still run
     if (body.document_type) {
       claudeJson = { document_type: body.document_type, document: null };
       console.log('[file-page] Built minimal claudeJson for non-order document');
     } else {
-      // Fallback: callback.js may have already saved claudeJson to Firestore —
-      // retrieve it so the processing chain continues when triggered via /api/callback
       try {
         const record = await db.getRecord(fileId);
         const savedPage = record?.pages?.[pageNumber] || record?.pages?.[String(pageNumber)];
@@ -191,11 +182,17 @@ module.exports = async function handler(req, res) {
     '| ref:', claudeJson?.document?.header?.ref,
     '| name:', claudeJson?.document?.customer?.name);
 
-  // Check document type — only process Delivery Orders
-  // Claude identifies "Delivery Order" text in the top right of the document
+  // ── CACHE QUEUE once for entire invocation ──
+  // Avoids repeated Firestore reads inside checkForNewPriorityFile
+  let cachedQueue = null;
+  try {
+    cachedQueue = await db.getQueue();
+  } catch (e) {
+    console.warn('[file-page] Queue prefetch failed (non-fatal):', e.message);
+    cachedQueue = { oldFiles: {}, pausedFile: null, autoEnabledAt: null };
+  }
+
   const isOrderForm = docType === 'delivery_order' ||
-    // Fallback if document_type not yet in Make.com payload:
-    // only allow if document is not null
     (docType === '' && claudeJson?.document !== null && claudeJson?.document !== undefined);
 
   if (!isOrderForm) {
@@ -204,36 +201,35 @@ module.exports = async function handler(req, res) {
       : 'Document field is null — not a customer order';
     console.log(`[file-page] Non-order page ${pageNumber} — moving to Non-Order Documents folder`);
 
-    // Build a descriptive filename: <docType>_<YYYY-MM-DD>_<zeroPadded>.pdf
-    // e.g. "branch_transfer_2026-04-06_01.pdf"
-    // Falls back to "non_order_document" if Claude didn't return a document type.
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const today = new Date().toISOString().slice(0, 10);
     const typeSlug = docType
       ? docType.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
       : 'non_order_document';
 
-    // Download the page from Temp and store in Non-Order Documents with new name
+    // ── FIX: fetch record FIRST so originalFileName is available ──
     let nonOrderFileName = null;
-    let record = null; // hoisted so it's accessible after the try block
+    let record = null;
+    let originalFileName = null;
     try {
       record = await db.getRecord(fileId);
+      originalFileName = record?.originalFileName || fileId;
       const ps = record?.pageStore || {};
       const td = ps[pageNumber] || ps[String(pageNumber)];
       if (td?.tempItemId) {
         const pageBuffer = await downloadTempPage(td.tempItemId);
         const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
         const zeroPadded = String(pageNumber).padStart(padWidth, '0');
-        // Rename with document type and processed date
         nonOrderFileName = `${typeSlug}_${today}_${zeroPadded}.pdf`;
         const nonOrderFolder = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
         await uploadToOneDrive(nonOrderFolder, nonOrderFileName, pageBuffer);
         console.log(`[file-page] Stored non-order page as "${nonOrderFileName}" in Non-Order Documents`);
+      } else {
+        console.warn(`[file-page] No tempItemId for non-order page ${pageNumber} — cannot file to Non-Order Documents`);
       }
     } catch (moveErr) {
       console.error('[file-page] Failed to move to Non-Order Documents:', moveErr.message);
     }
 
-    // Save skipped status to Firestore — include the final filename so it shows on the dashboard
     try {
       await db.updateRecord(fileId, {
         [`pages.${pageNumber}`]: {
@@ -246,22 +242,18 @@ module.exports = async function handler(req, res) {
       });
     } catch(e) { /* non-fatal */ }
 
-    // Dispatch next page or mark complete — non-order pages must NOT stop the chain
-    await dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName);
+    // ── FIX: pass originalFileName and cachedQueue so chain continues cleanly ──
+    await dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName, record?.pageStore || {}, cachedQueue);
 
-    // Respond 200 AFTER all work — Make.com expects 200
     return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason, nonOrderFileName });
   }
 
-  // If Claude returned { document_type: "delivery_order", document: {...} }
-  // unwrap to get just the document object in expected { document: {...} } structure
   if (claudeJson.document_type && claudeJson.document) {
     claudeJson = { document: claudeJson.document };
   }
 
-  // Do ALL work before responding — Make.com waits for our response
   try {
-    await processAndFile(fileId, pageNumber, totalPages, claudeJson);
+    await processAndFile(fileId, pageNumber, totalPages, claudeJson, cachedQueue);
     return res.status(200).json({ status: 'filed', pageNumber });
   } catch (err) {
     console.error(`[file-page] Error on page ${pageNumber}:`, err.message);
@@ -275,36 +267,38 @@ module.exports = async function handler(req, res) {
       console.error('[file-page] Firestore update failed:', dbErr.message);
     }
 
-    // Even on error, dispatch the next page so the chain keeps going
-    await dispatchNextOrComplete(fileId, pageNumber, totalPages);
+    await dispatchNextOrComplete(fileId, pageNumber, totalPages, null, {}, cachedQueue);
 
     return res.status(200).json({ status: 'error', pageNumber, error: err.message });
   }
 };
 
 /**
- * Dispatch the next page to Make.com, or mark the file as complete if this was the last page.
- * Used after non-order skips and errors to keep the chain alive.
+ * Dispatch next page or mark file complete.
+ * PERF: accepts pageStore and cachedQueue to avoid re-reading Firestore.
  */
-async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName) {
+async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName, pageStore, cachedQueue) {
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
     console.log(`[file-page] Dispatching next page ${nextPage} after page ${pageNumber}`);
     try {
-      // Check Firestore immediately first — page may already be uploaded
-      if (!originalFileName) {
-        const r = await db.getRecord(fileId);
-        originalFileName = r?.originalFileName;
-        const ps = r?.pageStore || {};
-        var quickCheck = ps[nextPage] || ps[String(nextPage)] || null;
-      } else {
-        var quickCheck = null;
+      // Use passed-in pageStore first — only read Firestore if not found
+      let nextTempData = (pageStore || {})[nextPage] || (pageStore || {})[String(nextPage)] || null;
+
+      if (!nextTempData?.tempItemId) {
+        // Not in passed pageStore — fetch originalFileName if we don't have it
+        if (!originalFileName) {
+          const r = await db.getRecord(fileId);
+          originalFileName = r?.originalFileName;
+          const ps = r?.pageStore || {};
+          nextTempData = ps[nextPage] || ps[String(nextPage)] || null;
+        }
       }
 
-      let nextTempData = quickCheck;
       if (!nextTempData?.tempItemId) {
         nextTempData = await waitForTempPage(fileId, nextPage, 180000);
       }
+
       if (!nextTempData?.tempItemId) {
         // Final direct read fallback
         const latestRecord = await db.getRecord(fileId);
@@ -326,7 +320,6 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
       console.error(`[file-page] Failed to dispatch page ${nextPage}:`, dispatchErr.message);
     }
   } else {
-    // This was the last page — mark the file as complete and clean up
     console.log(`[file-page] Page ${pageNumber} was the last page — marking complete`);
     try {
       const finalRecord = await db.getRecord(fileId);
@@ -341,7 +334,6 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
       console.error('[file-page] Failed to mark complete:', completeErr.message);
     }
 
-    // Always trigger scan-now to pick up the next file
     const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
     axios.post(`${baseUrl}/api/scan-now`, {}, {
       headers: { 'Content-Type': 'application/json' },
@@ -350,7 +342,7 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
   }
 }
 
-async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
+async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cachedQueue) {
   const t0 = Date.now();
   const T = () => `+${((Date.now()-t0)/1000).toFixed(1)}s`;
   console.log(`[file-page] START page ${pageNumber}/${totalPages} for ${fileId}`);
@@ -361,7 +353,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   });
   console.log(`[file-page] ${T()} Saved to Firestore`);
 
-  // Get pageStore from Firestore — single read, extract everything we need from it
+  // ── PERF: single record read — extract everything needed from it ──
   const record = await db.getRecord(fileId);
   let originalFileName = record?.originalFileName || fileId;
   const pageStore = record?.pageStore || {};
@@ -372,12 +364,10 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     throw new Error(`No tempItemId for page ${pageNumber}. pageStore keys: [${Object.keys(pageStore).join(',')}]`);
   }
 
-  // Download from OneDrive Temp
   console.log(`[file-page] ${T()} Downloading from Temp: ${tempData.tempItemId}`);
   const pageBuffer = await downloadTempPage(tempData.tempItemId);
   console.log(`[file-page] ${T()} Downloaded ${pageBuffer.length} bytes`);
 
-  // Build filename
   const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
   const zeroPadded = String(pageNumber).padStart(padWidth, '0');
   const finalFileName = buildFilename(claudeJson, zeroPadded);
@@ -387,11 +377,6 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   const folderIsCompany = isCompanyName(claudeJson);
   console.log(`[file-page] ${T()} Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
 
-  // ── DUPLICATE CHECKS ──
-  // Run both checks concurrently before uploading to either destination.
-  // Each check compares filename AND file size (+ MD5 for Google Drive) so that
-  // files which coincidentally share a name but have different content are not
-  // incorrectly skipped.
   console.log(`[file-page] ${T()} Running duplicate checks...`);
   const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
   const userId = process.env.ONEDRIVE_USER_ID;
@@ -410,7 +395,6 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     console.warn(`[file-page] ${T()} GOOGLE DRIVE DUPLICATE: "${finalFileName}" — ${gdDupResult.reason}`);
   }
 
-  // ── PARALLEL UPLOADS ──
   console.log(`[file-page] ${T()} Starting parallel uploads (OD skip: ${odDupResult.isDuplicate}, GD skip: ${gdDupResult?.isDuplicate})...`);
 
   const [oneDriveResult, googleDriveResult] = await Promise.all([
@@ -438,7 +422,6 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
 
   console.log(`[file-page] ${T()} Uploads done. OneDrive: ${!!oneDriveResult} | Google: ${!!googleDriveResult}`);
 
-  // Update Firestore
   await db.updatePageResult(fileId, pageNumber, {
     claudeJson,
     finalFileName,
@@ -456,47 +439,52 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
   });
   console.log(`[file-page] ${T()} Firestore updated`);
 
-  // Dispatch next page or mark complete
+  // Broadcast status-update so dashboard refreshes via SSE — eliminates polling reads
+  {
+    const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+    axios.post(`${baseUrl}/api/notify`, {
+      event: 'status-update',
+      data: { fileId, pageNumber, totalPages, status: 'page-complete' },
+      secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
+    }, {
+      headers: { 'Content-Type': 'application/json', 'x-notify-secret': process.env.CALLBACK_SECRET || 'grove-pdf-router-secret' },
+      timeout: 3000,
+    }).catch(() => {}); // non-fatal — dashboard will catch up on next SSE reconnect
+  }
+
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
-    // ── PRIORITY CHECK ──
-    // Before dispatching the next page of this (potentially old) file, check whether
-    // a new higher-priority file has arrived. If so, pause here and let scan-now
-    // pick up the new file first. We resume this file once new files are done.
+    // ── PERF: use cachedQueue instead of fetching queue again ──
     {
-      const isOld = await db.isOldFile(fileId);
+      const isOld = cachedQueue?.oldFiles?.[fileId] || false;
       if (isOld) {
-        const newFileArrived = await checkForNewPriorityFile(fileId);
+        const newFileArrived = await checkForNewPriorityFile(fileId, cachedQueue);
         if (newFileArrived) {
           console.log(`[file-page] ${T()} NEW FILE DETECTED — pausing old file after page ${pageNumber}, will resume from page ${nextPage}`);
-          // originalFileName already available from processAndFile scope — no extra read needed
           await Promise.all([
             db.setPausedFile(fileId, nextPage, totalPages, originalFileName),
             db.updateRecord(fileId, { status: 'paused', pausedAtPage: pageNumber }),
           ]);
-          // Trigger scan-now to pick up the new file immediately
           const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
           axios.post(`${baseUrl}/api/scan-now`, {}, {
             headers: { 'Content-Type': 'application/json' }, timeout: 5000,
           }).catch(err => console.warn('[file-page] scan-now trigger warning:', err.message));
-          return; // Stop processing this file for now
+          return;
         }
       }
     }
 
     console.log(`[file-page] ${T()} Dispatching page ${nextPage}/${totalPages}...`);
 
-    // Check pageStore immediately — page may already be uploaded to Temp
+    // ── PERF: use already-fetched pageStore — only poll if page not yet there ──
     let nextTempData = pageStore[nextPage] || pageStore[String(nextPage)] || null;
 
     if (!nextTempData?.tempItemId) {
-      // Not in pageStore yet — wait for scan-now/test-run to finish uploading it
       console.log(`[file-page] ${T()} Page ${nextPage} not in pageStore yet — waiting (max 3 min)...`);
       nextTempData = await waitForTempPage(fileId, nextPage, 180000);
     }
 
     if (!nextTempData?.tempItemId) {
-      // Still not there after 3 minutes — do one final direct Firestore read as last resort
       console.warn(`[file-page] ${T()} waitForTempPage timed out for page ${nextPage} — doing final direct read`);
       const latestRecord = await db.getRecord(fileId);
       const latestPs = latestRecord?.pageStore || {};
@@ -510,7 +498,6 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
       ]);
       console.log(`[file-page] ${T()} Dispatched page ${nextPage}/${totalPages}`);
     } else {
-      // Page never appeared — log and mark error so chain doesn't silently die
       const errMsg = `Page ${nextPage} temp file never appeared in Firestore after 3+ minutes — chain broken`;
       console.error(`[file-page] ${T()} ${errMsg}`);
       await db.updateRecord(fileId, {
@@ -537,7 +524,6 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
     oneDriveProcessedFolderUrl: 'https://grovebedding-my.sharepoint.com/personal/files_grovebedding_com/Documents/Grove%20Group%20Scotland/Grove%20Bedding/Scans/Processed',
   });
 
-  // Delete original from Scans and clean up Temp in background
   Promise.all([
     deleteOriginalFromScans(fileId),
     cleanupTempPages(fileId, finalRecord?.pageStore || {}),
@@ -545,21 +531,15 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson) {
 
   console.log(`[file-page] ${T()} ✅ Complete — all ${totalPages} pages filed`);
 
-  // In auto mode, trigger scan-now to pick up the next file in the queue
-  { // Always auto — no mode check needed
-    const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-    axios.post(`${baseUrl}/api/scan-now`, {}, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 5000,
-    }).catch(err => console.warn('[file-page] scan-now trigger warning:', err.message));
-    console.log('[file-page] Auto mode — triggered scan-now for next file');
-  }
+  const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+  axios.post(`${baseUrl}/api/scan-now`, {}, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 5000,
+  }).catch(err => console.warn('[file-page] scan-now trigger warning:', err.message));
+  console.log('[file-page] Auto mode — triggered scan-now for next file');
 }
 
 async function waitForTempPage(fileId, pageNumber, timeoutMs) {
-  // Use a Firestore onSnapshot listener instead of polling.
-  // Fires the instant scan-now writes the page's tempItemId — zero polling reads.
-  // Falls back to a single direct read first in case the page is already there.
   const admin = require('firebase-admin');
   const firestore = admin.firestore();
   const COLLECTION = 'processedFiles';
@@ -591,7 +571,6 @@ async function waitForTempPage(fileId, pageNumber, timeoutMs) {
           resolve(td);
         }
       }, err => {
-        // Snapshot error — fall back to single read
         console.warn(`[file-page] waitForTempPage snapshot error, falling back to poll:`, err.message);
         if (!resolved) {
           db.getRecord(fileId).then(record => {
@@ -635,8 +614,6 @@ async function cleanupTempPages(fileId, pageStore) {
 }
 
 async function dispatchToMake(pageNumber, zeroPadded, fileId, originalFileName, totalPages, tempItemId) {
-  // Strip control characters (raw newlines, tabs, etc.) from all string fields
-  // to prevent "Bad control character in JSON" errors in Make.com's HTTP module
   const clean = s => (typeof s === 'string' ? s.replace(/[\x00-\x1F\x7F]/g, '') : s);
 
   const payload = {
@@ -670,40 +647,22 @@ async function getToken() {
 }
 
 function buildFromFlatFields(body) {
-  // Always build if we have any document fields OR a document_type
-  // Non-order documents have document_type but empty document fields
   if (!body.title && !body.customer_name && !body.document_type) return null;
 
-  // Sanitise string: strip control characters (raw newlines, tabs etc.) that
-  // are illegal inside JSON strings and cause Make.com's HTTP module to reject payloads.
   const s = v => (typeof v === 'string' ? v.replace(/[\x00-\x1F\x7F]/g, ' ').trim() : (v || ''));
 
-  // Handle dynamic handwritten object — Claude now returns a key-value object
-  // with variable keys depending on what annotations appear on each page.
-  // If Make.com sends it as a nested object use it directly; otherwise fall back
-  // to the legacy handwritten_notes flat string for backwards compatibility.
   let handwritten = {};
   if (body.handwritten && typeof body.handwritten === 'object') {
-    // Sanitise every value in the dynamic handwritten object
     for (const [k, v] of Object.entries(body.handwritten)) {
       handwritten[k] = s(v);
     }
   } else if (body.handwritten_notes) {
-    // Legacy flat field fallback
     handwritten = { notes: s(body.handwritten_notes) };
   }
 
-  // Parse product_selection — Make.com sends this as a toString() of the JSON array.
-  // After the extractor fix, items no longer contain newlines, so the string is
-  // valid JSON. Handle all the formats Make.com may produce:
-  //   - Already an array (if body parser succeeded): use directly
-  //   - A JSON string of a single object: wrap in array then parse
-  //   - A JSON string of an array: parse directly
-  //   - Anything else: return empty array
   let product_selection = [];
   const rawProds = body.product_selection;
   if (Array.isArray(rawProds)) {
-    // Already parsed as array by body parser
     product_selection = rawProds.map(p => ({
       item: s(p.item || ''),
       options: s(p.options || ''),
@@ -711,7 +670,6 @@ function buildFromFlatFields(body) {
     }));
   } else if (typeof rawProds === 'string' && rawProds.trim()) {
     try {
-      // Strip any remaining control chars then parse
       const cleaned = rawProds.replace(/[\x00-\x1F\x7F]/g, ' ');
       let parsed = JSON.parse(cleaned);
       if (!Array.isArray(parsed)) parsed = [parsed];
@@ -721,7 +679,6 @@ function buildFromFlatFields(body) {
         qty: s(p.qty || ''),
       }));
     } catch (_) {
-      // Could not parse — log and leave as empty array
       console.warn('[file-page] Could not parse product_selection:', rawProds.slice(0, 100));
     }
   }
@@ -759,16 +716,13 @@ function buildFromFlatFields(body) {
 }
 
 async function deleteOriginalFromScans(fileId) {
-  // The fileId IS the OneDrive item ID of the original file in Scans
   try {
     const token = await getToken();
     const userId = process.env.ONEDRIVE_USER_ID;
-    // Check it still exists first
     await axios.get(
       `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${fileId}`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-    // Delete it
     await axios.delete(
       `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${fileId}`,
       { headers: { Authorization: `Bearer ${token}` } }
@@ -783,9 +737,10 @@ async function deleteOriginalFromScans(fileId) {
   }
 }
 
-async function checkForNewPriorityFile(currentFileId) {
-  // Returns true if there is a file in the Scans folder that is NOT marked as old
-  // (i.e. it arrived after auto mode was switched on) and hasn't started processing yet.
+/**
+ * PERF: accepts cachedQueue so we don't re-fetch it per PDF in the Scans folder.
+ */
+async function checkForNewPriorityFile(currentFileId, cachedQueue) {
   try {
     const userId = process.env.ONEDRIVE_USER_ID;
     const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
@@ -802,10 +757,10 @@ async function checkForNewPriorityFile(currentFileId) {
     });
 
     for (const pdf of pdfs) {
-      if (pdf.id === currentFileId) continue; // skip self
-      const isOld = await db.isOldFile(pdf.id);
-      if (isOld) continue; // skip other old files
-      // This file is new — check it hasn't already started processing
+      if (pdf.id === currentFileId) continue;
+      // ── PERF: use cached queue instead of calling db.isOldFile (which fetches queue each time) ──
+      const isOld = !!(cachedQueue?.oldFiles?.[pdf.id]);
+      if (isOld) continue;
       const existing = await db.getRecord(pdf.id);
       if (!existing || ['reset', null, undefined].includes(existing?.status)) {
         console.log(`[file-page] Priority check: new file found — ${pdf.name}`);
@@ -815,7 +770,7 @@ async function checkForNewPriorityFile(currentFileId) {
     return false;
   } catch (err) {
     console.warn('[file-page] Priority check error (non-fatal):', err.message);
-    return false; // fail safe — don't pause if check fails
+    return false;
   }
 }
 
