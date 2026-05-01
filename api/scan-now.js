@@ -13,6 +13,7 @@
  */
 
 const db = require('../lib/firebase');
+const { fileProcessing, fileError } = require('../lib/statusWriter');
 const { downloadFile, graphRequest } = require('../lib/graph');
 const { splitPdf } = require('../lib/pdfSplitter');
 const axios = require('axios');
@@ -139,6 +140,7 @@ async function scanAndProcess() {
   // Process the oldest pending file
   const next = pending[0];
   console.log(`[scan-now] Processing: "${next.file.name}"`);
+  fileProcessing(next.file.id, next.file.name, null).catch(() => {});
   await processFile(next.file.id, next.file.name, token, userId);
 }
 
@@ -391,26 +393,10 @@ async function getToken() {
 }
 
 async function notifyDashboard(files) {
-  const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-  try {
-    await axios.post(`${baseUrl}/api/notify`, {
-      secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
-      event: 'new-file',
-      data: {
-        count: files.length,
-        files: files.map(f => ({
-          id: f.id,
-          name: f.name,
-          size: f.size || 0,
-          createdAt: f.createdDateTime,
-        })),
-      },
-    }, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 5000,
-    });
-    console.log(`[scan-now] Dashboard notified — ${files.length} file(s) in Scans`);
-  } catch (err) {
-    console.warn('[scan-now] Dashboard notify (non-fatal):', err.message);
+  // Write to Firestore instead of calling dashboard HTTP endpoint
+  const { fileDetected } = require('../lib/statusWriter');
+  for (const f of files) {
+    fileDetected(f.id, f.name, files.length).catch(() => {});
   }
+  console.log(`[scan-now] Status written to Firestore — ${files.length} file(s) in Scans`);
 }

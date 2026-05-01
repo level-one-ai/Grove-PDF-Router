@@ -28,6 +28,8 @@ const { buildFilename, getSupplierLabel, getCustomerFolderName, getRefFolder, is
 const { uploadFile: uploadToOneDrive } = require('../lib/graph');
 const { fileDocuments } = require('../lib/googleDrive');
 const { checkOneDriveDuplicate, checkGoogleDriveDuplicate } = require('../lib/duplicateCheck');
+const { lookupCin7FolderName } = require('../lib/cin7');
+const { pageComplete, fileComplete, fileError, cin7Matched, cin7NoMatch } = require('../lib/statusWriter');
 const axios = require('axios');
 
 const TEMP_FOLDER = 'Grove Group Scotland/Grove Bedding/Scans/Temp';
@@ -242,18 +244,8 @@ module.exports = async function handler(req, res) {
       });
     } catch(e) { /* non-fatal */ }
 
-    // Broadcast status-update so dashboard knows this page is done
-    {
-      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-      axios.post(`${baseUrl}/api/notify`, {
-        event: 'status-update',
-        data: { fileId, pageNumber, totalPages, status: pageNumber >= totalPages ? 'complete' : 'page-complete' },
-        secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
-      }, {
-        headers: { 'Content-Type': 'application/json', 'x-notify-secret': process.env.CALLBACK_SECRET || 'grove-pdf-router-secret' },
-        timeout: 3000,
-      }).catch(() => {});
-    }
+    // Write page status to Firestore — dashboard reads this
+    pageComplete(fileId, pageNumber, totalPages, { status: 'skipped', docType }).catch(() => {});
 
     // ── FIX: pass originalFileName and cachedQueue so chain continues cleanly ──
     await dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName, record?.pageStore || {}, cachedQueue);
@@ -349,18 +341,8 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
       console.error('[file-page] Failed to mark complete:', completeErr.message);
     }
 
-    // Broadcast completion so dashboard steps turn green immediately
-    {
-      const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-      axios.post(`${baseUrl}/api/notify`, {
-        event: 'status-update',
-        data: { fileId, pageNumber, totalPages, status: 'complete' },
-        secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
-      }, {
-        headers: { 'Content-Type': 'application/json', 'x-notify-secret': process.env.CALLBACK_SECRET || 'grove-pdf-router-secret' },
-        timeout: 3000,
-      }).catch(() => {});
-    }
+    // Write completion to Firestore
+    fileComplete(fileId, { pageNumber, totalPages }).catch(() => {});
 
     const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
     axios.post(`${baseUrl}/api/scan-now`, {}, {
@@ -400,9 +382,43 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   const zeroPadded = String(pageNumber).padStart(padWidth, '0');
   const finalFileName = buildFilename(claudeJson, zeroPadded);
   const supplierLabel = getSupplierLabel(claudeJson);
-  const customerFolderName = getCustomerFolderName(claudeJson);
+  let customerFolderName = getCustomerFolderName(claudeJson);
   const refFolderName = getRefFolder(claudeJson);
-  const folderIsCompany = isCompanyName(claudeJson);
+  let folderIsCompany = isCompanyName(claudeJson);
+
+  // ── Cin7 lookup — determine correct Google Drive folder name ──
+  const claudeCustomerName = claudeJson?.document?.customer?.name || null;
+  const claudeCompanyName  = claudeJson?.document?.customer?.company_name || null;
+  const pdfRef             = claudeJson?.document?.header?.ref || null;
+
+  try {
+    const cin7Result = await lookupCin7FolderName({
+      customerName: claudeCustomerName,
+      companyName:  claudeCompanyName,
+      pdfRef,
+      fileId,
+    });
+
+    if (cin7Result) {
+      // Cin7 match found — use Cin7 folder name (company takes priority)
+      customerFolderName = cin7Result.folderName;
+      folderIsCompany    = cin7Result.source === 'company';
+      console.log(`[file-page] ${T()} Cin7 folder: "${customerFolderName}" (source: ${cin7Result.source}, order: ${cin7Result.cin7OrderRef})`);
+      cin7Matched(fileId, cin7Result).catch(() => {});
+    } else {
+      // No Cin7 match — log error to Firestore, continue with Claude-extracted name
+      console.warn(`[file-page] ${T()} Cin7 no match — using Claude name: "${customerFolderName}"`);
+      cin7NoMatch(fileId, claudeCustomerName || claudeCompanyName, pdfRef,
+        `No Cin7 order found for "${claudeCustomerName || claudeCompanyName}" — used Claude-extracted name`
+      ).catch(() => {});
+    }
+  } catch (cin7Err) {
+    console.warn(`[file-page] ${T()} Cin7 lookup error (non-fatal): ${cin7Err.message}`);
+    cin7NoMatch(fileId, claudeCustomerName || claudeCompanyName, pdfRef,
+      `Cin7 lookup error: ${cin7Err.message}`
+    ).catch(() => {});
+  }
+
   console.log(`[file-page] ${T()} Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
 
   console.log(`[file-page] ${T()} Running duplicate checks...`);
@@ -467,18 +483,10 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   });
   console.log(`[file-page] ${T()} Firestore updated`);
 
-  // Broadcast status-update so dashboard refreshes via SSE — eliminates polling reads
-  {
-    const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-    axios.post(`${baseUrl}/api/notify`, {
-      event: 'status-update',
-      data: { fileId, pageNumber, totalPages, status: 'page-complete' },
-      secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
-    }, {
-      headers: { 'Content-Type': 'application/json', 'x-notify-secret': process.env.CALLBACK_SECRET || 'grove-pdf-router-secret' },
-      timeout: 3000,
-    }).catch(() => {}); // non-fatal — dashboard will catch up on next SSE reconnect
-  }
+  // Write page status to Firestore
+  pageComplete(fileId, pageNumber, totalPages, {
+    finalFileName, customerName: customerFolderName, ref: refFolderName,
+  }).catch(() => {});
 
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
@@ -541,7 +549,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   const pagesData = finalRecord?.pages || {};
   const renamedFiles = Object.values(pagesData).map(p => p.finalFileName).filter(Boolean);
 
-  await db.markCompleted(fileId, {
+  const completeData = {
     renamedFiles,
     customerName: customerFolderName,
     ref: refFolderName,
@@ -550,7 +558,9 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
     googleDriveFolderUrl: googleDriveResult?.refFolderUrl || null,
     googleDriveCustomerFolderUrl: googleDriveResult?.customerFolderUrl || null,
     oneDriveProcessedFolderUrl: 'https://grovebedding-my.sharepoint.com/personal/files_grovebedding_com/Documents/Grove%20Group%20Scotland/Grove%20Bedding/Scans/Processed',
-  });
+  };
+  await db.markCompleted(fileId, completeData);
+  fileComplete(fileId, completeData).catch(() => {});
 
   Promise.all([
     deleteOriginalFromScans(fileId),

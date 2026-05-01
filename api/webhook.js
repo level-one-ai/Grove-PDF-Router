@@ -1,23 +1,19 @@
 /**
  * /api/webhook
  *
- * Receives Microsoft Graph API change notifications.
- * Responds immediately then processes in background.
+ * Receives HTTP POST from Make.com when a new file lands in OneDrive Scans.
+ * Also handles Microsoft Graph API change notification validation handshake.
  *
- * To stay under Vercel's 60s timeout:
- * - Responds 202 instantly
- * - Downloads + splits PDF in background
- * - Uploads pages to Temp ONE AT A TIME
- * - Dispatches page 1 to Make.com as soon as it's uploaded
- * - Remaining pages uploaded in background ready for later dispatch
+ * Responds immediately then triggers scan-now in background.
+ * No dashboard calls — status is written to Firestore instead.
  */
 
 const { graphRequest } = require('../lib/graph');
+const { fileDetected } = require('../lib/statusWriter');
 const axios = require('axios');
 
-
 module.exports = async function handler(req, res) {
-  // Graph API validation handshake
+  // Microsoft Graph validation handshake
   if (req.method === 'POST' && req.query.validationToken) {
     console.log('[webhook] Validation token handshake');
     res.setHeader('Content-Type', 'text/plain');
@@ -28,24 +24,23 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Respond immediately — Graph API requires response within 3 seconds.
-  // Graph sometimes drops the connection before TLS completes on a cold start,
-  // causing ECONNRESET. Catch it so background processing still runs regardless.
+  // Respond immediately — Make.com and Graph both require fast response
   try {
     res.status(202).json({ status: 'accepted' });
   } catch (connErr) {
-    console.warn('[webhook] Could not send 202 (Graph disconnected early — harmless):', connErr.message);
+    console.warn('[webhook] Could not send 202 (connection dropped early — harmless):', connErr.message);
   }
 
   try {
+    // Handle both Make.com direct calls and Graph API notifications
     const notifications = req.body?.value || [];
-    if (!notifications.length) return;
-
-    const expectedSecret = process.env.CALLBACK_SECRET || 'grove-pdf-router-secret';
-    const valid = notifications.find(n => n.clientState === expectedSecret);
-    if (!valid) {
-      console.warn('[webhook] Invalid clientState — ignoring');
-      return;
+    if (notifications.length) {
+      const expectedSecret = process.env.CALLBACK_SECRET || 'grove-pdf-router-secret';
+      const valid = notifications.find(n => n.clientState === expectedSecret);
+      if (!valid) {
+        console.warn('[webhook] Invalid clientState — ignoring');
+        return;
+      }
     }
 
     await scanAndProcess();
@@ -55,11 +50,12 @@ module.exports = async function handler(req, res) {
 };
 
 async function scanAndProcess() {
-  const userId = process.env.ONEDRIVE_USER_ID;
-  const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
+  const userId  = process.env.ONEDRIVE_USER_ID;
+  const baseUrl = process.env.VERCEL_URL
+    ? `https://${process.env.VERCEL_URL}`
+    : 'https://grove-pdf-router.vercel.app';
 
-  // List Scans folder for dashboard notification — best-effort, non-blocking
-  // No Firestore reads here — scan-now handles all the Firestore logic internally
+  // List Scans folder to write status to Firestore
   let newFiles = [];
   try {
     const result = await graphRequest(
@@ -79,12 +75,12 @@ async function scanAndProcess() {
     console.warn('[webhook] Could not list Scans (non-fatal):', err.message);
   }
 
-  // Notify dashboard so the Scans panel refreshes immediately
-  if (newFiles.length > 0) {
-    await notifyDashboard(newFiles);
+  // Write detected files to Firestore — dashboard reads this
+  for (const file of newFiles) {
+    fileDetected(file.id, file.name, newFiles.length).catch(() => {});
   }
 
-  // Trigger scan-now — it handles Firestore, priority ordering, and processing
+  // Trigger scan-now to do the actual processing
   try {
     await axios.post(`${baseUrl}/api/scan-now`, {}, {
       headers: { 'Content-Type': 'application/json' },
@@ -95,39 +91,3 @@ async function scanAndProcess() {
     console.warn('[webhook] scan-now trigger warning:', err.message);
   }
 }
-
-async function notifyDashboard(files) {
-  const baseUrl = process.env.WEBHOOK_NOTIFICATION_URL || 'https://grove-pdf-router.vercel.app';
-  try {
-    await axios.post(`${baseUrl}/api/notify`, {
-      secret: process.env.CALLBACK_SECRET || 'grove-pdf-router-secret',
-      event: 'new-file',
-      data: {
-        count: files.length,
-        files: files.map(f => ({ id: f.id, name: f.name, size: f.size, createdAt: f.createdDateTime })),
-      },
-    }, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 5000,
-    });
-    console.log(`[webhook] Dashboard notified — ${files.length} new file(s)`);
-  } catch (err) {
-    // Non-fatal — dashboard will catch up on its next poll
-    console.warn('[webhook] Dashboard notify warning (non-fatal):', err.message);
-  }
-}
-
-
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-
-/**
- * ensureAutoPollRunning — RETIRED (no-op stub)
- * auto-poll has been retired. Detection is handled by Make.com Watch Files.
- * This stub prevents errors from any call sites that still reference this function.
- */
-async function ensureAutoPollRunning() {
-  // no-op — auto-poll retired, Make.com handles detection
-}
-
