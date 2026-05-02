@@ -385,9 +385,13 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   // We look up Cin7 before buildFilename() so the confirmed company name,
   // customer name, and reference number from Cin7 feed into the filename
   // itself — not just the Google Drive folder.
-  const claudeCustomerName = claudeJson?.document?.customer?.name || null;
+  const claudeCustomerName = claudeJson?.document?.customer?.name         || null;
   const claudeCompanyName  = claudeJson?.document?.customer?.company_name || null;
-  const pdfRef             = claudeJson?.document?.header?.ref || null;
+  const pdfRef             = claudeJson?.document?.header?.ref            || null;
+  const pdfPostcode        = claudeJson?.document?.customer?.address?.postcode ||
+                             claudeJson?.document?.ship_to?.address?.postcode  || null;
+  const pdfMobile          = claudeJson?.document?.customer?.mobile ||
+                             claudeJson?.document?.customer?.phone  || null;
 
   let cin7Result = null;
   try {
@@ -395,6 +399,8 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
       customerName: claudeCustomerName,
       companyName:  claudeCompanyName,
       pdfRef,
+      pdfPostcode,
+      pdfMobile,
       fileId,
     });
   } catch (cin7Err) {
