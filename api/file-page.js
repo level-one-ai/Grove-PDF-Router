@@ -380,46 +380,62 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
 
   const padWidth = String(totalPages).length > 1 ? String(totalPages).length : 2;
   const zeroPadded = String(pageNumber).padStart(padWidth, '0');
-  const finalFileName = buildFilename(claudeJson, zeroPadded);
-  const supplierLabel = getSupplierLabel(claudeJson);
-  let customerFolderName = getCustomerFolderName(claudeJson);
-  const refFolderName = getRefFolder(claudeJson);
-  let folderIsCompany = isCompanyName(claudeJson);
 
-  // ── Cin7 lookup — determine correct Google Drive folder name ──
+  // ── Cin7 lookup FIRST — before naming the file ────────────────────────────
+  // We look up Cin7 before buildFilename() so the confirmed company name,
+  // customer name, and reference number from Cin7 feed into the filename
+  // itself — not just the Google Drive folder.
   const claudeCustomerName = claudeJson?.document?.customer?.name || null;
   const claudeCompanyName  = claudeJson?.document?.customer?.company_name || null;
   const pdfRef             = claudeJson?.document?.header?.ref || null;
 
+  let cin7Result = null;
   try {
-    const cin7Result = await lookupCin7FolderName({
+    cin7Result = await lookupCin7FolderName({
       customerName: claudeCustomerName,
       companyName:  claudeCompanyName,
       pdfRef,
       fileId,
     });
-
-    if (cin7Result) {
-      // Cin7 match found — use Cin7 folder name (company takes priority)
-      customerFolderName = cin7Result.folderName;
-      folderIsCompany    = cin7Result.source === 'company';
-      console.log(`[file-page] ${T()} Cin7 folder: "${customerFolderName}" (source: ${cin7Result.source}, order: ${cin7Result.cin7OrderRef})`);
-      cin7Matched(fileId, cin7Result).catch(() => {});
-    } else {
-      // No Cin7 match — log error to Firestore, continue with Claude-extracted name
-      console.warn(`[file-page] ${T()} Cin7 no match — using Claude name: "${customerFolderName}"`);
-      cin7NoMatch(fileId, claudeCustomerName || claudeCompanyName, pdfRef,
-        `No Cin7 order found for "${claudeCustomerName || claudeCompanyName}" — used Claude-extracted name`
-      ).catch(() => {});
-    }
   } catch (cin7Err) {
     console.warn(`[file-page] ${T()} Cin7 lookup error (non-fatal): ${cin7Err.message}`);
-    cin7NoMatch(fileId, claudeCustomerName || claudeCompanyName, pdfRef,
-      `Cin7 lookup error: ${cin7Err.message}`
+  }
+
+  // If Cin7 returned a confirmed company/customer name, patch it back into
+  // claudeJson so buildFilename() and getCustomerFolderName() use the
+  // authoritative Cin7 value rather than whatever Claude extracted.
+  if (cin7Result) {
+    if (cin7Result.cin7Company && claudeJson?.document?.customer) {
+      claudeJson.document.customer.company_name = cin7Result.cin7Company;
+    } else if (cin7Result.cin7Customer && claudeJson?.document?.customer) {
+      // Only overwrite name if Cin7 has a cleaner/confirmed version
+      if (!claudeJson.document.customer.company_name) {
+        claudeJson.document.customer.name = cin7Result.cin7Customer;
+      }
+    }
+    // If Cin7 confirmed a ref and the PDF had none, patch it in so the
+    // filename includes the reference number
+    if (cin7Result.cin7OrderRef && !pdfRef && claudeJson?.document?.header) {
+      claudeJson.document.header.ref = cin7Result.cin7OrderRef;
+    }
+    console.log(`[file-page] ${T()} Cin7 confirmed — patched claudeJson: company="${cin7Result.cin7Company}", ref="${cin7Result.cin7OrderRef}"`);
+    cin7Matched(fileId, cin7Result).catch(() => {});
+  } else {
+    const searchName = claudeCompanyName || claudeCustomerName;
+    console.warn(`[file-page] ${T()} Cin7 no match — using Claude-extracted name: "${searchName}"`);
+    cin7NoMatch(fileId, searchName, pdfRef,
+      `No Cin7 order found for "${searchName}" — used Claude-extracted name`
     ).catch(() => {});
   }
 
-  console.log(`[file-page] ${T()} Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}"`);
+  // ── Now build filename using (potentially Cin7-enriched) claudeJson ────────
+  const finalFileName    = buildFilename(claudeJson, zeroPadded);
+  const supplierLabel    = getSupplierLabel(claudeJson);
+  let customerFolderName = cin7Result ? cin7Result.folderName : getCustomerFolderName(claudeJson);
+  const refFolderName    = getRefFolder(claudeJson);
+  let folderIsCompany    = cin7Result ? cin7Result.source === 'company' : isCompanyName(claudeJson);
+
+  console.log(`[file-page] ${T()} Filename: "${finalFileName}" | Customer: "${customerFolderName}" | Ref: "${refFolderName}" | Cin7 ref confirmed: ${cin7Result?.refMatchConfirmed ?? false}`);
 
   console.log(`[file-page] ${T()} Running duplicate checks...`);
   const processedPath = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
