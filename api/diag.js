@@ -7,7 +7,9 @@
  * Always returns JSON: { ok, summary, results }
  */
 
-module.exports.config = { maxDuration: 30 };
+module.exports.config = { maxDuration: 45 };
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
