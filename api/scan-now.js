@@ -31,34 +31,79 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // Respond immediately — processing runs in background via Fluid Compute
+  // Read file details from POST body if Make.com sent them
+  // This is the fast path — no need to scan the whole folder
+  const body       = req.body || {};
+  const fileId     = body.fileId   || null;
+  const fileName   = body.fileName || null;
+  const fileSize   = body.fileSize || null;
+
+  if (fileId && fileName) {
+    console.log(`[scan-now] Make.com sent file directly: "${fileName}" (${fileId})`);
+  } else {
+    console.log(`[scan-now] No file in body — will scan Scans folder`);
+  }
+
+  // Respond immediately to Make.com — they require a fast response
   res.status(200).json({ status: 'scanning', message: 'Scan started' });
 
+  // Keep the function alive for background processing via Vercel Fluid Compute
   try {
-    await scanAndProcess();
-  } catch (err) {
-    console.error('[scan-now] Error:', err.message);
+    const { waitUntil } = require('@vercel/functions');
+    waitUntil(
+      scanAndProcess({ fileId, fileName, fileSize }).catch(err => {
+        console.error('[scan-now] Background processing error:', err.message);
+      })
+    );
+  } catch (importErr) {
+    // @vercel/functions not available — fall back to direct await (local dev)
+    console.warn('[scan-now] waitUntil not available — running inline:', importErr.message);
+    try {
+      await scanAndProcess({ fileId, fileName, fileSize });
+    } catch (err) {
+      console.error('[scan-now] Error:', err.message);
+    }
   }
 };
 
-async function scanAndProcess() {
-  const userId = process.env.ONEDRIVE_USER_ID;
+async function scanAndProcess({ fileId: incomingFileId, fileName: incomingFileName } = {}) {
+  const userId     = process.env.ONEDRIVE_USER_ID;
   const folderPath = 'Grove Group Scotland/Grove Bedding/Scans';
-  const token = await getToken();
+  const token      = await getToken();
 
-  // Fetch all PDFs in Scans folder
-  const result = await graphRequest(
-    'GET',
-    `/users/${userId}/drive/root:/${folderPath}:/children` +
-    `?$select=id,name,file,size,createdDateTime&$top=200`
-  );
+  let allPdfs = [];
 
-  const allPdfs = (result?.value || [])
-    .filter(item => {
-      const name = (item.name || '').toLowerCase();
-      const mime = item.file?.mimeType || '';
-      return name.endsWith('.pdf') || mime.includes('pdf');
-    });
+  // ── Fast path — Make.com sent the file details directly ──────────────────
+  // No need to scan the whole folder — process this specific file immediately
+  if (incomingFileId && incomingFileName) {
+    const name = incomingFileName.toLowerCase();
+    const isPdf = name.endsWith('.pdf');
+    if (!isPdf) {
+      console.log(`[scan-now] "${incomingFileName}" is not a PDF — ignoring`);
+      return;
+    }
+    console.log(`[scan-now] Fast path — processing: "${incomingFileName}"`);
+    allPdfs = [{
+      id:              incomingFileId,
+      name:            incomingFileName,
+      createdDateTime: new Date().toISOString(),
+      file:            { mimeType: 'application/pdf' },
+    }];
+  } else {
+    // ── Fallback — scan the whole folder (manual trigger or file-page chain) ─
+    console.log(`[scan-now] Scanning Scans folder...`);
+    const result = await graphRequest(
+      'GET',
+      `/users/${userId}/drive/root:/${folderPath}:/children` +
+      `?$select=id,name,file,size,createdDateTime&$top=200`
+    );
+    allPdfs = (result?.value || [])
+      .filter(item => {
+        const name = (item.name || '').toLowerCase();
+        const mime = item.file?.mimeType || '';
+        return name.endsWith('.pdf') || mime.includes('pdf');
+      });
+  }
 
   console.log(`[scan-now] ${allPdfs.length} PDF(s) in Scans`);
 
