@@ -286,6 +286,9 @@ async function processFile(itemId, fileName, token, userId) {
 
   let pdfBuffer;
   try {
+    // Write downloading stage
+    const { writeFileStatus } = require('../lib/statusWriter');
+    writeFileStatus(itemId, { currentStage: 'downloading', fileName: originalFileName }).catch(() => {});
     pdfBuffer = await downloadFile(itemId);
     console.log(`[scan-now] Downloaded "${originalFileName}" (${pdfBuffer.length} bytes)`);
   } catch (err) {
@@ -296,6 +299,8 @@ async function processFile(itemId, fileName, token, userId) {
 
   let pages, totalPages;
   try {
+    const { writeFileStatus } = require('../lib/statusWriter');
+    writeFileStatus(itemId, { currentStage: 'splitting' }).catch(() => {});
     ({ pages, totalPages } = await splitPdf(pdfBuffer));
     console.log(`[scan-now] Split into ${totalPages} page(s)`);
   } catch (splitErr) {
@@ -330,6 +335,8 @@ async function processFile(itemId, fileName, token, userId) {
     tempFileName: `${itemId}_page_${page1.zeroPadded}.pdf`,
   };
   await db.updateRecord(itemId, { pageStore });
+  const { writeFileStatus } = require('../lib/statusWriter');
+  writeFileStatus(itemId, { currentStage: 'dispatching', currentPage: 1 }).catch(() => {});
   await dispatchToMake(1, page1.zeroPadded, itemId, originalFileName, totalPages, page1ItemId);
   console.log(`[scan-now] Page 1/${totalPages} dispatched for "${originalFileName}"`);
 

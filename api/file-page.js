@@ -29,7 +29,7 @@ const { uploadFile: uploadToOneDrive } = require('../lib/graph');
 const { fileDocuments } = require('../lib/googleDrive');
 const { checkOneDriveDuplicate, checkGoogleDriveDuplicate } = require('../lib/duplicateCheck');
 const { lookupCin7FolderName } = require('../lib/cin7');
-const { pageComplete, fileComplete, fileError, cin7Matched, cin7NoMatch } = require('../lib/statusWriter');
+const { pageComplete, fileComplete, fileError, cin7Matched, cin7NoMatch, writeFileStatus } = require('../lib/statusWriter');
 const axios = require('axios');
 
 const TEMP_FOLDER = 'Grove Group Scotland/Grove Bedding/Scans/Temp';
@@ -245,9 +245,25 @@ module.exports = async function handler(req, res) {
     } catch(e) { /* non-fatal */ }
 
     // Write page status to Firestore — dashboard reads this
-    pageComplete(fileId, pageNumber, totalPages, { status: 'skipped', docType }).catch(() => {});
+    // Include clear message that this page went to Non-Order Documents
+    pageComplete(fileId, pageNumber, totalPages, {
+      status:           'non_order',
+      docType:          docType || 'non_order',
+      nonOrderFileName: nonOrderFileName || null,
+      message:          nonOrderFileName
+        ? `Filed to Non-Order Documents as "${nonOrderFileName}"`
+        : 'Non-order document — could not file (no temp file)',
+    }).catch(() => {});
 
-    // ── FIX: pass originalFileName and cachedQueue so chain continues cleanly ──
+    // Also write current stage so pipeline cards update
+    writeFileStatus(fileId, {
+      currentStage: 'non_order',
+      currentPage:  pageNumber,
+      [`page_${pageNumber}_type`]: 'non_order',
+      [`page_${pageNumber}_fileName`]: nonOrderFileName || null,
+    }).catch(() => {});
+
+    // Continue the chain — dispatch next page regardless
     await dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName, record?.pageStore || {}, cachedQueue);
 
     return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason, nonOrderFileName });
@@ -359,6 +375,14 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   const T = () => `+${((Date.now()-t0)/1000).toFixed(1)}s`;
   console.log(`[file-page] START page ${pageNumber}/${totalPages} for ${fileId}`);
 
+  // Write current stage to pdfRouterStatus so dashboard pipeline shows it
+  writeFileStatus(fileId, {
+    currentStage: 'extracting',
+    currentPage:  pageNumber,
+    totalPages,
+    fileName: (await db.getRecord(fileId))?.originalFileName || fileId,
+  }).catch(() => {});
+
   // Save JSON to Firestore
   await db.updateRecord(fileId, {
     [`pages.${pageNumber}`]: { claudeJson, status: 'filing' },
@@ -384,9 +408,8 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   const zeroPadded = String(pageNumber).padStart(padWidth, '0');
 
   // ── Cin7 lookup FIRST — before naming the file ────────────────────────────
-  // We look up Cin7 before buildFilename() so the confirmed company name,
-  // customer name, and reference number from Cin7 feed into the filename
-  // itself — not just the Google Drive folder.
+  writeFileStatus(fileId, { currentStage: 'cin7' }).catch(() => {});
+
   const claudeCustomerName = claudeJson?.document?.customer?.name         || null;
   const claudeCompanyName  = claudeJson?.document?.customer?.company_name || null;
   const pdfRef             = claudeJson?.document?.header?.ref            || null;
@@ -409,20 +432,14 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
     console.warn(`[file-page] ${T()} Cin7 lookup error (non-fatal): ${cin7Err.message}`);
   }
 
-  // If Cin7 returned a confirmed company/customer name, patch it back into
-  // claudeJson so buildFilename() and getCustomerFolderName() use the
-  // authoritative Cin7 value rather than whatever Claude extracted.
   if (cin7Result) {
     if (cin7Result.cin7Company && claudeJson?.document?.customer) {
       claudeJson.document.customer.company_name = cin7Result.cin7Company;
     } else if (cin7Result.cin7Customer && claudeJson?.document?.customer) {
-      // Only overwrite name if Cin7 has a cleaner/confirmed version
       if (!claudeJson.document.customer.company_name) {
         claudeJson.document.customer.name = cin7Result.cin7Customer;
       }
     }
-    // If Cin7 confirmed a ref and the PDF had none, patch it in so the
-    // filename includes the reference number
     if (cin7Result.cin7OrderRef && !pdfRef && claudeJson?.document?.header) {
       claudeJson.document.header.ref = cin7Result.cin7OrderRef;
     }
@@ -436,7 +453,8 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
     ).catch(() => {});
   }
 
-  // ── Now build filename using (potentially Cin7-enriched) claudeJson ────────
+  // ── Now build filename ────────────────────────────────────────────────────
+  writeFileStatus(fileId, { currentStage: 'filing' }).catch(() => {});
   const finalFileName    = buildFilename(claudeJson, zeroPadded);
   const supplierLabel    = getSupplierLabel(claudeJson);
   let customerFolderName = cin7Result ? cin7Result.folderName : getCustomerFolderName(claudeJson);
@@ -464,6 +482,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   }
 
   console.log(`[file-page] ${T()} Starting parallel uploads (OD skip: ${odDupResult.isDuplicate}, GD skip: ${gdDupResult?.isDuplicate})...`);
+  writeFileStatus(fileId, { currentStage: 'uploading' }).catch(() => {});
 
   const [oneDriveResult, googleDriveResult] = await Promise.all([
     odDupResult.isDuplicate
