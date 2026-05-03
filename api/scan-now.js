@@ -135,7 +135,7 @@ async function scanAndProcess({ fileId: incomingFileId, fileName: incomingFileNa
 
     // Already actively processing — check for stuck files
     if (existing && existing.status === 'processing') {
-      const STUCK_THRESHOLD_MS = 10 * 60 * 1000;
+      const STUCK_THRESHOLD_MS = 3 * 60 * 1000; // 3 minutes — reset if stuck
       const updatedAt = existing.updatedAt?.toMillis?.() || (existing.updatedAt?._seconds || 0) * 1000;
       const createdAt = existing.createdAt?.toMillis?.() || (existing.createdAt?._seconds || 0) * 1000;
       const lastActivity = Math.max(updatedAt, createdAt);

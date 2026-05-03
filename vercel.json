@@ -2,15 +2,36 @@
   "version": 2,
   "fluid": true,
   "functions": {
-    "api/file-page.js":  { "maxDuration": 300 },
-    "api/scan-now.js":   { "maxDuration": 300 },
-    "api/webhook.js":    { "maxDuration": 300 },
-    "api/test-run.js":   { "maxDuration": 300 },
-    "api/gdrive.js":     { "maxDuration": 300 },
-    "api/callback.js":   { "maxDuration": 60  },
-    "api/cron.js":       { "maxDuration": 60  },
-    "api/logs.js":       { "maxDuration": 10  },
-    "api/*.js":          { "maxDuration": 60  }
+    "api/file-page.js": {
+      "maxDuration": 300
+    },
+    "api/scan-now.js": {
+      "maxDuration": 300
+    },
+    "api/webhook.js": {
+      "maxDuration": 300
+    },
+    "api/test-run.js": {
+      "maxDuration": 300
+    },
+    "api/gdrive.js": {
+      "maxDuration": 300
+    },
+    "api/callback.js": {
+      "maxDuration": 60
+    },
+    "api/cron.js": {
+      "maxDuration": 60
+    },
+    "api/logs.js": {
+      "maxDuration": 10
+    },
+    "api/*.js": {
+      "maxDuration": 60
+    },
+    "api/reset-file.js": {
+      "maxDuration": 30
+    }
   },
   "crons": [
     {
@@ -19,6 +40,9 @@
     }
   ],
   "routes": [
-    { "src": "/api/(.*)", "dest": "/api/$1" }
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/$1"
+    }
   ]
 }
