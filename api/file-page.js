@@ -336,6 +336,8 @@ async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFi
       Promise.all([
         deleteOriginalFromScans(fileId),
         cleanupTempPages(fileId, finalRecord?.pageStore || {}),
+        // Trim heavy fields from processedFiles after completion
+        db.updateRecord(fileId, { pageStore: {}, pages: {} }).catch(() => {}),
       ]).catch(err => console.warn('[file-page] Cleanup warning:', err.message));
     } catch (completeErr) {
       console.error('[file-page] Failed to mark complete:', completeErr.message);
@@ -587,6 +589,12 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   Promise.all([
     deleteOriginalFromScans(fileId),
     cleanupTempPages(fileId, finalRecord?.pageStore || {}),
+    // Trim heavy internal fields from processedFiles once complete
+    // pageStore and pages can be large and are no longer needed after filing
+    db.updateRecord(fileId, {
+      pageStore: {},
+      pages:     {},
+    }).catch(() => {}),
   ]).catch(err => console.warn('[file-page] Cleanup warning:', err.message));
 
   console.log(`[file-page] ${T()} ✅ Complete — all ${totalPages} pages filed`);

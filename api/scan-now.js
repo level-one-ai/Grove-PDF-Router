@@ -105,13 +105,7 @@ async function scanAndProcess({ fileId: incomingFileId, fileName: incomingFileNa
       });
   }
 
-  console.log(`[scan-now] ${allPdfs.length} PDF(s) in Scans`);
-
-  // Notify the dashboard immediately so Scans column refreshes
-  // This fires whether triggered by Make.com or file-page.js
-  if (allPdfs.length > 0) {
-    notifyDashboard(allPdfs).catch(() => {}); // fire-and-forget, non-fatal
-  }
+  console.log(`[scan-now] ${allPdfs.length} PDF(s) found`);
 
   if (!allPdfs.length) {
     console.log('[scan-now] No PDFs found — nothing to do');
@@ -437,11 +431,4 @@ async function getToken() {
   return r.data.access_token;
 }
 
-async function notifyDashboard(files) {
-  // Write to Firestore instead of calling dashboard HTTP endpoint
-  const { fileDetected } = require('../lib/statusWriter');
-  for (const f of files) {
-    fileDetected(f.id, f.name, files.length).catch(() => {});
-  }
-  console.log(`[scan-now] Status written to Firestore — ${files.length} file(s) in Scans`);
-}
+

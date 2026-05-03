@@ -28,9 +28,6 @@
     },
     "api/*.js": {
       "maxDuration": 60
-    },
-    "api/reset-file.js": {
-      "maxDuration": 30
     }
   },
   "crons": [
