@@ -102,47 +102,55 @@ module.exports = async function handler(req, res) {
     const result = await testCin7Connection();
 
     if (result.ok) {
-      t('Cin7: API connection', true,
-        `${result.message} | Stages in sample: ${(result.stages || []).join(', ')}`
+      t('Cin7: API connection', true, result.message);
+
+      // Contacts endpoint — now the primary matching source
+      const c = result.sampleContact || {};
+      t('Cin7: Contacts endpoint working', true,
+        `Sample contact — company: ${c.company ?? '(null)'} | ` +
+        `name: ${c.firstName ?? ''} ${c.lastName ?? ''} | ` +
+        `postCode: ${c.postCode ?? '(null)'} | ` +
+        `mobile: ${c.mobile ?? '(null)'} | phone: ${c.phone ?? '(null)'}`
       );
 
-      // Matching fields on a sample order
+      // SalesOrders confirmation fields
       const f = result.relevantFields || {};
-      t('Cin7: Name fields available', true,
-        `company: ${f.company ?? '(null)'} | ` +
-        `deliveryCompany: ${f.deliveryCompany ?? '(null)'} | ` +
-        `firstName: ${f.firstName ?? '(null)'} | ` +
-        `lastName: ${f.lastName ?? '(null)'}`
-      );
-      t('Cin7: Confirmation fields available', true,
+      t('Cin7: SalesOrders confirmation fields', true,
         `reference: ${f.reference ?? '(null)'} | ` +
+        `stage: ${f.stage ?? '(null)'} | ` +
         `deliveryPostalCode: ${f.deliveryPostalCode ?? '(null)'} | ` +
-        `billingPostalCode: ${f.billingPostalCode ?? '(null)'} | ` +
-        `mobile: ${f.mobile ?? '(null)'} | ` +
         `phone: ${f.phone ?? '(null)'}`
       );
+
       t('Cin7: All fields on first order', true,
         (result.sampleFields || []).join(', ')
       );
 
-      // Specific order lookup — JTAI20130-1 (Jim Tait test order from scan4166.pdf)
-      if (result.specificOrder) {
-        const s = result.specificOrder;
-        t('Cin7: Specific order JTAI20130-1 found', true,
-          `id: ${s.id} | stage: ${s.stage} | ` +
-          `name: ${s.firstName || ''} ${s.lastName || ''} | ` +
-          `company: ${s.company ?? '(null)'} | ` +
-          `deliveryPostalCode: ${s.deliveryPostalCode ?? '(null)'} | ` +
-          `mobile: ${s.mobile ?? '(null)'} | ` +
-          `phone: ${s.phone ?? '(null)'} | ` +
-          `ETD: ${s.estimatedDeliveryDate ?? '(null)'}`
+      // Specific lookups — JTAI20130-1 / Jim Tait
+      if (result.specificContact) {
+        const sc = result.specificContact;
+        t('Cin7: Contact "Jim Tait" found', true,
+          `id: ${sc.id} | company: ${sc.company ?? '(null)'} | ` +
+          `postCode: ${sc.postCode ?? '(null)'} | ` +
+          `mobile: ${sc.mobile ?? '(null)'} | phone: ${sc.phone ?? '(null)'}`
         );
       } else {
-        t('Cin7: Specific order JTAI20130-1',
-          false,
+        t('Cin7: Contact "Jim Tait" found', false,
           result.specificOrderError
-            ? `Lookup error: ${result.specificOrderError}`
-            : 'Order JTAI20130-1 not found in first 250 orders — it may be completed/archived or the ref format differs'
+            ? `Error: ${result.specificOrderError}`
+            : 'Jim Tait not found in Contacts — may be archived or use a different name'
+        );
+      }
+
+      if (result.specificOrder) {
+        const so = result.specificOrder;
+        t('Cin7: Order JTAI20130-1 found', true,
+          `id: ${so.id} | stage: ${so.stage} | ref: ${so.reference} | ` +
+          `postCode: ${so.deliveryPostalCode ?? '(null)'}`
+        );
+      } else {
+        t('Cin7: Order JTAI20130-1 found', false,
+          'Order JTAI20130-1 not found — may be completed/archived'
         );
       }
 
