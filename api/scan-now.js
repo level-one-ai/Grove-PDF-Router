@@ -81,8 +81,8 @@ async function scanAndProcess() {
   for (const file of allPdfs) {
     const existing = records[file.id];
 
-    // Already completed — clean up
-    if (existing && existing.status === 'completed') {
+    // Already completed — clean up from Scans folder
+    if (existing && (existing.status === 'complete' || existing.status === 'completed')) {
       console.log(`[scan-now] "${file.name}" already completed — removing from Scans`);
       await deleteFromScans(file.id, file.name, userId, token);
       continue;
