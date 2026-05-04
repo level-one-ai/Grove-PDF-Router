@@ -195,10 +195,28 @@ module.exports = async function handler(req, res) {
 };
 
 /**
+ * Check if processing has been stopped by the user.
+ * Returns true if the file has been stopped/errored manually.
+ */
+async function isStopped(fileId) {
+  try {
+    const record = await db.getRecord(fileId);
+    return record?.status === 'error' && record?.error?.includes('Manually stopped');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * All the heavy work — Cin7 lookup, uploads, dispatch next page.
  * Runs in the background after we have ack'd Make.com.
  */
 async function handlePageInBackground(fileId, pageNumber, totalPages, claudeJson, body) {
+  // Check if user pressed Stop before we even start
+  if (await isStopped(fileId)) {
+    console.log(`[file-page] File ${fileId} was stopped — aborting page ${pageNumber}`);
+    return;
+  }
   // Fix null string
   if (claudeJson?.document?.customer?.company_name === 'null' ||
       claudeJson?.document?.customer?.company_name === '') {
@@ -317,6 +335,12 @@ async function handlePageInBackground(fileId, pageNumber, totalPages, claudeJson
  * PERF: accepts pageStore and cachedQueue to avoid re-reading Firestore.
  */
 async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName, pageStore, cachedQueue) {
+  // Check if user pressed Stop before dispatching next page
+  if (await isStopped(fileId)) {
+    console.log(`[file-page] File ${fileId} stopped — not dispatching next page`);
+    return;
+  }
+
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
     console.log(`[file-page] Dispatching next page ${nextPage} after page ${pageNumber}`);
@@ -500,6 +524,13 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   }
 
   console.log(`[file-page] ${T()} Starting parallel uploads (OD skip: ${odDupResult.isDuplicate}, GD skip: ${gdDupResult?.isDuplicate})...`);
+
+  // Check stop flag before doing the heavy uploads
+  if (await isStopped(fileId)) {
+    console.log(`[file-page] ${T()} File stopped before upload — aborting`);
+    return;
+  }
+
   writeFileStatus(fileId, { currentStage: 'uploading' }).catch(() => {});
 
   const [oneDriveResult, googleDriveResult] = await Promise.all([
