@@ -133,10 +133,23 @@ module.exports = async function handler(req, res) {
 
   const fileId = body.fileId;
   const pageNumber = parseInt(body.pageNumber, 10);
-  const totalPages = parseInt(body.totalPages, 10);
+  let totalPages = parseInt(body.totalPages, 10);
 
   if (!fileId || isNaN(pageNumber)) {
     return res.status(400).json({ error: 'Missing fileId or pageNumber' });
+  }
+
+  // If Make.com didn't send totalPages (common for non-order documents),
+  // read it from Firestore where scan-now.js wrote it after splitting.
+  // Without this, totalPages stays NaN and the status never becomes 'complete'.
+  if (isNaN(totalPages) || !totalPages) {
+    try {
+      const r = await db.getRecord(fileId);
+      totalPages = r?.totalPages || 1;
+      console.log(`[file-page] totalPages missing from body — read ${totalPages} from Firestore`);
+    } catch {
+      totalPages = 1;
+    }
   }
 
   // Build claudeJson
