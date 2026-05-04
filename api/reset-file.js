@@ -7,7 +7,8 @@
  * reset (default) — clears stuck processing status so scan-now will reprocess
  * stop            — marks file as stopped so it won't be picked up again
  *
- * Called from the dashboard Reset and Stop buttons.
+ * Called from the dashboard via /api/reset-stuck-file proxy.
+ * The secret must match the CALLBACK_SECRET env var.
  */
 
 module.exports = async function handler(req, res) {
@@ -18,7 +19,7 @@ module.exports = async function handler(req, res) {
   const { fileId, secret, action = 'reset' } = req.body || {};
   const expectedSecret = process.env.CALLBACK_SECRET || 'grove-pdf-router-secret';
 
-  if (!fileId)                  return res.status(400).json({ error: 'fileId required' });
+  if (!fileId)                   return res.status(400).json({ error: 'fileId required' });
   if (secret !== expectedSecret) return res.status(403).json({ error: 'Invalid secret' });
 
   try {
@@ -36,7 +37,6 @@ module.exports = async function handler(req, res) {
     const ts        = admin.firestore.FieldValue.serverTimestamp();
 
     if (action === 'stop') {
-      // Mark as stopped in both collections — file won't be reprocessed automatically
       const stopData = {
         status:    'error',
         error:     'Manually stopped from dashboard',
@@ -56,9 +56,7 @@ module.exports = async function handler(req, res) {
         action:  'stop',
         message: `File ${fileId} stopped — marked as error, will not be reprocessed automatically`,
       });
-
     } else {
-      // Reset — clear stuck status so scan-now will pick it up again
       const resetData = {
         status:    'detected',
         error:     null,
