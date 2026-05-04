@@ -172,6 +172,51 @@ module.exports = async function handler(req, res) {
     }
   }
 
+  // ── CRITICAL: Respond to Make.com IMMEDIATELY ──
+  // Make.com has a 40-second webhook timeout. The Cin7 lookup + OneDrive
+  // upload + Google Drive upload + page 2 dispatch can take longer than
+  // 40 seconds. If we respond at the end, Make times out and the chain
+  // breaks. Instead, ack now and run all the heavy work via waitUntil.
+  res.status(200).json({ status: 'received', pageNumber, totalPages });
+
+  // ── Heavy work runs in background via waitUntil ──
+  try {
+    const { waitUntil } = require('@vercel/functions');
+    waitUntil(
+      handlePageInBackground(fileId, pageNumber, totalPages, claudeJson, body)
+        .catch(err => console.error('[file-page] Background error:', err.message))
+    );
+  } catch (importErr) {
+    // @vercel/functions not available — fall back to inline (local dev)
+    console.warn('[file-page] waitUntil not available — running inline');
+    handlePageInBackground(fileId, pageNumber, totalPages, claudeJson, body)
+      .catch(err => console.error('[file-page] Inline error:', err.message));
+  }
+};
+
+/**
+ * Check if processing has been stopped by the user.
+ * Returns true if the file has been stopped/errored manually.
+ */
+async function isStopped(fileId) {
+  try {
+    const record = await db.getRecord(fileId);
+    return record?.status === 'error' && record?.error?.includes('Manually stopped');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * All the heavy work — Cin7 lookup, uploads, dispatch next page.
+ * Runs in the background after we have ack'd Make.com.
+ */
+async function handlePageInBackground(fileId, pageNumber, totalPages, claudeJson, body) {
+  // Check if user pressed Stop before we even start
+  if (await isStopped(fileId)) {
+    console.log(`[file-page] File ${fileId} was stopped — aborting page ${pageNumber}`);
+    return;
+  }
   // Fix null string
   if (claudeJson?.document?.customer?.company_name === 'null' ||
       claudeJson?.document?.customer?.company_name === '') {
@@ -184,8 +229,7 @@ module.exports = async function handler(req, res) {
     '| ref:', claudeJson?.document?.header?.ref,
     '| name:', claudeJson?.document?.customer?.name);
 
-  // ── CACHE QUEUE once for entire invocation ──
-  // Avoids repeated Firestore reads inside checkForNewPriorityFile
+  // Cache queue once
   let cachedQueue = null;
   try {
     cachedQueue = await db.getQueue();
@@ -208,7 +252,6 @@ module.exports = async function handler(req, res) {
       ? docType.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
       : 'non_order_document';
 
-    // ── FIX: fetch record FIRST so originalFileName is available ──
     let nonOrderFileName = null;
     let record = null;
     let originalFileName = null;
@@ -244,8 +287,6 @@ module.exports = async function handler(req, res) {
       });
     } catch(e) { /* non-fatal */ }
 
-    // Write page status to Firestore — dashboard reads this
-    // Include clear message that this page went to Non-Order Documents
     pageComplete(fileId, pageNumber, totalPages, {
       status:           'non_order',
       docType:          docType || 'non_order',
@@ -255,7 +296,6 @@ module.exports = async function handler(req, res) {
         : 'Non-order document — could not file (no temp file)',
     }).catch(() => {});
 
-    // Also write current stage so pipeline cards update
     writeFileStatus(fileId, {
       currentStage: 'non_order',
       currentPage:  pageNumber,
@@ -263,10 +303,8 @@ module.exports = async function handler(req, res) {
       [`page_${pageNumber}_fileName`]: nonOrderFileName || null,
     }).catch(() => {});
 
-    // Continue the chain — dispatch next page regardless
     await dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName, record?.pageStore || {}, cachedQueue);
-
-    return res.status(200).json({ status: 'skipped', pageNumber, reason: skipReason, nonOrderFileName });
+    return;
   }
 
   if (claudeJson.document_type && claudeJson.document) {
@@ -275,7 +313,6 @@ module.exports = async function handler(req, res) {
 
   try {
     await processAndFile(fileId, pageNumber, totalPages, claudeJson, cachedQueue);
-    return res.status(200).json({ status: 'filed', pageNumber });
   } catch (err) {
     console.error(`[file-page] Error on page ${pageNumber}:`, err.message);
     console.error('[file-page] Stack:', err.stack);
@@ -289,16 +326,21 @@ module.exports = async function handler(req, res) {
     }
 
     await dispatchNextOrComplete(fileId, pageNumber, totalPages, null, {}, cachedQueue);
-
-    return res.status(200).json({ status: 'error', pageNumber, error: err.message });
   }
-};
+}
+
 
 /**
  * Dispatch next page or mark file complete.
  * PERF: accepts pageStore and cachedQueue to avoid re-reading Firestore.
  */
 async function dispatchNextOrComplete(fileId, pageNumber, totalPages, originalFileName, pageStore, cachedQueue) {
+  // Check if user pressed Stop before dispatching next page
+  if (await isStopped(fileId)) {
+    console.log(`[file-page] File ${fileId} stopped — not dispatching next page`);
+    return;
+  }
+
   const nextPage = pageNumber + 1;
   if (nextPage <= totalPages) {
     console.log(`[file-page] Dispatching next page ${nextPage} after page ${pageNumber}`);
@@ -482,6 +524,13 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
   }
 
   console.log(`[file-page] ${T()} Starting parallel uploads (OD skip: ${odDupResult.isDuplicate}, GD skip: ${gdDupResult?.isDuplicate})...`);
+
+  // Check stop flag before doing the heavy uploads
+  if (await isStopped(fileId)) {
+    console.log(`[file-page] ${T()} File stopped before upload — aborting`);
+    return;
+  }
+
   writeFileStatus(fileId, { currentStage: 'uploading' }).catch(() => {});
 
   const [oneDriveResult, googleDriveResult] = await Promise.all([
