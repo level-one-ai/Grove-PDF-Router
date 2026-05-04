@@ -274,40 +274,13 @@ async function processFile(itemId, fileName, token, userId) {
     return;
   }
 
-  // ── Global one-at-a-time lock ──
-  // Check if any OTHER file is currently processing. If so, queue this one
-  // as 'detected' so the dashboard shows it as waiting, but don't start
-  // processing it. When the current file finishes, it triggers scan-now
-  // which will pick up this queued file.
-  try {
-    const admin = require('firebase-admin');
-    const firestore = admin.firestore();
-    const otherProcessing = await firestore
-      .collection('processedFiles')
-      .where('status', '==', 'processing')
-      .limit(1)
-      .get();
-
-    const blockedBy = otherProcessing.docs.find(d => d.id !== itemId);
-    if (blockedBy) {
-      console.log(`[scan-now] "${originalFileName}" queued — another file (${blockedBy.id}) is already processing`);
-      // Mark this file as 'detected' (waiting) so dashboard shows it
-      const { writeFileStatus } = require('../lib/statusWriter');
-      if (!existing) {
-        await db.createRecord(itemId, originalFileName);
-      }
-      await db.updateRecord(itemId, { status: 'detected', queuedAt: new Date().toISOString() });
-      writeFileStatus(itemId, {
-        fileName:     originalFileName,
-        status:       'detected',
-        currentStage: 'queued',
-        queuedReason: `Waiting for "${blockedBy.data()?.originalFileName || 'another file'}" to finish`,
-      }).catch(() => {});
-      return;
-    }
-  } catch (lockErr) {
-    console.warn('[scan-now] Lock check failed (non-fatal — proceeding):', lockErr.message);
-  }
+  // NOTE: A "global one-at-a-time" queue lock was previously here but was
+  // removed because it caused more deadlocks than it prevented. The lock would
+  // see stuck Firestore records and block ALL new files indefinitely. Files
+  // are processed against their own Firestore record by file ID, so concurrent
+  // processing of two different files is safe. The only remaining risk is two
+  // pages of two different files trying to create the same customer folder
+  // simultaneously, which is rare and self-healing.
 
   if (existing) {
     await db.updateRecord(itemId, {
