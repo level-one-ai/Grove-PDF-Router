@@ -480,6 +480,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
       pdfPostcode,
       pdfMobile,
       fileId,
+      pageNumber,
     });
   } catch (cin7Err) {
     console.warn(`[file-page] ${T()} Cin7 lookup error (non-fatal): ${cin7Err.message}`);
