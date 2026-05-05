@@ -348,9 +348,22 @@ async function processFile(itemId, fileName, token, userId) {
   await dispatchToMake(1, page1.zeroPadded, itemId, originalFileName, totalPages, page1ItemId);
   console.log(`[scan-now] Page 1/${totalPages} dispatched for "${originalFileName}"`);
 
-  // Upload remaining pages in background
-  uploadRemainingPages(pages.slice(1), itemId, token, userId, pageStore)
+  // Upload remaining pages in background.
+  // CRITICAL: must use waitUntil so Vercel keeps the function alive until
+  // all pages are uploaded to OneDrive Temp. Without it, the function
+  // returns and Vercel kills the upload mid-flight, meaning pages 2-N
+  // never reach pageStore and file-page.js gets stuck waiting forever.
+  const remainingPagesPromise = uploadRemainingPages(pages.slice(1), itemId, token, userId, pageStore)
     .catch(err => console.error('[scan-now] Remaining pages error:', err.message));
+
+  try {
+    const { waitUntil } = require('@vercel/functions');
+    waitUntil(remainingPagesPromise);
+  } catch {
+    // @vercel/functions not available — fall back to awaiting inline
+    // (slower response to Make.com but guarantees pages get uploaded)
+    await remainingPagesPromise;
+  }
 }
 
 async function uploadRemainingPages(remainingPages, fileId, token, userId, pageStore) {
