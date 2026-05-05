@@ -130,6 +130,7 @@ module.exports = async function handler(req, res) {
   const body = await parseBody(req);
   console.log('[file-page] Received keys:', Object.keys(body));
   console.log('[file-page] fileId:', body.fileId, '| page:', body.pageNumber, '| total:', body.totalPages);
+  console.log(`[file-page] >>> INCOMING customer_name="${body.customer_name}" | company_name="${body.company_name}" | ref="${body.ref}" | page=${body.pageNumber}`);
 
   const fileId = body.fileId;
   const pageNumber = parseInt(body.pageNumber, 10);
@@ -168,20 +169,17 @@ module.exports = async function handler(req, res) {
       claudeJson = { document_type: body.document_type, document: null };
       console.log('[file-page] Built minimal claudeJson for non-order document');
     } else {
-      try {
-        const record = await db.getRecord(fileId);
-        const savedPage = record?.pages?.[pageNumber] || record?.pages?.[String(pageNumber)];
-        if (savedPage?.claudeJson) {
-          claudeJson = savedPage.claudeJson;
-          console.log('[file-page] Retrieved claudeJson from Firestore (saved by callback)');
-        }
-      } catch (lookupErr) {
-        console.warn('[file-page] Firestore claudeJson lookup failed:', lookupErr.message);
-      }
-
-      if (!claudeJson) {
-        return res.status(400).json({ error: 'Missing json field', keys: Object.keys(body) });
-      }
+      // CRITICAL: Do NOT fall back to Firestore for claudeJson.
+      // If we did, an incomplete webhook would inherit a previous page's data,
+      // causing all pages to be filed with the wrong customer name. Better to
+      // error out so we know exactly when Make.com is sending bad data.
+      console.error(`[file-page] Missing customer data for page ${pageNumber}. Body keys: ${Object.keys(body).join(',')}`);
+      console.error(`[file-page] Body customer_name: "${body.customer_name}", company_name: "${body.company_name}", title: "${body.title}"`);
+      return res.status(400).json({
+        error: 'Missing customer data — refusing to use stale data from a different page',
+        keys: Object.keys(body),
+        pageNumber,
+      });
     }
   }
 
