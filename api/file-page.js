@@ -589,7 +589,13 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
 
   // Write page status to Firestore
   pageComplete(fileId, pageNumber, totalPages, {
-    finalFileName, customerName: customerFolderName, ref: refFolderName,
+    finalFileName,
+    customerName: customerFolderName,
+    ref: refFolderName,
+    oneDriveUrl: oneDriveResult?.oneDriveUrl || null,
+    oneDriveId: oneDriveResult?.oneDriveId || null,
+    googleDriveUrl: googleDriveResult?.uploadedFiles?.[0]?.webViewLink || null,
+    googleDriveFileId: googleDriveResult?.uploadedFiles?.[0]?.id || null,
   }).catch(() => {});
 
   const nextPage = pageNumber + 1;
