@@ -509,7 +509,7 @@ async function processAndFile(fileId, pageNumber, totalPages, claudeJson, cached
 
   // ── Now build filename ────────────────────────────────────────────────────
   writeFileStatus(fileId, { currentStage: 'filing' }).catch(() => {});
-  const finalFileName    = buildFilename(claudeJson, zeroPadded);
+  const finalFileName    = buildFilename(claudeJson, zeroPadded, cin7Result);
   const supplierLabel    = getSupplierLabel(claudeJson);
   let customerFolderName = cin7Result ? cin7Result.folderName : getCustomerFolderName(claudeJson);
   const refFolderName    = getRefFolder(claudeJson);
