@@ -1,24 +1,22 @@
 /**
  * /api/reprocess-page
  *
- * Reprocesses a single page that was previously processed. Uses the renamed PDF
- * already in OneDrive Processed as the source — no need to keep the original.
+ * Reprocesses a single page that was previously processed.
+ * Source: the renamed PDF already in OneDrive Processed.
  *
  * Flow:
- *   1. Look up the page in Firestore — get the OneDrive file ID and current name
+ *   1. Look up the page in Firestore — get OneDrive ID + current name
  *   2. Download the PDF bytes from OneDrive
  *   3. Send to PDF Extractor (same flow as fresh processing)
- *   4. Run fresh Cin7 lookup (cache bypassed — reprocess always uses live data)
- *   5. Build new filename (with ETD fallback)
- *   6. If new filename === current filename: no-op, return "already filed correctly"
+ *   4. Run fresh Cin7 lookup (cache bypassed)
+ *   5. Build new filename
+ *   6. If new filename === current filename: no-op
  *   7. Otherwise:
- *      - Upload new file to OneDrive Processed (correct name)
+ *      - Upload new file to OneDrive Processed
  *      - Move old OneDrive file to Recycle Bin
  *      - Upload new file to Google Drive (correct customer/ref folder)
  *      - Move old Google Drive file to Bin
  *      - Update Firestore with new filename + URLs
- *
- * Protected by CALLBACK_SECRET so randoms can't trigger reprocesses.
  *
  * Request body: { fileId: string, pageNumber: number, secret: string }
  */
@@ -38,7 +36,6 @@ const EXTRACTOR_URL  = process.env.EXTRACTOR_URL || 'https://grove-pdf-extractor
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
 
-  // ── Auth ────────────────────────────────────────────────────────────────
   const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
   const providedSecret = body.secret || req.headers['x-callback-secret'];
   const expectedSecret = process.env.CALLBACK_SECRET || 'abc123xyz';
@@ -54,14 +51,14 @@ module.exports = async function handler(req, res) {
   console.log(`[reprocess-page] Starting reprocess for ${fileId} page ${pageNumber}`);
 
   try {
-    // ── 1. Look up page details from dashboard collection ──────────────────
+    // ── 1. Look up dashboard status to find page details ────────────────
     const admin = require('firebase-admin');
     if (!admin.apps.length) {
       admin.initializeApp({
         credential: admin.credential.cert({
-          projectId: process.env.FIREBASE_PROJECT_ID,
+          projectId:   process.env.FIREBASE_PROJECT_ID,
           clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+          privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
         }),
       });
     }
@@ -76,23 +73,23 @@ module.exports = async function handler(req, res) {
       return res.status(404).json({ error: `Page ${pageNumber} not found for this file` });
     }
 
-    const oldOneDriveId = pageData.oneDriveId;
+    const oldOneDriveId       = pageData.oneDriveId;
     const oldGoogleDriveFileId = pageData.googleDriveFileId;
-    const oldFileName = pageData.finalFileName;
+    const oldFileName         = pageData.finalFileName;
 
     if (!oldOneDriveId) {
       return res.status(400).json({
-        error: 'OneDrive file ID missing — this page was processed before reprocess support was added. Please reprocess the original PDF instead.',
+        error: 'OneDrive file ID missing — this page was processed before reprocess support was added. Please upload the original PDF to Scans again.',
       });
     }
 
     console.log(`[reprocess-page] Source: ${oldFileName} (OneDrive ID: ${oldOneDriveId})`);
 
-    // ── 2. Download PDF bytes from OneDrive ────────────────────────────────
+    // ── 2. Download from OneDrive ─────────────────────────────────────────
     const pdfBuffer = await downloadFile(oldOneDriveId);
     console.log(`[reprocess-page] Downloaded ${pdfBuffer.length} bytes`);
 
-    // ── 3. Send to PDF Extractor ───────────────────────────────────────────
+    // ── 3. Send to PDF Extractor ──────────────────────────────────────────
     const form = new FormData();
     form.append('file', pdfBuffer, { filename: 'page.pdf', contentType: 'application/pdf' });
 
@@ -105,24 +102,111 @@ module.exports = async function handler(req, res) {
     console.log(`[reprocess-page] Extractor returned document_type=${claudeJson?.document_type}`);
 
     if (claudeJson?.document_type !== 'delivery_order') {
-      return res.status(400).json({
-        error: `Reprocessed file is not a delivery order (got: ${claudeJson?.document_type}). No changes made.`,
+      // Not a delivery order — move it to Non-Order Documents instead of erroring.
+      // This lets reprocess clean up mis-classified files (e.g. Sealy delivery
+      // returns that an older, less strict gatekeeper wrongly accepted).
+      const NON_ORDER_PATH = 'Grove Group Scotland/Grove Bedding/Scans/Non-Order Documents';
+      const nonOrderName   = `other_${new Date().toISOString().slice(0, 10)}_${String(pageNumber).padStart(2, '0')}.pdf`;
+
+      console.log(`[reprocess-page] Not a delivery order — moving to Non-Order Documents as "${nonOrderName}"`);
+
+      // Upload to Non-Order Documents folder
+      let nonOrderUpload = null;
+      try {
+        nonOrderUpload = await uploadFile(NON_ORDER_PATH, nonOrderName, pdfBuffer);
+        console.log(`[reprocess-page] Non-order upload OK → ${nonOrderUpload.id}`);
+      } catch (err) {
+        console.error(`[reprocess-page] Non-order upload FAILED: ${err.message}`);
+        return res.status(500).json({
+          error: 'Could not move file to Non-Order Documents: ' + err.message,
+        });
+      }
+
+      // Move old OneDrive file (in Processed) to Recycle Bin
+      try {
+        const userId = process.env.ONEDRIVE_USER_ID;
+        await graphRequest('DELETE', `/users/${userId}/drive/items/${oldOneDriveId}`);
+        console.log(`[reprocess-page] Old Processed file moved to bin: "${oldFileName}"`);
+      } catch (err) {
+        console.warn(`[reprocess-page] Could not move old OneDrive file to bin: ${err.message}`);
+      }
+
+      // Move old Google Drive file (if any) to Bin
+      if (oldGoogleDriveFileId) {
+        try {
+          const { google } = require('googleapis');
+          const oAuth2Client = new google.auth.OAuth2(
+            process.env.GOOGLE_OAUTH_CLIENT_ID,
+            process.env.GOOGLE_OAUTH_CLIENT_SECRET
+          );
+          oAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN });
+          const drive = google.drive({ version: 'v3', auth: oAuth2Client });
+          await drive.files.update({
+            fileId: oldGoogleDriveFileId,
+            requestBody: { trashed: true },
+            supportsAllDrives: true,
+          });
+          console.log(`[reprocess-page] Old Drive file moved to bin`);
+        } catch (err) {
+          console.warn(`[reprocess-page] Could not move old Drive file to bin: ${err.message}`);
+        }
+      }
+
+      // Update Firestore — mark page as routed to non-order folder
+      await admin.firestore().collection('pdfRouterStatus').doc(fileId).update({
+        [`page_${pageNumber}`]: {
+          ...pageData,
+          finalFileName:     nonOrderName,
+          customerName:      'Non-Order Documents',
+          ref:               '',
+          oneDriveId:        nonOrderUpload.id,
+          oneDriveUrl:       nonOrderUpload.webUrl || null,
+          googleDriveFileId: null,
+          googleDriveUrl:    null,
+          reprocessedAt:     new Date().toISOString(),
+        },
+      });
+
+      return res.status(200).json({
+        status: 'moved_to_non_order',
+        message: 'File reclassified as non-delivery-order and moved to Non-Order Documents',
+        oldFileName,
+        newFileName:    nonOrderName,
+        newOneDriveUrl: nonOrderUpload.webUrl,
       });
     }
 
-    // ── 4. Fresh Cin7 lookup (no cache) ────────────────────────────────────
-    const cin7Result = await lookupCin7FolderName({
-      customerName: claudeJson?.document?.customer?.name || null,
-      companyName:  claudeJson?.document?.customer?.company_name || null,
-      pdfRef:       claudeJson?.document?.header?.ref || null,
-      pdfPostcode:  claudeJson?.document?.customer?.address?.postcode || null,
-      pdfMobile:    claudeJson?.document?.customer?.mobile || null,
-      fileId:       null,  // bypass cache
-      pageNumber:   null,  // bypass cache
+    // ── 4. Fresh Cin7 lookup with Ship-To fallback ────────────────────────
+    const claudeCustomerName = claudeJson?.document?.customer?.name || null;
+    const claudeCompanyName  = claudeJson?.document?.customer?.company_name || null;
+    const pdfRef             = claudeJson?.document?.header?.ref || null;
+    const pdfPostcode        = claudeJson?.document?.customer?.address?.postcode ||
+                               claudeJson?.document?.ship_to?.address?.postcode || null;
+    const pdfMobile          = claudeJson?.document?.customer?.mobile || claudeJson?.document?.customer?.phone || null;
+    const shipToName         = claudeJson?.document?.ship_to?.name || null;
+    const shipToPostcode     = claudeJson?.document?.ship_to?.address?.postcode || null;
+
+    let cin7Result = await lookupCin7FolderName({
+      customerName: claudeCustomerName,
+      companyName:  claudeCompanyName,
+      pdfRef, pdfPostcode, pdfMobile,
+      fileId: null, pageNumber: null,    // bypass cache
     });
+
+    const looksUnusable = !claudeCustomerName || claudeCustomerName.trim().length < 3 ||
+                          /^[\w.+-]+@[\w.-]+$/.test(claudeCustomerName.trim());
+    if (!cin7Result && shipToName && shipToName !== claudeCustomerName && looksUnusable) {
+      console.log(`[reprocess-page] Primary Cin7 missed — Ship-To fallback: "${shipToName}"`);
+      cin7Result = await lookupCin7FolderName({
+        customerName: shipToName,
+        companyName:  null,
+        pdfRef, pdfPostcode: shipToPostcode || pdfPostcode, pdfMobile,
+        fileId: null, pageNumber: null,
+      });
+    }
+
     console.log(`[reprocess-page] Cin7: ${cin7Result ? 'matched ' + cin7Result.folderName : 'no match'}`);
 
-    // Patch claudeJson with Cin7 confirmed values
     if (cin7Result) {
       if (cin7Result.cin7Company && claudeJson?.document?.customer) {
         claudeJson.document.customer.company_name = cin7Result.cin7Company;
@@ -132,16 +216,16 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // ── 5. Build new filename ──────────────────────────────────────────────
+    // ── 5. Build new filename ─────────────────────────────────────────────
     const zeroPadded = String(pageNumber).padStart(2, '0');
     const newFileName = buildFilename(claudeJson, zeroPadded, cin7Result);
     const customerFolderName = cin7Result ? cin7Result.folderName : getCustomerFolderName(claudeJson);
     const refFolderName      = getRefFolder(claudeJson);
     const folderIsCompany    = cin7Result ? cin7Result.source === 'company' : isCompanyName(claudeJson);
 
-    console.log(`[reprocess-page] New filename: "${newFileName}" | Old: "${oldFileName}"`);
+    console.log(`[reprocess-page] New: "${newFileName}" | Old: "${oldFileName}"`);
 
-    // ── 6. No-op if filename unchanged ─────────────────────────────────────
+    // ── 6. No-op if filename unchanged ────────────────────────────────────
     if (newFileName === oldFileName) {
       return res.status(200).json({
         status: 'no_change',
@@ -150,7 +234,7 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // ── 7. Upload new + Move old to Bin ────────────────────────────────────
+    // ── 7. Upload new + move old to Bin ───────────────────────────────────
     const newUpload = await uploadFile(PROCESSED_PATH, newFileName, pdfBuffer);
     console.log(`[reprocess-page] New OneDrive upload: "${newFileName}" → ${newUpload.id}`);
 
@@ -163,7 +247,7 @@ module.exports = async function handler(req, res) {
       console.warn(`[reprocess-page] Could not move old OneDrive file to bin: ${err.message}`);
     }
 
-    // Upload to Google Drive
+    // Upload to Google Drive in correct customer/ref folder
     let googleDriveResult = null;
     try {
       googleDriveResult = await fileDocuments(
@@ -198,17 +282,17 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // ── 8. Update Firestore ────────────────────────────────────────────────
+    // ── 8. Update Firestore ───────────────────────────────────────────────
     const newPageData = {
       ...pageData,
-      finalFileName: newFileName,
-      customerName: customerFolderName,
-      ref: refFolderName,
-      oneDriveId: newUpload.id,
-      oneDriveUrl: newUpload.webUrl || null,
+      finalFileName:    newFileName,
+      customerName:     customerFolderName,
+      ref:              refFolderName,
+      oneDriveId:       newUpload.id,
+      oneDriveUrl:      newUpload.webUrl || null,
       googleDriveFileId: googleDriveResult?.uploadedFiles?.[0]?.id || null,
-      googleDriveUrl: googleDriveResult?.uploadedFiles?.[0]?.webViewLink || null,
-      reprocessedAt: new Date().toISOString(),
+      googleDriveUrl:    googleDriveResult?.uploadedFiles?.[0]?.webViewLink || null,
+      reprocessedAt:    new Date().toISOString(),
     };
     await admin.firestore().collection('pdfRouterStatus').doc(fileId).update({
       [`page_${pageNumber}`]: newPageData,
