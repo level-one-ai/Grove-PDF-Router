@@ -1,3 +1,15 @@
 .vercel
 .env*.local
 .env.local
+
+# Catch ALL .env variants (including .env.check, .env.google, etc.)
+.env
+.env.*
+!.env.example
+
+# Node modules (already untracked but be explicit)
+node_modules/
+
+# Test scripts not meant for production
+test-*.js
+cleanup-*.js
