@@ -26,6 +26,12 @@
     "api/logs.js": {
       "maxDuration": 10
     },
+    "api/reprocess-file.js": {
+      "maxDuration": 800
+    },
+    "api/reprocess-page.js": {
+      "maxDuration": 300
+    },
     "api/*.js": {
       "maxDuration": 60
     }
