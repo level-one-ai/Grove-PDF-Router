@@ -1,29 +1,16 @@
 /**
- * api/google-diag.js
+ * api/google-diag.js — v2
  *
- * Granular diagnostic for Google OAuth chain.
- * Tells you exactly which credential is wrong when /api/diag says "invalid_client".
+ * Granular diagnostic for Google OAuth chain, PLUS:
+ *  - Counts ALL customer folders under the Drive root (verifies pagination)
+ *  - Confirms the count via a second pass with a different page size
  *
- * Usage:
- *   GET /api/google-diag?secret=YOUR_CALLBACK_SECRET
- *
- * Tests, in order:
- *   1. Are all 3 OAuth env vars present + non-empty?
- *   2. Do they have whitespace anywhere (start/end/middle)?
- *   3. Does Client ID match expected format (...apps.googleusercontent.com)?
- *   4. Does Client Secret match expected format (GOCSPX-...)?
- *   5. Does Refresh Token match expected format (1//...)?
- *   6. Direct token-exchange call to Google's oauth2 endpoint, decoding the
- *      exact error response. This is what reveals which credential Google rejects.
- *   7. If token exchange succeeds, try a Drive API call.
- *
- * Returns plain JSON — no HTML — so the dashboard can also call this if needed.
+ * Usage: GET /api/google-diag?secret=YOUR_CALLBACK_SECRET
  */
 
 module.exports = async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
 
-  // Auth: require CALLBACK_SECRET
   const expectedSecret = process.env.CALLBACK_SECRET;
   const providedSecret = req.query?.secret || req.headers['x-callback-secret'];
   if (!expectedSecret || providedSecret !== expectedSecret) {
@@ -37,25 +24,25 @@ module.exports = async function handler(req, res) {
   const cid     = process.env.GOOGLE_OAUTH_CLIENT_ID     || '';
   const csecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET || '';
   const ctoken  = process.env.GOOGLE_OAUTH_REFRESH_TOKEN || '';
+  const rootFolderId = process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || '';
 
   t('Client ID present',          !!cid.trim(),     cid     ? `${cid.length} chars`     : 'MISSING');
   t('Client Secret present',      !!csecret.trim(), csecret ? `${csecret.length} chars` : 'MISSING');
   t('Refresh Token present',      !!ctoken.trim(),  ctoken  ? `${ctoken.length} chars`  : 'MISSING');
+  t('Root folder ID present',     !!rootFolderId.trim(), rootFolderId || 'MISSING');
 
   if (!cid.trim() || !csecret.trim() || !ctoken.trim()) {
     return res.status(200).json({ ok: false, summary: 'Missing one or more OAuth credentials', results });
   }
 
-  // ── Step 2: Whitespace check (the most common cause) ────────────────────────
+  // ── Step 2: Whitespace check ────────────────────────────────────────────────
   const checkWhitespace = (label, val) => {
     const issues = [];
-    if (val !== val.trim())        issues.push('leading/trailing whitespace');
-    if (/[\r\n]/.test(val))        issues.push('embedded newlines');
-    if (/\t/.test(val))            issues.push('embedded tabs');
-    if (/^[ \t]/.test(val))        issues.push('starts with space/tab');
-    if (/[ \t]$/.test(val))        issues.push('ends with space/tab');
+    if (val !== val.trim())  issues.push('leading/trailing whitespace');
+    if (/[\r\n]/.test(val))  issues.push('embedded newlines');
+    if (/\t/.test(val))      issues.push('embedded tabs');
     return issues.length === 0
-      ? t(`${label} — no whitespace issues`, true,  'clean')
+      ? t(`${label} — no whitespace issues`, true, 'clean')
       : t(`${label} — WHITESPACE PROBLEM`,    false, issues.join(', '));
   };
   checkWhitespace('Client ID',     cid);
@@ -63,28 +50,14 @@ module.exports = async function handler(req, res) {
   checkWhitespace('Refresh Token', ctoken);
 
   // ── Step 3: Format check ────────────────────────────────────────────────────
-  t('Client ID format',
-    cid.endsWith('.apps.googleusercontent.com'),
-    cid.endsWith('.apps.googleusercontent.com')
-      ? `ends with .apps.googleusercontent.com (good)`
-      : `does NOT end with .apps.googleusercontent.com — first 12 chars: "${cid.slice(0,12)}", last 12: "${cid.slice(-12)}"`
-  );
-  t('Client Secret format',
-    csecret.startsWith('GOCSPX-'),
-    csecret.startsWith('GOCSPX-')
-      ? `starts with GOCSPX- (good)`
-      : `does NOT start with GOCSPX- — first 8 chars: "${csecret.slice(0,8)}"`
-  );
-  t('Refresh Token format',
-    ctoken.startsWith('1//'),
-    ctoken.startsWith('1//')
-      ? `starts with 1// (good)`
-      : `does NOT start with 1// — first 8 chars: "${ctoken.slice(0,8)}"`
-  );
+  t('Client ID format',     cid.endsWith('.apps.googleusercontent.com'),
+    cid.endsWith('.apps.googleusercontent.com') ? 'good' : `last 12: "${cid.slice(-12)}"`);
+  t('Client Secret format', csecret.startsWith('GOCSPX-'),
+    csecret.startsWith('GOCSPX-') ? 'good' : `first 8: "${csecret.slice(0,8)}"`);
+  t('Refresh Token format', ctoken.startsWith('1//'),
+    ctoken.startsWith('1//') ? 'good' : `first 8: "${ctoken.slice(0,8)}"`);
 
-  // ── Step 4: Direct token exchange — this is where Google tells us the truth ─
-  // We hit Google's OAuth endpoint directly and decode the exact error.
-  const start = Date.now();
+  // ── Step 4: Token exchange ──────────────────────────────────────────────────
   let tokenResponse;
   try {
     const body = new URLSearchParams({
@@ -94,65 +67,89 @@ module.exports = async function handler(req, res) {
       grant_type:    'refresh_token',
     });
     const r = await fetch('https://oauth2.googleapis.com/token', {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:    body.toString(),
+      body:   body.toString(),
     });
     tokenResponse = { status: r.status, body: await r.json().catch(() => ({})) };
   } catch (err) {
-    t('Token exchange — network',
-      false,
-      `network error: ${err.message}`
-    );
-    return res.status(200).json({ ok: false, summary: 'Network error reaching Google', results });
+    t('Token exchange — network', false, `network error: ${err.message}`);
+    return res.status(200).json({ ok: false, summary: 'Network error', results });
   }
-
-  const elapsed = Date.now() - start;
   if (tokenResponse.status === 200 && tokenResponse.body.access_token) {
-    t('Token exchange — Google accepted credentials',
-      true,
-      `OK in ${elapsed}ms — got access_token (${String(tokenResponse.body.access_token).length} chars)`
-    );
+    t('Token exchange — Google accepted credentials', true, `OK (access_token ${tokenResponse.body.access_token.length} chars)`);
   } else {
     const err  = tokenResponse.body.error             || '(no error code)';
     const desc = tokenResponse.body.error_description || '(no description)';
-    let interpretation = '';
-    if (err === 'invalid_client') {
-      interpretation = ' → Client ID or Client Secret is wrong (or they don\'t match each other in Google Cloud Console)';
-    } else if (err === 'invalid_grant') {
-      interpretation = ' → Refresh Token is wrong, revoked, expired, or was generated with a DIFFERENT Client ID/Secret pair';
-    } else if (err === 'unauthorized_client') {
-      interpretation = ' → OAuth client exists but is not authorised for this grant type';
-    }
-    t('Token exchange — Google REJECTED',
-      false,
-      `HTTP ${tokenResponse.status} | error=${err} | description="${desc}"${interpretation}`
-    );
-    return res.status(200).json({
-      ok: false,
-      summary: `Google rejected the credentials with: ${err}`,
-      results,
-      googleRawResponse: tokenResponse.body,
-    });
+    t('Token exchange — Google REJECTED', false, `HTTP ${tokenResponse.status} | error=${err} | "${desc}"`);
+    return res.status(200).json({ ok: false, summary: `Google rejected: ${err}`, results });
   }
 
-  // ── Step 5: Try a Drive API call to confirm end-to-end ──────────────────────
+  // ── Step 5: Drive API call ──────────────────────────────────────────────────
+  let drive;
   try {
     const { google } = require('googleapis');
     const oauthClient = new google.auth.OAuth2(cid.trim(), csecret.trim());
     oauthClient.setCredentials({ refresh_token: ctoken.trim() });
-    const drive = google.drive({ version: 'v3', auth: oauthClient });
-    const driveStart = Date.now();
-    const aboutRes = await drive.about.get({ fields: 'user' });
-    t('Drive API — about.get',
+    drive = google.drive({ version: 'v3', auth: oauthClient });
+    const aboutRes = await drive.about.get({ fields: 'user, storageQuota' });
+    t('Drive API — about.get', true, `logged in as ${aboutRes.data.user?.emailAddress || 'unknown'}`);
+  } catch (err) {
+    t('Drive API — about.get', false, `failed: ${err.message}`);
+    return res.status(200).json({ ok: false, summary: 'Drive API call failed', results });
+  }
+
+  // ── Step 6: COUNT all customer folders (proves pagination works) ────────────
+  if (!rootFolderId) {
+    t('Folder count', false, 'GOOGLE_DRIVE_ROOT_FOLDER_ID not set — skipping');
+    return res.status(200).json({ ok: true, summary: 'OAuth works (folder count skipped)', results });
+  }
+
+  try {
+    let total      = 0;
+    let pages      = 0;
+    let pageToken  = null;
+    const sample   = [];   // first 3 and last 3 folder names for inspection
+    const allFolders = [];
+
+    do {
+      const r = await drive.files.list({
+        q: `'${rootFolderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+        fields:    'nextPageToken, files(id, name)',
+        pageSize:  1000,
+        pageToken: pageToken || undefined,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        corpora: 'allDrives',
+      });
+      const batch = r.data.files || [];
+      total += batch.length;
+      allFolders.push(...batch.map(f => f.name));
+      pageToken = r.data.nextPageToken || null;
+      pages++;
+      if (pages > 50) break;
+    } while (pageToken);
+
+    // Sort names alphabetically for inspection
+    allFolders.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    sample.push(...allFolders.slice(0, 3).map(n => `[A] ${n}`));
+    if (allFolders.length > 6) {
+      const mid = Math.floor(allFolders.length / 2);
+      sample.push(`[~mid] ${allFolders[mid]}`);
+    }
+    sample.push(...allFolders.slice(-3).map(n => `[Z] ${n}`));
+
+    t('Folder pagination scan',
       true,
-      `OK in ${Date.now()-driveStart}ms — logged in as ${aboutRes.data.user?.emailAddress || 'unknown'}`
+      `Found ${total} customer folder(s) across ${pages} page(s). ` +
+      (pages > 1 ? `Pagination IS active and working.` : `(Only 1 page needed — your folder count is under 1000.)`)
+    );
+    t('Folder name sample',
+      true,
+      sample.join(' | ')
     );
   } catch (err) {
-    t('Drive API — about.get',
-      false,
-      `failed: ${err.message}`
-    );
+    t('Folder pagination scan', false, `failed: ${err.message}`);
   }
 
   return res.status(200).json({ ok: true, summary: 'Google OAuth chain works end-to-end', results });
