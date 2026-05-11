@@ -33,6 +33,27 @@ const {
 const PROCESSED_PATH = 'Grove Group Scotland/Grove Bedding/Scans/Processed';
 const EXTRACTOR_URL  = process.env.EXTRACTOR_URL || 'https://grove-pdf-extractor.vercel.app/api/index';
 
+/**
+ * Get a Firestore client by ensuring the DEFAULT Firebase app exists.
+ * Some other endpoints (e.g. firebase-diag) may have initialised named
+ * (non-default) apps, which makes admin.apps.length > 0 even when no
+ * default app exists. This helper explicitly checks for the default app.
+ */
+function getFirestore() {
+  const admin = require('firebase-admin');
+  const hasDefault = admin.apps.some(a => a && a.name === '[DEFAULT]');
+  if (!hasDefault) {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId:   process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      }),
+    });
+  }
+  return admin.firestore();
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
 
@@ -52,18 +73,8 @@ module.exports = async function handler(req, res) {
 
   try {
     // ── 1. Look up dashboard status to find page details ────────────────
-    const admin = require('firebase-admin');
-    if (!admin.apps.length) {
-      admin.initializeApp({
-        credential: admin.credential.cert({
-          projectId:   process.env.FIREBASE_PROJECT_ID,
-          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-        }),
-      });
-    }
-
-    const dashSnapshot = await admin.firestore().collection('pdfRouterStatus').doc(fileId).get();
+    const firestore = getFirestore();
+    const dashSnapshot = await firestore.collection('pdfRouterStatus').doc(fileId).get();
     if (!dashSnapshot.exists) {
       return res.status(404).json({ error: 'File not found in dashboard records' });
     }
@@ -153,7 +164,7 @@ module.exports = async function handler(req, res) {
       }
 
       // Update Firestore — mark page as routed to non-order folder
-      await admin.firestore().collection('pdfRouterStatus').doc(fileId).update({
+      await firestore.collection('pdfRouterStatus').doc(fileId).update({
         [`page_${pageNumber}`]: {
           ...pageData,
           finalFileName:     nonOrderName,
@@ -294,7 +305,7 @@ module.exports = async function handler(req, res) {
       googleDriveUrl:    googleDriveResult?.uploadedFiles?.[0]?.webViewLink || null,
       reprocessedAt:    new Date().toISOString(),
     };
-    await admin.firestore().collection('pdfRouterStatus').doc(fileId).update({
+    await firestore.collection('pdfRouterStatus').doc(fileId).update({
       [`page_${pageNumber}`]: newPageData,
     });
 
