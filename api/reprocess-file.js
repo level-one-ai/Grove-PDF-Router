@@ -86,11 +86,13 @@ module.exports = async function handler(req, res) {
     }
 
     const summary = {
-      reprocessed: results.filter(r => r.status === 'reprocessed').length,
-      noChange:    results.filter(r => r.status === 'no_change').length,
-      skipped:     results.filter(r => r.status === 'skipped').length,
-      failed:      results.filter(r => r.status === 'failed').length,
-      movedToNonOrder: results.filter(r => r.status === 'moved_to_non_order').length,
+      reprocessed:        results.filter(r => r.status === 'reprocessed').length,
+      driveBackfilled:    results.filter(r => r.status === 'drive_backfilled').length,
+      driveBackfillFailed:results.filter(r => r.status === 'drive_backfill_failed').length,
+      noChange:           results.filter(r => r.status === 'no_change').length,
+      skipped:            results.filter(r => r.status === 'skipped').length,
+      failed:             results.filter(r => r.status === 'failed').length,
+      movedToNonOrder:    results.filter(r => r.status === 'moved_to_non_order').length,
     };
 
     return res.status(200).json({ status: 'complete', fileId, totalPages, summary, results });

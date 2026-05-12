@@ -236,12 +236,62 @@ module.exports = async function handler(req, res) {
 
     console.log(`[reprocess-page] New: "${newFileName}" | Old: "${oldFileName}"`);
 
-    // ── 6. No-op if filename unchanged ────────────────────────────────────
+    // ── 6. Same filename? Check whether Drive backfill is needed ──────────
     if (newFileName === oldFileName) {
+      // Filename is already correct. Check if the file is missing from Google Drive.
+      const driveLinkPresent = Boolean(pageData.googleDriveFileId);
+
+      if (driveLinkPresent) {
+        // Already in Drive too — true no-op.
+        return res.status(200).json({
+          status: 'no_change',
+          message: 'File is already correctly named and present in Google Drive',
+          currentFileName: oldFileName,
+        });
+      }
+
+      // Filename is correct but Drive link is missing. Upload to Drive only,
+      // creating the customer/ref folders if they don't exist.
+      console.log(`[reprocess-page] Drive backfill: "${oldFileName}" → ${customerFolderName}/${refFolderName}`);
+
+      let backfillResult = null;
+      try {
+        backfillResult = await fileDocuments(
+          customerFolderName, refFolderName,
+          [{ pageNumber, finalFileName: oldFileName, buffer: pdfBuffer }],
+          folderIsCompany,
+          { isDuplicate: false }
+        );
+        console.log(`[reprocess-page] Drive backfill OK: "${customerFolderName}/${refFolderName}/${oldFileName}"`);
+      } catch (err) {
+        console.error(`[reprocess-page] Drive backfill FAILED: ${err.message}`);
+        return res.status(500).json({
+          status: 'drive_backfill_failed',
+          error: 'Could not upload to Google Drive: ' + err.message,
+          currentFileName: oldFileName,
+        });
+      }
+
+      // Update Firestore with the new Drive IDs (filename and OneDrive ID unchanged)
+      const newDriveFileId = backfillResult?.uploadedFiles?.[0]?.id || null;
+      const newDriveUrl    = backfillResult?.uploadedFiles?.[0]?.webViewLink || null;
+
+      await firestore.collection('pdfRouterStatus').doc(fileId).update({
+        [`page_${pageNumber}`]: {
+          ...pageData,
+          googleDriveFileId: newDriveFileId,
+          googleDriveUrl:    newDriveUrl,
+          reprocessedAt:     new Date().toISOString(),
+        },
+      });
+
       return res.status(200).json({
-        status: 'no_change',
-        message: 'File is already correctly named — no changes made',
-        currentFileName: oldFileName,
+        status: 'drive_backfilled',
+        message: 'File was correctly named — uploaded to Google Drive',
+        currentFileName:   oldFileName,
+        customerFolderName,
+        refFolderName,
+        newGoogleDriveUrl: newDriveUrl,
       });
     }
 
